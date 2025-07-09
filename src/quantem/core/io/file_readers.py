@@ -147,6 +147,7 @@ def read_4dstem(
     file_path: str,
     file_type: str | None = None,
     **kwargs,
+    **kwargs,
 ) -> Dataset4dstem:
     """
     File reader for 4D-STEM data
@@ -179,23 +180,17 @@ def read_4dstem(
             imported_axes[2]["scale"],
             imported_axes[3]["scale"],
         ],
-    )
-    origin = kwargs.pop(
-        "origin",
-        [
-            imported_axes[0]["offset"],
-            imported_axes[1]["offset"],
-            imported_axes[2]["offset"],
-            imported_axes[3]["offset"],
+        origin=[
+            imported_data["axes"][0]["offset"],
+            imported_data["axes"][1]["offset"],
+            imported_data["axes"][2]["offset"],
+            imported_data["axes"][3]["offset"],
         ],
-    )
-    units = kwargs.pop(
-        "units",
-        [
-            "pixels" if imported_axes[0]["units"] == "1" else imported_axes[0]["units"],
-            "pixels" if imported_axes[1]["units"] == "1" else imported_axes[1]["units"],
-            "pixels" if imported_axes[2]["units"] == "1" else imported_axes[2]["units"],
-            "pixels" if imported_axes[3]["units"] == "1" else imported_axes[3]["units"],
+        units=[
+            imported_data["axes"][0]["units"],
+            imported_data["axes"][1]["units"],
+            imported_data["axes"][2]["units"],
+            imported_data["axes"][3]["units"],
         ],
     )
     dataset = Dataset4dstem.from_array(

@@ -283,6 +283,7 @@ def _normalize_show_input_to_grid(
     if isinstance(arrays, np.ndarray):
         if not np.iscomplexobj(arrays):
             arrays = arrays.astype(np.float32)  # int/bool arrays can cause issues with norm
+        arrays = arrays.astype(np.float32)
         if arrays.ndim == 2:
             return [[arrays]]
         elif arrays.ndim == 3:
