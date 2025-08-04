@@ -116,7 +116,11 @@ def _show_2d_array(
         fig, ax = figax
 
     ax.imshow(rgba, interpolation=config.get("viz.interpolation"))
-    ax.set(xticks=[], yticks=[], title=title)
+
+    if show_ticks:
+        ax.set(title=title)
+    else:
+        ax.set(xticks=[], yticks=[], title=title)
 
     if cbar:
         divider = make_axes_locatable(ax)
