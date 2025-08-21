@@ -147,7 +147,6 @@ def read_4dstem(
     file_path: str,
     file_type: str | None = None,
     **kwargs,
-    **kwargs,
 ) -> Dataset4dstem:
     """
     File reader for 4D-STEM data
