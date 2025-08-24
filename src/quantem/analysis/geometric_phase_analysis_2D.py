@@ -1,0 +1,1375 @@
+from typing import Literal
+
+import numpy as np
+from tqdm import trange
+
+from quantem.core import config
+from quantem.core.datastructures import Dataset
+from quantem.core.io.serialize import AutoSerialize
+from quantem.core.datastructures.dataset2d import Dataset2d
+from scipy.fftpack import fft, fftshift, ifftshift, ifft, fft2, ifft2
+from skimage import restoration as skr
+from scipy.optimize import curve_fit
+from skimage.color import lab2rgb
+from scipy import ndimage as scnd
+import numba
+from scipy.ndimage import gaussian_filter
+
+if config.get("has_cupy"):
+    import cupy as cp
+else:
+    import numpy as cp
+    
+import matplotlib.pyplot as plt
+
+def create_lattice(
+    n_rows: int,
+    n_cols: int,
+    a_rows: int,
+    a_cols: int,
+    ):  
+    """
+    This function creates a square image with lattice parameters a1 and a2.
+    This can be used to create a simple lattice for demonstration purposes.
+    
+    n_rows:int
+        Number of lattice sites in the row direction  (the x direction, by convention)
+    n_cols:int
+        Number of lattice sites in the column direction  (the y direction, by convention)
+    a_rows:int
+        Lattice parameter in the row direction (the x direction, by convention)
+    a_cols:int
+        Lattice parameter in the column direction (the y direction, by convention)
+    
+    Returns:
+        coords: np.ndarray, (n_rows*n_cols, 2)
+            Coordinates with the row (x) coordinates in the first column and the column (y) coordinates in the second column
+    """
+
+    ind = 0
+    coords = np.zeros([n_rows*n_cols,2])
+    a_rows_array = np.array([a_rows, 0])
+    a_cols_array = np.array([0,a_cols])
+    for row in range(n_rows):
+        for col in range(n_cols):
+            coords[ind] = row * a_rows_array + col * a_cols_array
+            ind += 1
+    return coords
+
+
+class geometric_phase_analysis_2D(AutoSerialize):
+    """
+    A class for performing geometric phase retrieval on 2D real space images using Gaussian fitting and Fourier transforms.
+    
+    This can be used to retrieve atomic displacements and strain maps.
+    """
+
+    def __init__(
+        self,
+        image: Dataset2d,
+        device: Literal["cpu", "gpu"] = "cpu",
+    ):
+        """
+        Parameters
+        ----------
+        image: (nx, ny) np.ndarray
+            A 2D image in real space.
+        device: string
+            The device to use, either cpu or gpu. The default is cpu
+
+        """
+        # self.xp = cp if device == "gpu" else np
+        self.image = np.asarray(image)
+        self.device = device
+        [self.nx, self.ny] = self.image.shape
+        self.imFFT = fftshift(fft2(self.image))
+        self.dtype = np.dtype([("x", float), ("y", float), ("intensity", float)]) # the py4DSTEM data type for real space data, extended to 3D
+
+    def get_FFT(
+        self,
+    ):
+        """
+        Returns the FFT of the input dataset.
+
+        Returns
+        -------
+        self.imFFT: (nx, ny) np.ndarray, complex
+            The FFT of the input data.
+        """
+        return self.imFFT
+    
+
+
+    def fourier_filter(
+        self, 
+        data: np.ndarray, 
+        threshold: int = 1,
+        show_plot: bool = False,
+    ):
+        """
+        Calculates a mask based on the low frequency structure in real space. Signal is set to one, vacuum is set to zero.
+        
+        Parameters
+        ----------
+        data: (nx, ny) np.ndarray
+            An image in real space that matches the dimensions of self.image.
+        threshold: int
+            A Fourier threshold value for the real space amplitude after filtering. Defaults to 1.
+        show_plot: bool
+            Controls if the mask and original real space are shown. Defaults to False.
+        
+        Returns
+        -------
+        self.fourier_mask * data: (nx, ny) np.ndarray
+            The input data multiplied by a binary mask.
+        """
+        if data.shape != self.image.shape:
+            print("Input shape does not match that of original image")
+            return 0
+        xx,yy = np.meshgrid(np.arange(self.nx),np.arange(self.ny), indexing = 'ij')
+        dkx = 1/(self.nx); dky = 1/(self.ny)
+
+        center = np.array(self.imFFT.shape)/2
+        mask_size = 10
+        gaussCoords = ((xx - center[0])**2 + (yy - center[1])**2) / mask_size**2
+        del xx, yy
+        mask = np.exp( -0.5 * gaussCoords, dtype=np.float32 )
+        del gaussCoords
+        self.fourier_mask = np.abs((ifft2(self.imFFT*mask)))*100
+        self.fourier_mask[self.fourier_mask<threshold] = 0
+        self.fourier_mask[self.fourier_mask>0] = 1
+        if show_plot:
+            plt.figure(figsize = (5,10))
+            plt.subplot(121)
+            plt.imshow(self.fourier_mask, origin = 'upper'); plt.axis('off')
+            plt.subplot(122)
+            plt.imshow(self.fourier_mask * data, origin = 'upper'); plt.axis('off')        
+        return self.fourier_mask * data
+
+
+    def phase_im_lab(
+        self,
+        phaseIM: np.ndarray,
+        brightness: int = 60,
+        saturation: int = 60,
+        ):
+        """
+        Display an input phase image using color; because phase is bound to a range spanning 2pi, a color wrap is used.
+        
+        Parameters
+        ----------
+        phaseIM: np.ndarray
+            The phase image.
+        brightness: int
+            The brightness of the output color image. Defaults to 60.
+        saturation: int
+            The saturation of the output color image. Defaults to 60.
+        
+        Returns
+        -------
+        im_pha_gp: np.ndarray
+            The phase represented by 3 color channels. The dimensionality is im_pha_gp.shape = phaseIM.shape, 3. 
+        """
+        L = brightness * (1 + np.zeros(phaseIM.shape))     # Brightness
+        a = saturation * np.cos(phaseIM)                   # Saturation
+        b = saturation * np.sin(phaseIM)                   # Saturation
+        im_pha_gp = lab2rgb(np.dstack((L,a,b)))
+        return im_pha_gp
+
+
+    def image_normalizer(
+        self,
+        image: np.ndarray,
+        ):
+        """
+        Normalizing input image.
+        
+        Parameters
+        ----------
+        image: np.ndarray
+            The original image to be normalized
+                    
+        Returns
+        -------
+        image_out: np.ndarray
+            Normalized image
+        """
+        image_out = (image - np.amin(image)) / (np.amax(image) - np.amin(image))
+        return image_out
+
+    def precise_peak_location(
+        self,
+        peakCoordinates: np.dtype([("x", float), ("y", float), ("intensity", float)]), 
+        subImageHalfLength: int = 20,
+        ):
+        """
+        Zero in on peak location by fitting with a Gaussian.
+        
+        Parameters
+        ----------
+        peakCoordinates: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            One set of peak coordinates.
+        subImageHalfLength: int
+            Half of side length of sub image for peak fitting. Defaults to 20. 
+        
+        Returns
+        -------
+        peakCoordinatesPrecise: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            A more precise estimate of the Bragg peak location.
+        """
+
+        decimal_x = peakCoordinates['x'] - int(peakCoordinates['x'])
+        decimal_y = peakCoordinates['y'] - int(peakCoordinates['y'])
+        subIm = np.abs(self.imFFT)[int(peakCoordinates['x']-subImageHalfLength):int(peakCoordinates['x']+subImageHalfLength), 
+                                                    int(peakCoordinates['y']-subImageHalfLength):int(peakCoordinates['y']+subImageHalfLength)]
+        GaussianFit = self.fit_diffraction_center(subIm)
+        peakCoordinatesPrecise = np.zeros(1, dtype=self.dtype)
+        peakCoordinatesPrecise['x'] = peakCoordinates['x'] + GaussianFit[2] - subImageHalfLength - decimal_x
+        peakCoordinatesPrecise['y'] = peakCoordinates['y'] + GaussianFit[3] - subImageHalfLength - decimal_y
+        return peakCoordinatesPrecise
+
+    def gauss2D(
+        self,
+        xdata: np.ndarray,
+        A: float,
+        B: float,
+        xc: float,
+        yc: float,
+        sx: float,
+        sy: float,
+        th: float,
+        ):
+        """
+        A 2D Gaussian (with rotation).
+        
+        Parameters
+        ----------
+        xdata: (nx, ny, 2) np.ndarray
+            The input subimage coordinates. X and Y coordinates should be present.
+        A: float
+            The amplitude multiplier of the Gaussian.
+        B: float
+            The scalar offset of the Gaussian.
+        xc: float
+            The central coordinate of the Gaussian in the X (row) direction.
+        yc: float
+            The central coordinate of the Gaussian in the Y (column).
+        sx: float
+            The standard deviation of the Gaussian in the X (row) direction.
+        sy: float
+            The standard deviation of the Gaussian in the Y (column) direction.
+        th: float
+            The rotation (in radians) of the Gaussian in the Z direction.
+            
+        Returns
+        -------
+        G: (nx, ny) np.ndarray
+            The 2D Gaussian.
+        """
+        xx = xdata[:,:,0]; yy = xdata[:,:,1]
+        a = np.cos(th)**2/(2*sx**2) + np.sin(th)**2/(2*sy**2)
+        b = -np.sin(2*th)/(4*sx**2) + np.sin(2*th)/(4*sy**2)
+        c = np.sin(th)**2/(2*sx**2) + np.cos(th)**2/(2*sy**2)
+        G = A*np.exp( - (a*(xx-xc)**2 + 2*b*(xx-xc)*(yy-yc) + c*(yy-yc)**2))+ B
+        return G.ravel()
+
+    def fit_diffraction_center(
+        self,
+        subIm: np.ndarray,
+        plot_results: bool =True,
+        ):
+        
+        """
+        Given a subimage of the Fourier transform, use curve fitting to improve the estimate of the Bragg peak's central coordinates.
+        
+        Parameters
+        ----------
+        subIm: (nx, ny) np.ndarray
+            The subimage of the Fourier transform. This should ideally contain a single strongest Bragg peak close to the center of the image.
+        plot_results: bool
+            Plot the subimage and Gaussian fit of the Bragg peak. Defaults to True.
+            
+        Returns
+        -------
+        popt: (7) np.ndarray
+            An array of the optimal values returned by the curve fit algorithm. These entries have the following identities: [amplitude, offset, center x, center y, std x, std y, theta].
+        """
+        
+        # Create Grid for Curve Fit
+        (xx,yy) = np.meshgrid(np.arange(subIm.shape[0]), np.arange(subIm.shape[1]), indexing = 'ij')
+        xdata = np.dstack((xx,yy))
+
+        # Default Parameters for 2D Curve Fit
+        A0 = np.max(subIm); B0 = np.min(subIm)
+        x0 = np.array([A0,   B0, subIm.shape[0]/2,   subIm.shape[1]/2,    0.5,   0.5,      0])
+        lb = np.array([A0/4, -A0,  subIm.shape[0]*3/8,   subIm.shape[1]*3/8,    0, 0, -np.pi])
+        ub = np.array([2*A0, A0, subIm.shape[0]*5/8, subIm.shape[1]*5/8,  15,   5, np.pi])
+
+        # Fit Parameters
+        popt, pcov = curve_fit(self.gauss2D, xdata, subIm.ravel(), p0=x0, bounds=(lb,ub))
+
+        # Display fit
+        if plot_results:
+            data_fitted = self.gauss2D(xdata,*popt)
+            plt.figure()
+            plt.imshow(subIm,cmap='gray')
+            plt.title('Abs of FFT Subwindow and Gaussian Fit')
+            plt.contour(xdata[:,:,1],xdata[:,:,0],data_fitted.reshape(subIm.shape[0],subIm.shape[1])) # like scatter, contour follows these rules: "len(X) == N is the number of columns in Z and len(Y) == M is the number of rows in Z."
+            
+        return popt
+
+    def calculate_phase_map(
+        self,
+        peakCoordinates: np.dtype([("x", float), ("y", float), ("intensity", float)]), 
+        inputMaskSize: float, 
+        gaussianMask: bool = True,
+        useHamming: bool = False,
+        showResult: bool = True,
+        ):
+        """
+        Calculate the geometric phase for a single Bragg peak.
+        
+        Parameters
+        ----------
+        peakCoordinates: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            Coordinates of the Bragg peak.
+        inputMaskSize: float
+            The size of the input mask. Highly tunable. Lower values correspond to larger convolution kernel and lower resolution.
+        guassianMask: bool
+            Control for whether to use a Gaussian mask or circular binary mask. Defaults to True (Gaussian).
+        useHamming: bool
+            Control whether to use a Hamming window in k-space. Defaults to False.
+        showResult: bool
+            Show the real space geometric phase alongside the shifted Fourier transform and the Gaussian mask. Defaults to True.
+            
+        Returns
+        -------
+        G_matrix: (nx, ny) np.ndarray
+            A 2D array of the geometric phase corresponding to the input peak.
+        """
+        peakCoordinates_xy = self.get_xy_2(peakCoordinates)
+
+        # Construct Fourier Coordinates
+        xx,yy = np.meshgrid(np.arange(self.nx),np.arange(self.ny), indexing = 'ij')
+        dkx = 1/(self.nx); dky = 1/(self.ny)
+
+        # Shift Bragg Peak to Center
+        center = np.array(self.image.shape)/2
+        shift = np.array( center - peakCoordinates_xy)
+        shift = shift * [dkx, dky]
+        shift_phase = np.exp(1j*2*np.pi*(shift[0]*xx+shift[1]*yy))
+
+        if gaussianMask: # Create Mask with Gaussian Kernel
+            xx,yy = np.mgrid[0:self.nx,0:self.ny]
+            gg = (((xx - center[0])**2) + ((yy - center[1])**2))/inputMaskSize
+            mask = np.exp((-0.5)*gg)
+        else:             # Create a Hard Circle Mask
+            circ_rad = np.amin(inputMaskSize*np.asarray(self.image.shape))
+            mask = (self.make_circle(self.image.shape,self.nx/2,self.ny/2,circ_rad)).astype(bool)
+        
+        if useHamming:
+            ham_x = np.hamming(self.nx)[:, None]
+            ham_y = np.hamming(self.ny)[None, :]
+            ham = np.sqrt(ham_x * ham_y)            
+            G_matrix = ifft2(ifftshift(mask*fftshift(fft2(self.image*ham*shift_phase))))    # With hamming in 2D. Original methods would take the phase immediately, but the amplitude is also useful.
+        else:
+            G_matrix = ifft2(ifftshift(mask*fftshift(fft2(self.image*shift_phase))))    # Without hamming
+
+        if showResult:
+            im_pha_gp = self.phase_im_lab(np.angle(G_matrix))
+            imFFT = fftshift(fft2(self.image*shift_phase))
+            (_,axs) = plt.subplots(1,2,figsize=(15,30))
+            axs[0].imshow(im_pha_gp, origin = 'upper')#; axs[0].axis('off')
+            axs[1].imshow(np.log(np.abs(imFFT)+1),cmap='gray', origin = 'upper'); plt.imshow(mask,alpha=0.4, origin = 'upper'); axs[1].axis('off')
+
+        return G_matrix
+
+    def make_circle(
+        self,
+        size_circ: np.ndarray,
+        center_x: float,
+        center_y: float,
+        radius: float,
+        ):
+        """
+        Make a circle Mask
+        
+        Parameters
+        ----------
+        size_circ: ndarray
+                2 element array giving the size of the output matrix
+        center_x: float
+                x position of circle center
+        center_y: float
+                y position of circle center
+        radius: float
+                radius of the circle
+        
+        Returns
+        -------
+        circle: ndarray
+                p X q sized array where the it is 1
+                inside the circle and 0 outside
+        """
+        p = size_circ[0]
+        q = size_circ[1]
+        yV, xV = np.mgrid[0:p, 0:q]
+        sub = ((((yV - center_y) ** 2) + ((xV - center_x) ** 2)) ** 0.5) < radius
+        circle = np.asarray(sub,dtype=np.float64)
+        return circle
+
+    def calculate_displacement_map(
+        self,
+        peakCoordinatesA: np.dtype([("x", float), ("y", float), ("intensity", float)]), 
+        peakCoordinatesB: np.dtype([("x", float), ("y", float), ("intensity", float)]), 
+        phaseA: np.ndarray, 
+        phaseB: np.ndarray, 
+        showResult: bool = False,
+        ):
+        """
+        Use the phase maps and peak coordinates to retrieve the x and y displacement maps.
+        
+        Parameters
+        ----------
+        peakCoordinatesA: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            The absolute pixel coordinates of the first selected peak.
+        peakCoordinatesB: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            The absolute pixel coordinates of the second selected peak.
+        phaseA: (nx, ny) np.ndarray
+            The geometric phase corresponding to the first selected peak.
+        phaseB: (nx, ny) np.ndarray
+            The geometric phase corresponding to the second selected peak.
+        showResult: bool
+            Show the real space displacement. Defaults to False.
+            
+        Returns
+        -------
+        displacementX: (nx, ny) np.ndarray
+            A 2D array that maps the X (row offset) displacement within the lattice.
+        displacementY: (nx, ny) np.ndarray
+            A 2D array that maps the Y (column offset) displacement within the lattice.
+        """
+        center_coords = np.asarray(self.image.shape)//2
+        peakCoordinatesA_G = self.circ_to_G(self.get_xy_2(peakCoordinatesA))
+        peakCoordinatesB_G = self.circ_to_G(self.get_xy_2(peakCoordinatesB))
+        peakMatrix = self.get_a_matrix(peakCoordinatesA_G, peakCoordinatesB_G)
+        displacementX, displacementY = self.get_u_matrices(phaseA, phaseB, peakMatrix)
+        if showResult == True:
+            (fig, axs) = plt.subplots(1,2,figsize = (15,10))
+            axs[0].imshow(displacementX, origin = 'upper'); axs[0].set_title('Displacement Along X Direction (rows)'); axs[0].axis('off')
+            axs[1].imshow(displacementY, origin = 'upper'); axs[1].set_title('Displacement Along Y Direction (columns)'); axs[1].axis('off')
+        return displacementX, displacementY
+
+    def get_a_matrix(
+        self,
+        g_vector_1: np.ndarray,
+        g_vector_2: np.ndarray, 
+        ):
+        """
+        Retrieve the inverse of the g matrix. The g matrix has reciprocal lattice vectors along its rows.
+        The following is true: [[g1x g1y], [g2x g2y]]^-1 = [[a1x a2x], [a1y a2y]].
+        The three reciprocal lattice vectors should be linearly independent.
+        
+        Parameters
+        ----------
+        g_vector_1: (2) np.ndarray
+            The first reciprocal lattice vector.
+        g_vector_2: (2) np.ndarray
+            The second reciprocal lattice vector.
+        
+        Returns
+        -------
+        a_matrix: (2, 2) np.ndarray
+            The transpose of the real space lattice vector matrix. The entries are organized like this: [[a1x a2x], [a1y a2y]].
+        """
+        g_matrix = np.array([g_vector_1, g_vector_2])
+        a_matrix = np.linalg.inv(g_matrix)
+        return a_matrix
+
+    def get_u_matrices(
+        self,
+        P1: np.ndarray,
+        P2: np.ndarray,
+        a_matrix: np.ndarray,
+        ):
+        """
+        Retrieve the displacment (U) matrices using two phase matrices.
+        
+        Parameters
+        ----------
+        P1: (nx, ny) np.ndarray
+            The first phase matrix.
+        P2: (nx, ny) np.ndarray
+            The second phase matrix.
+        a_matrix: (2, 2) np.ndarray
+            The transpose of the real space lattice vector matrix. The entries are organized like this: [[a1x a2x], [a1y a2y]].
+
+        Returns
+        -------
+        ux: (nx, ny) np.ndarray
+            The atomic displacement map in the X (row) direction.
+        uy: (nx, ny) np.ndarray
+            The atomic displacement map in the Y (column) direction.
+        """
+        P1 = skr.unwrap_phase(P1)
+        P2 = skr.unwrap_phase(P2)
+        rolled_p = np.asarray((np.reshape(P1,-1),np.reshape(P2,-1)))
+        u_matrix = -1/(2*np.pi)*np.matmul(a_matrix,rolled_p)
+        u_x = np.reshape(u_matrix[0,:],P1.shape)
+        u_y = np.reshape(u_matrix[1,:],P2.shape)
+        return u_x,u_y
+
+    def circ_to_G(
+        self,
+        circ_pos: np.ndarray
+        ):
+        """
+        Convert peak coordinates from absolute pixel location to centered k-space units.
+        
+        Parameters
+        ----------
+        circ_pos: (2) np.ndarray
+            The position of the peak given in absolute coordinates (measured from corner origin) in pixels.
+        
+        Returns
+        -------
+        g_vec: (2) np.ndarray
+            The position of the peak given in centered (self.image.shape/2) k-space coordinates (frequency units).
+        """
+        g_vec = np.zeros(2)
+        g_vec[0] = ((circ_pos[0] - (0.5*self.nx))/self.nx)
+        g_vec[1] = ((circ_pos[1] - (0.5*self.ny))/self.ny)
+        return g_vec
+
+    def G_to_circ(
+        self,
+        g_vec: np.ndarray,
+        ):
+        """
+        Convert peak coordinates from centered k-space units to absolute pixel location.
+        
+        Parameters
+        ----------
+        g_vec: (2) np.ndarray
+            The position of the peak given in centered (self.image.shape/2) k-space coordinates (frequency units).
+        
+        Returns
+        -------
+        circ_pos: (2) np.ndarray
+            The position of the peak given in absolute coordinates (measured from corner origin) in pixels.
+        """
+        circ_pos = np.zeros(2)
+        circ_pos[0] = (g_vec[0]*self.nx) + (0.5*self.nx)
+        circ_pos[1] = (g_vec[1]*self.ny) + (0.5*self.ny)
+        return circ_pos
+
+    def get_xy_2(
+        self,
+        coords_arr: np.dtype([("x", float), ("y", float), ("intensity", float)]),
+        ):
+        """
+        Converts the custom dtype to an np.ndarray.
+        
+        Parameters
+        ----------
+        coords_arr: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            A single set of peak coordinates that has not already been indexed.
+        
+        Returns
+        -------
+        xyCoords: (2) np.ndarray
+            A simple array with two entries giving the x (row) and y (column) coordinates of the input peak.
+        """
+        xyCoords = np.array([coords_arr['x'][0], coords_arr['y'][0]])
+        return xyCoords
+
+    def get_xy(
+        self,
+        coords_arr: np.dtype([("x", float), ("y", float), ("intensity", float)]),
+        ):
+        """
+        Converts the custom dtype to an np.ndarray.
+        
+        Parameters
+        ----------
+        coords_arr: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            A single set of peak coordinates.
+            
+        Returns
+        -------
+        xyCoords: (2) np.ndarray
+            A simple array with three entries giving the x (row) and y (column) coordinates of the input peak.
+        """
+        xyCoords = np.array([coords_arr['x'], coords_arr['y']])
+        return xyCoords
+
+    def calculate_strain_map(
+        self,
+        displacementX: np.ndarray, 
+        displacementY: np.ndarray,
+        showResult: bool = True,
+        ):
+        """
+        Using the x and y displacement maps, calculate the strain maps.
+        
+        Parameters
+        ----------
+        displacementX: (nx, ny) np.ndarray
+            A 2D array that maps the X (row offset) displacement within the lattice.
+        displacementY: (nx, ny) np.ndarray
+            A 2D array that maps the Y (column offset) displacement within the lattice.
+        showResult: bool
+            Show the real space strain. Defaults to True.
+            
+        Returns
+        -------
+        e_mat: (2, 2, nx, ny) np.ndarray
+            The 2x2 tensor of strain maps.
+        """
+        e_xx,e_xy = self.phase_diff(displacementX)
+        e_yx,e_yy = self.phase_diff(displacementY)
+        e_mat = np.array([
+            [e_xx, e_xy],
+            [e_yx, e_yy]
+        ])
+        
+        e_xx, e_yy = self.get_axial_strain(e_mat)
+        e_th_xy, e_dg_xy = self.get_rot_and_diag_strain(e_mat)
+        if showResult == True:
+            (fig,axs) = plt.subplots(2,2, figsize = (20,25))
+            axs = axs.flatten()
+            axs[0].imshow(self.image, cmap = 'gray', origin = 'upper'); axs[0].axis('off')
+            axs[1].imshow(e_xx, cmap = 'BrBG', origin = 'upper'); axs[1].set_title('$Strain_{xx}$', fontsize = 20); axs[1].axis('off')
+            axs[2].imshow(e_yy, cmap = 'BrBG', origin = 'upper'); axs[2].set_title('$Strain_{yy}$', fontsize = 20); axs[2].axis('off')
+            axs[3].imshow(e_dg_xy, cmap = 'BrBG', origin = 'upper'); axs[3].set_title('$Strain_{xy}$', fontsize = 20); axs[3].axis('off')
+        fig.tight_layout()
+        return e_mat
+
+    def calculate_strain_map_phase(
+        self,
+        peakCoordinatesA,
+        peakCoordinatesB,
+        phaseA,
+        phaseB,
+        showResult = True
+    ):
+
+        center_coords = np.asarray(self.image.shape)//2
+        peakCoordinatesA_G = self.circ_to_G(self.get_xy_2(peakCoordinatesA))
+        peakCoordinatesB_G = self.circ_to_G(self.get_xy_2(peakCoordinatesB))
+        peakMatrix = self.get_a_matrix(peakCoordinatesA_G, peakCoordinatesB_G)
+
+        phase_derivative = np.zeros([2,2,self.nx, self.ny])
+
+        expA_matrix1 = np.exp(-1j*phaseA)
+        expA_matrix2 = np.exp(1j*phaseA)
+        phase_derivative[0, 0] = np.imag(np.multiply(expA_matrix1,np.gradient(expA_matrix2, axis=0))) # phaseA_dx 
+        phase_derivative[0, 1] = np.imag(np.multiply(expA_matrix1,np.gradient(expA_matrix2, axis=1))) # phaseA_dy
+
+        expB_matrix1 = np.exp(-1j*phaseB)
+        expB_matrix2 = np.exp(1j*phaseB)
+        phase_derivative[1, 0] = np.imag(np.multiply(expB_matrix1,np.gradient(expB_matrix2, axis=0))) # phaseB_dx
+        phase_derivative[1, 1] = np.imag(np.multiply(expB_matrix1,np.gradient(expB_matrix2, axis=1))) # phaseB_dy
+
+        e_mat = -1/(2*np.pi) * np.einsum('ij,jkab->ikab', peakMatrix, phase_derivative)
+
+        e_xx, e_yy = self.get_axial_strain(e_mat)
+        e_th_xy, e_dg_xy = self.get_rot_and_diag_strain(e_mat)
+        if showResult == True:
+            (fig,axs) = plt.subplots(2,2, figsize = (20,25))
+            axs = axs.flatten()
+            axs[0].imshow(self.image, cmap = 'gray', origin = 'upper'); axs[0].axis('off')
+            axs[1].imshow(e_xx, cmap = 'BrBG', origin = 'upper'); axs[1].set_title('$Strain_{xx}$', fontsize = 20); axs[1].axis('off')
+            axs[2].imshow(e_yy, cmap = 'BrBG', origin = 'upper'); axs[2].set_title('$Strain_{yy}$', fontsize = 20); axs[2].axis('off')
+            axs[3].imshow(e_dg_xy, cmap = 'BrBG', origin = 'upper'); axs[3].set_title('$Strain_{xy}$', fontsize = 20); axs[3].axis('off')
+        fig.tight_layout()
+
+        return e_mat
+
+    def get_rot_and_diag_strain(
+        self, 
+        e_mat: np.ndarray,
+        ):
+        """
+        Unpack and build the rotation and shear strain components.
+        
+        Parameters
+        ----------
+        e_mat: (2,2, nx, ny)
+            The strain maps.
+        
+        Returns
+        -------
+        e_th_xy: (nx, ny) np.ndarray
+            The xy rotation matrix.
+        e_dg_xy: (nx, ny) np.ndarray
+            The xy shear strain matrix.
+        """
+        e_th_xy = 0.5*(e_mat[0,1] - e_mat[1,0])
+        
+        e_dg_xy = 0.5*(e_mat[0,1] + e_mat[1,0])
+        return e_th_xy, e_dg_xy
+
+    def get_axial_strain(
+        self,
+        e_mat: np.ndarray,
+        ):
+        """
+        Unpack and build the axial strain components.
+        
+        Parameters
+        ----------
+        e_mat: (2, 2, nx, ny)
+            The strain maps.
+        
+        Returns
+        -------
+        e_mat[0,0]: (nx, ny) np.ndarray
+            The x (row) axial strain.
+        e_mat[1,1]: (nx, ny) np.ndarray
+            The y (column) axial strain.
+       """
+        return e_mat[0,0], e_mat[1,1]
+
+    def define_reference(
+        self,
+        x1: int,
+        x2: int,
+        y1: int,
+        y2: int,
+        ):
+        """
+        Locate visually the unstrained reference region.
+        
+        Parameters
+        ----------
+        x1:      Left limiting line
+        x2:     Right limiting line
+        y1:     Bottom limiting line
+        y2:     Top limiting line
+        
+        Returns
+        -------
+        ref_reg: np.ndarray
+                Boolean indices marking the reference region in 2D
+        """
+        xx,yy = np.meshgrid(np.arange(self.nx),np.arange(self.ny), indexing = 'ij')
+        ref_reg = np.logical_and(np.logical_and(xx>x1, xx<x2), np.logical_and(yy>y1, yy<y2))
+
+        A = (x1, y2)
+        B = (x2, y2)
+        C = (x2, y1)
+        D = (x1, y1)
+        
+        plt.figure(figsize=(15,15))
+        plt.imshow(self.image_normalizer(self.image)+0.33*ref_reg, origin = 'upper')
+        plt.annotate(A, (A[0]/self.nx, (1 - A[1]/self.ny)), textcoords='axes fraction', size=15,color='w')
+        plt.annotate(B, (B[0]/self.nx, (1 - B[1]/self.ny)), textcoords='axes fraction', size=15,color='w')
+        plt.annotate(C, (C[0]/self.nx, (1 - C[1]/self.ny)), textcoords='axes fraction', size=15,color='w')
+        plt.annotate(D, (D[0]/self.nx, (1 - D[1]/self.ny)), textcoords='axes fraction', size=15,color='w')
+        plt.scatter(A[1],A[0]) # scatter uses column row ordering, so we must put these in reverse order.
+        plt.scatter(B[1],B[0])
+        plt.scatter(C[1],C[0])
+        plt.scatter(D[1],D[0])
+        plt.axis('off')
+        return ref_reg
+
+    def set_reference_matrix(
+        self,
+        planeX1: int,
+        planeX2: int,
+        planeY1: int,
+        planeY2: int,
+        ):
+        """
+        Dictate a region of ideal (minimally distorted) lattice using 4 lines. This region will be a rectangle.
+        
+        Parameters
+        ----------
+        planeX1: int
+            The lower bounding x plane for the region.
+        planeX2: int
+            The upper bounding x plane for the region.
+        planeY1: int
+            The lower bounding y plane for the region.
+        planeY2: int
+            The upper bounding y plane for the region.
+            
+        Returns
+        -------
+        referenceMatrix: np.ndarray, bool
+            The reference (ideal) region of the crystal.
+        """
+        referenceMatrix = self.define_reference(planeX1, planeX2, planeY1, planeY2)
+        return referenceMatrix
+
+    def set_reference_matrix_s(
+        self,
+        centerOfReferenceRegion: int,
+        radiusOfReferenceRegion: int,
+        ):
+        """
+        Dictate a region of ideal (minimally distorted) lattice using a center and square half side length. This region will be a square.
+        
+        Parameters
+        ----------
+        centerOfReferenceRegion: (2) np.ndarray
+            An array with 2 entries giving the X (row) and Y (column) coordinates of the center of the region. These coordinates should be absolute and in pixels.
+        radiusOfReferenceRegion: int
+            An integer value that gives the half side length of the square defining the reference region.
+
+        Returns
+        -------
+        referenceMatrix: np.ndarray, bool
+            The reference (ideal) region of the crystal.
+        """
+        planeX1 = centerOfReferenceRegion[0] - radiusOfReferenceRegion
+        planeX2 = centerOfReferenceRegion[0] + radiusOfReferenceRegion
+        planeY1 = centerOfReferenceRegion[1] - radiusOfReferenceRegion
+        planeY2 = centerOfReferenceRegion[1] + radiusOfReferenceRegion
+        referenceMatrix = self.define_reference(planeX1, planeX2, planeY1, planeY2)
+        return referenceMatrix
+
+    def refine_phase(
+        self,
+        phaseMap: np.ndarray,
+        peakCoordinates: np.dtype([("x", float), ("y", float), ("intensity", float)]),
+        referenceMatrix: np.ndarray,
+        maskSize: float,
+        iterations: int,
+        useGaussMask: bool,
+        showResult: bool = True,
+        ):
+        """
+        Refine the geometric phase according to the user-defined reference (ideal) region of the crystal.
+
+        Parameters
+        ----------
+        phaseMap: (nx, ny) np.ndarray
+            A 2D geometric phase map (to be refined).
+        peakCoordinates: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            The coordinates for the peak used to generate the phase map.
+        referenceMatrix: np.ndarray, bool
+            The user-defined reference (ideal) region of the crystal.
+        maskSize: float
+            The size of the input mask. Highly tunable. Lower values correspond to larger convolution kernel and lower resolution.
+        iterations: int
+            The number of iterations of phase refinement.
+        useGaussMask: bool
+            Control for whether to use a Gaussian mask or circular binary mask. Defaults to True (Gaussian).
+        showResult: bool
+            Show the real space geometric phase alongside the shifted Fourier transform and the Gaussian mask. Defaults to True.
+        
+        Returns
+        -------
+        peakCoordinatesRefined_dtype: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            The refined peak coordinates in a custom dtype.
+        phaseMapRefined: (nx, ny) np.ndarray
+            The 2D phase map after refinement.
+        """
+        peakCoordinates_xy = self.get_xy_2(peakCoordinates)
+        ry = np.arange(start=-self.nx/2,stop=self.nx/2,step=1)
+        rx = np.arange(start=-self.ny/2,stop=self.ny/2,step=1)
+        rx,ry = np.meshgrid(rx,ry, indexing = 'ij')
+        
+        peakCoordinatesRefined = peakCoordinates_xy.copy(); phaseMapRefined = phaseMap.copy()
+        for _ in range(int(iterations)):
+            G_x,G_y = self.phase_diff(phaseMapRefined)
+            G_nabla = G_x + G_y
+            g_r = G_nabla/(2*np.pi)
+            del_g = np.asarray((np.median(g_r[referenceMatrix]/rx[referenceMatrix]),np.median(g_r[referenceMatrix]/ry[referenceMatrix])))
+            peakCoordinatesRefined += del_g
+            peakCoordinatesRefined_dtype = np.zeros(1, dtype=self.dtype)
+            peakCoordinatesRefined_dtype["x"] = peakCoordinatesRefined[0]
+            peakCoordinatesRefined_dtype["y"] = peakCoordinatesRefined[1]
+            phaseMapRefined = np.angle(self.calculate_phase_map(peakCoordinatesRefined_dtype,gaussianMask=useGaussMask,inputMaskSize=maskSize,showResult=False))
+        
+        if showResult:
+            im_pha_gp = self.phase_im_lab(phaseMapRefined)
+            (_,axs) = plt.subplots(1,2,figsize=(15,30))
+            axs[0].imshow(self.image,cmap='gray', origin = 'upper'); axs[0].axis('off')
+            axs[1].imshow(im_pha_gp, origin = 'upper'); axs[1].axis('off')
+
+        peakCoordinatesRefined_dtype = np.zeros(1, dtype=self.dtype)
+        peakCoordinatesRefined_dtype['x'] = peakCoordinatesRefined[0]
+        peakCoordinatesRefined_dtype['y'] = peakCoordinatesRefined[1]
+        return peakCoordinatesRefined_dtype, phaseMapRefined
+
+    def phase_diff(
+        self, 
+        angle_image: np.ndarray,
+        ):
+        """
+        Differentiate the complex exponential of the phase image, and then obtain the 
+        differentiation result by multiplying the differential with 
+        the conjugate of the complex phase image.
+        Here, the image is 2D.
+        
+        Parameters
+        ----------
+        angle_image:  np.ndarray
+                    Wrapped phase image 
+        
+        Returns
+        -------
+        diff_x: np.ndarray
+                X difference of the phase image
+        diff_y: np.ndarray
+                Y difference of the phase image
+        """
+        imaginary_image = np.exp(1j * angle_image)
+        
+        diff_imaginary_x = np.zeros(imaginary_image.shape,dtype=complex)
+        diff_imaginary_x[0:-1,:] = np.diff(imaginary_image,axis=0)
+        diff_imaginary_y = np.zeros(imaginary_image.shape,dtype=complex)
+        diff_imaginary_y[:,0:-1] = np.diff(imaginary_image,axis=1)
+
+        conjugate_imaginary = np.conj(imaginary_image)
+        diff_complex_x = np.multiply(conjugate_imaginary,diff_imaginary_x)
+        diff_complex_y = np.multiply(conjugate_imaginary,diff_imaginary_y)
+        
+        diff_x = np.imag(diff_complex_x)
+        diff_y = np.imag(diff_complex_y)
+        
+        return diff_x,diff_y
+
+    def locate_first_order_peaks(
+        self,
+        peakCoordinates: np.dtype([("x", float), ("y", float), ("intensity", float)]),
+        ):
+        """
+        Locate three low-order linearly independent peaks in k-space.
+
+        Parameters
+        ----------
+        peakCoordinates: (number of peaks) np.ndarrary, np.dtype([("x", float), ("y", float), ("intensity", float)])
+            An array of input peaks. This array should contain at least 2 linearly independent Bragg vectors.
+            
+        Returns
+        -------
+        peakA: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            The first peak (closest to central peak).
+        peakB: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            The first peak (second closest to central peak).
+        """
+        midX = self.nx//2; midY = self.ny//2
+        peakCoordinatesRespCenter = np.zeros(len(peakCoordinates), dtype=self.dtype)
+        peakCoordinatesRespCenter['x'] = peakCoordinates['x'] - midX
+        peakCoordinatesRespCenter['y'] = peakCoordinates['y'] - midY
+        peakRadialDistCenter = peakCoordinatesRespCenter['x']**2 + peakCoordinatesRespCenter['y']**2
+        
+        smallestRadiiIndices = np.argsort(peakRadialDistCenter)
+        peakCoordinatesRespCenter = peakCoordinatesRespCenter[smallestRadiiIndices]
+        
+        # The closest peak should be the zero order peak - not interested in that.
+        peakAInd = 1
+        peakBInd = None
+        ####
+        crossAWithRest = np.zeros([len(peakCoordinates)-2]) # this 2 comes from the A peak and the central peak that are excluded from consideration for the B and C peaks
+        peakA_xy = self.get_xy(peakCoordinatesRespCenter[peakAInd])
+        for peakIndex in np.arange(2,len(peakCoordinates)):
+            currentPeak = self.get_xy(peakCoordinatesRespCenter[peakIndex])
+            crossAWithRest[peakIndex-2] = np.cross(peakA_xy, currentPeak)
+        threshold = 5 * (np.min(np.abs(crossAWithRest))+0.1)
+
+        thresholdCondition = np.abs(crossAWithRest)>threshold
+        if np.any(thresholdCondition):
+            peakBInd = np.argmax(thresholdCondition) + 2 # returning the 2 that was subtracted above
+        else:
+            print('Lowering threshold B')
+            threshold = 2 * (np.min(np.abs(crossAWithRest))+0.1)
+            thresholdCondition = np.abs(crossAWithRest)>threshold
+            peakBInd = np.argmax(thresholdCondition) + 2
+
+        peakA = np.zeros(1, dtype=self.dtype)
+        peakB = np.zeros(1, dtype=self.dtype)
+
+        peakA['x'] = peakCoordinates['x'][smallestRadiiIndices[peakAInd]]; peakA['y'] = peakCoordinates['y'][smallestRadiiIndices[peakAInd]]; peakA['intensity'] = peakCoordinates['intensity'][smallestRadiiIndices[peakAInd]]
+        peakB['x'] = peakCoordinates['x'][smallestRadiiIndices[peakBInd]]; peakB['y'] = peakCoordinates['y'][smallestRadiiIndices[peakBInd]]; peakB['intensity'] = peakCoordinates['intensity'][smallestRadiiIndices[peakBInd]]
+        return peakA, peakB
+
+    def locate_diffraction_spots(
+        self,
+        maxNumPeaks_in: int,
+        ):
+        """
+        Calls the maxima finder.
+        
+        Parameters
+        ----------
+        maxNumPeaks_in: int
+            The number of peaks to return. Noisier data should use a smaller value. For 2D crystals, more than 3 peaks should be sought. 
+        Returns
+        -------
+        peakList: (maxNumPeaks_in) np.ndarray, np.dtype([("x", float), ("y", float), ("intensity", float)])
+            An array of peak coordinates with a custom datatype.
+        """
+        peakList = self.get_maxima_2D(np.abs(self.imFFT), maxNumPeaks = maxNumPeaks_in, _ar_FT = self.imFFT)
+        return peakList
+
+    # Functions from py4DSTEM for peak finding.
+    def get_maxima_2D(
+        self,
+        ar: np.ndarray,
+        subpixel: str = "poly",
+        upsample_factor: int = 16,
+        sigma: float = 0,
+        minAbsoluteIntensity: float = 0,
+        minRelativeIntensity: float = 0,
+        relativeToPeak: float = 0,
+        minSpacing: float = 0,
+        edgeBoundary: int = 1,
+        maxNumPeaks: int = 1,
+        _ar_FT: np.ndarray | None = None,
+    ):
+        """
+        Finds the maximal points of a 2D array.
+
+        Parameters
+        ----------
+        ar: (nx, ny) np.ndarray
+            The 2D image with peaks.
+        subpixel: string
+            specifies the subpixel resolution algorithm to use.
+            must be in ('pixel','poly','multicorr'), which correspond
+            to pixel resolution, subpixel resolution by fitting a
+            parabola, and subpixel resultion by Fourier upsampling.
+        upsample_factor: int 
+            the upsampling factor for the 'multicorr' algorithm
+        sigma: float
+            If > 0, applies a gaussian filter
+        maxNumPeaks: int
+            The maximum number of maxima to return
+        minAbsoluteIntensity, minRelativeIntensity, relativeToPeak,
+            minSpacing, edgeBoundary, maxNumPeaks: filtering applied
+            after maximum detection and before subpixel refinement.
+            Parameter descriptions in filter_2D_maxima.
+        _ar_FT: (nx, ny) np.ndarray, complex
+            If 'multicorr' is used and this is not None, uses this argument
+            as the Fourier transform of `ar`, instead of recomputing it
+
+        Returns
+        -------
+        maxima: np.ndarray, np.dtype([("x", float), ("y", float), ("intensity", float)])
+            A structured array of maxima with fields 'x','y','intensity'
+        """
+
+        subpixel_modes = ("pixel", "poly", "multicorr")
+        er = f"Unrecognized subpixel option {subpixel}. Must be in {subpixel_modes}"
+        assert subpixel in subpixel_modes, er
+
+        # gaussian filtering
+        ar = ar if sigma <= 0 else gaussian_filter(ar, sigma)
+
+        # local pixelwise maxima
+        maxima_bool = (
+            (ar >= np.roll(ar, (-1, 0), axis=(0, 1)))
+            & (ar > np.roll(ar, (1, 0), axis=(0, 1)))
+            & (ar >= np.roll(ar, (0, -1), axis=(0, 1)))
+            & (ar > np.roll(ar, (0, 1), axis=(0, 1)))
+            & (ar >= np.roll(ar, (-1, -1), axis=(0, 1)))
+            & (ar > np.roll(ar, (-1, 1), axis=(0, 1)))
+            & (ar >= np.roll(ar, (1, -1), axis=(0, 1)))
+            & (ar > np.roll(ar, (1, 1), axis=(0, 1)))
+        )
+
+        # remove edges
+        assert isinstance(edgeBoundary, (int, np.integer))
+        if edgeBoundary < 1:
+            edgeBoundary = 1
+        maxima_bool[:edgeBoundary, :] = False
+        maxima_bool[-edgeBoundary:, :] = False
+        maxima_bool[:, :edgeBoundary] = False
+        maxima_bool[:, -edgeBoundary:] = False
+
+        # get indices
+        # sort by intensity
+        maxima_x, maxima_y = np.nonzero(maxima_bool)
+        dtype = np.dtype([("x", float), ("y", float), ("intensity", float)])
+        maxima = np.zeros(len(maxima_x), dtype=dtype)
+        maxima["x"] = maxima_x
+        maxima["y"] = maxima_y
+        maxima["intensity"] = ar[maxima_x, maxima_y]
+        maxima = np.sort(maxima, order="intensity")[::-1]
+
+        if len(maxima) == 0:
+            return maxima
+
+        # filter
+        maxima = self.filter_2D_maxima(
+            maxima,
+            minAbsoluteIntensity=minAbsoluteIntensity,
+            minRelativeIntensity=minRelativeIntensity,
+            relativeToPeak=relativeToPeak,
+            minSpacing=minSpacing,
+            edgeBoundary=edgeBoundary,
+            maxNumPeaks=maxNumPeaks,
+        )
+
+        if subpixel == "pixel":
+            return maxima
+
+        # Parabolic subpixel refinement
+        for i in range(len(maxima)):
+            Ix1_ = ar[int(maxima["x"][i]) - 1, int(maxima["y"][i])].astype(np.float64)
+            Ix0 = ar[int(maxima["x"][i]), int(maxima["y"][i])].astype(np.float64)
+            Ix1 = ar[int(maxima["x"][i]) + 1, int(maxima["y"][i])].astype(np.float64)
+            Iy1_ = ar[int(maxima["x"][i]), int(maxima["y"][i]) - 1].astype(np.float64)
+            Iy0 = ar[int(maxima["x"][i]), int(maxima["y"][i])].astype(np.float64)
+            Iy1 = ar[int(maxima["x"][i]), int(maxima["y"][i]) + 1].astype(np.float64)
+            deltax = (Ix1 - Ix1_) / (4 * Ix0 - 2 * Ix1 - 2 * Ix1_)
+            deltay = (Iy1 - Iy1_) / (4 * Iy0 - 2 * Iy1 - 2 * Iy1_)
+            maxima["x"][i] += deltax
+            maxima["y"][i] += deltay
+            maxima["intensity"][i] = self.linear_interpolation_2D(
+                ar, maxima["x"][i], maxima["y"][i]
+            )
+
+        if subpixel == "poly":
+            return maxima
+
+        # Fourier upsampling
+        if _ar_FT is None:
+            _ar_FT = np.fft.fft2(ar)
+        for ipeak in range(len(maxima["x"])):
+            xyShift = np.array((maxima["x"][ipeak], maxima["y"][ipeak]))
+            # we actually have to lose some precision and go down to half-pixel
+            # accuracy for multicorr
+            xyShift[0] = np.round(xyShift[0] * 2) / 2
+            xyShift[1] = np.round(xyShift[1] * 2) / 2
+
+            subShift = self.upsampled_correlation(_ar_FT, upsample_factor, xyShift)
+            maxima["x"][ipeak] = subShift[0]
+            maxima["y"][ipeak] = subShift[1]
+
+        maxima = np.sort(maxima, order="intensity")[::-1]
+        return maxima
+
+    def filter_2D_maxima(
+        self,
+        maxima,
+        minAbsoluteIntensity=0,
+        minRelativeIntensity=0,
+        relativeToPeak=0,
+        minSpacing=0,
+        edgeBoundary=1,
+        maxNumPeaks=1,
+    ):
+        """
+        Args:
+            maxima : a numpy structured array with fields 'x', 'y', 'intensity'
+            minAbsoluteIntensity : delete counts with intensity below this value
+            minRelativeIntensity : delete counts with intensity below this value times
+                the intensity of the i'th peak, where i is given by `relativeToPeak`
+            relativeToPeak : see above
+            minSpacing : if two peaks are within this euclidean distance from one
+                another, delete the less intense of the two
+            edgeBoundary : delete peaks within this distance of the image edge
+            maxNumPeaks : an integer. defaults to 1
+
+        Returns:
+            a numpy structured array with fields 'x', 'y', 'intensity'
+        """
+
+        # Remove maxima which are too dim
+        if minAbsoluteIntensity > 0:
+            deletemask = maxima["intensity"] < minAbsoluteIntensity
+            maxima = maxima[~deletemask]
+
+        # Remove maxima which are too dim, compared to the n-th brightest
+        if (minRelativeIntensity > 0) & (len(maxima) > relativeToPeak):
+            assert isinstance(relativeToPeak, (int, np.integer))
+            deletemask = (
+                maxima["intensity"] / maxima["intensity"][relativeToPeak]
+                < minRelativeIntensity
+            )
+            maxima = maxima[~deletemask]
+
+        # Remove maxima which are too close
+        if minSpacing > 0:
+            deletemask = np.zeros(len(maxima), dtype=bool)
+            for i in range(len(maxima)):
+                if deletemask[i] == False:  # noqa: E712
+                    tooClose = (
+                        (maxima["x"] - maxima["x"][i]) ** 2
+                        + (maxima["y"] - maxima["y"][i]) ** 2
+                    ) < minSpacing**2
+                    tooClose[: i + 1] = False
+                    deletemask[tooClose] = True
+            maxima = maxima[~deletemask]
+
+        # Remove maxima in excess of maxNumPeaks
+        if maxNumPeaks is not None:
+            if len(maxima) > maxNumPeaks:
+                maxima = maxima[:maxNumPeaks]
+
+        return maxima
+
+
+    def linear_interpolation_2D(self, ar, x, y):
+        """
+        Calculates the 2D linear interpolation of array ar at position x,y using the four
+        nearest array elements.
+        """
+        x0, x1 = int(np.floor(x)), int(np.ceil(x))
+        y0, y1 = int(np.floor(y)), int(np.ceil(y))
+        dx = x - x0
+        dy = y - y0
+        return (
+            (1 - dx) * (1 - dy) * ar[x0, y0]
+            + (1 - dx) * dy * ar[x0, y1]
+            + dx * (1 - dy) * ar[x1, y0]
+            + dx * dy * ar[x1, y1]
+        )
+
+
+
+    def upsampled_correlation(self, imageCorr, upsampleFactor, xyShift, device="cpu"):
+        """
+        Refine the correlation peak of imageCorr around xyShift by DFT upsampling.
+
+        There are two approaches to Fourier upsampling for subpixel refinement: (a) one
+        can pad an (appropriately shifted) FFT with zeros and take the inverse transform,
+        or (b) one can compute the DFT by matrix multiplication using modified
+        transformation matrices. The former approach is straightforward but requires
+        performing the FFT algorithm (which is fast) on very large data. The latter method
+        trades one speedup for a slowdown elsewhere: the matrix multiply steps are expensive
+        but we operate on smaller matrices. Since we are only interested in a very small
+        region of the FT around a peak of interest, we use the latter method to get
+        a substantial speedup and enormous decrease in memory requirement. This
+        "DFT upsampling" approach computes the transformation matrices for the matrix-
+        multiply DFT around a small 1.5px wide region in the original `imageCorr`.
+
+        Following the matrix multiply DFT we use parabolic subpixel fitting to
+        get even more precision! (below 1/upsampleFactor pixels)
+
+        NOTE: previous versions of multiCorr operated in two steps: using the zero-
+        padding upsample method for a first-pass factor-2 upsampling, followed by the
+        DFT upsampling (at whatever user-specified factor). I have implemented it
+        differently, to better support iterating over multiple peaks. **The DFT is always
+        upsampled around xyShift, which MUST be specified to HALF-PIXEL precision
+        (no more, no less) to replicate the behavior of the factor-2 step.**
+        (It is possible to refactor this so that peak detection is done on a Fourier
+        upsampled image rather than using the parabolic subpixel and rounding as now...
+        I like keeping it this way because all of the parameters and logic will be identical
+        to the other subpixel methods.)
+
+
+        Args:
+            imageCorr (complex valued ndarray):
+                Complex product of the FFTs of the two images to be registered
+                i.e. m = np.fft.fft2(DP) * probe_kernel_FT;
+                imageCorr = np.abs(m)**(corrPower) * np.exp(1j*np.angle(m))
+            upsampleFactor (int):
+                Upsampling factor. Must be greater than 2. (To do upsampling
+                with factor 2, use upsampleFFT, which is faster.)
+            xyShift:
+                Location in original image coordinates around which to upsample the
+                FT. This should be given to exactly half-pixel precision to
+                replicate the initial FFT step that this implementation skips
+
+        Returns:
+            (2-element np array): Refined location of the peak in image coordinates.
+        """
+
+        if device == "cpu":
+            xp = np
+        elif device == "gpu":
+            xp = cp
+
+        assert upsampleFactor > 2
+
+        xyShift[0] = xp.round(xyShift[0] * upsampleFactor) / upsampleFactor
+        xyShift[1] = xp.round(xyShift[1] * upsampleFactor) / upsampleFactor
+
+        globalShift = xp.fix(xp.ceil(upsampleFactor * 1.5) / 2)
+
+        upsampleCenter = xp.asarray(globalShift - upsampleFactor * xyShift)
+
+        imageCorrUpsample = xp.conj(
+            self.dftUpsample(xp.conj(imageCorr), upsampleFactor, upsampleCenter, device=device)
+        )
+
+        xySubShift = xp.asarray(
+            xp.unravel_index(imageCorrUpsample.argmax(), imageCorrUpsample.shape)
+        )
+
+        # add a subpixel shift via parabolic fitting
+        try:
+            icc = xp.real(
+                imageCorrUpsample[
+                    xySubShift[0] - 1 : xySubShift[0] + 2,
+                    xySubShift[1] - 1 : xySubShift[1] + 2,
+                ]
+            )
+            dx = (icc[2, 1] - icc[0, 1]) / (4 * icc[1, 1] - 2 * icc[2, 1] - 2 * icc[0, 1])
+            dy = (icc[1, 2] - icc[1, 0]) / (4 * icc[1, 1] - 2 * icc[1, 2] - 2 * icc[1, 0])
+        except:
+            dx, dy = (
+                0,
+                0,
+            )  # this is the case when the peak is near the edge and one of the above values does not exist
+
+        xySubShift = xySubShift - globalShift
+
+        xyShift = xyShift + (xySubShift + xp.array([dx, dy])) / upsampleFactor
+
+        return xyShift
+
+
+    def dftUpsample(self, imageCorr, upsampleFactor, xyShift, device="cpu"):
+        """
+        This performs a matrix multiply DFT around a small neighboring region of the inital
+        correlation peak. By using the matrix multiply DFT to do the Fourier upsampling, the
+        efficiency is greatly improved. This is adapted from the subfuction dftups found in
+        the dftregistration function on the Matlab File Exchange.
+
+        https://www.mathworks.com/matlabcentral/fileexchange/18401-efficient-subpixel-image-registration-by-cross-correlation
+
+        The matrix multiplication DFT is from:
+
+        Manuel Guizar-Sicairos, Samuel T. Thurman, and James R. Fienup, "Efficient subpixel
+        image registration algorithms," Opt. Lett. 33, 156-158 (2008).
+        http://www.sciencedirect.com/science/article/pii/S0045790612000778
+
+        Args:
+            imageCorr (complex valued ndarray):
+                Correlation image between two images in Fourier space.
+            upsampleFactor (int):
+                Scalar integer of how much to upsample.
+            xyShift (list of 2 floats):
+                Coordinates in the UPSAMPLED GRID around which to upsample.
+                These must be single-pixel IN THE UPSAMPLED GRID
+
+        Returns:
+            (ndarray):
+                Upsampled image from region around correlation peak.
+        """
+        if device == "cpu":
+            xp = np
+        elif device == "gpu":
+            xp = cp
+
+        imageSize = imageCorr.shape
+        pixelRadius = 1.5
+        numRow = np.ceil(pixelRadius * upsampleFactor)
+        numCol = numRow
+
+        colKern = xp.exp(
+            (-1j * 2 * np.pi / (imageSize[1] * upsampleFactor))
+            * xp.outer(
+                (xp.fft.ifftshift((xp.arange(imageSize[1]))) - xp.floor(imageSize[1] / 2)),
+                (xp.arange(numCol) - xyShift[1]),
+            )
+        )
+
+        rowKern = xp.exp(
+            (-1j * 2 * np.pi / (imageSize[0] * upsampleFactor))
+            * xp.outer(
+                (xp.arange(numRow) - xyShift[0]),
+                (xp.fft.ifftshift(xp.arange(imageSize[0])) - xp.floor(imageSize[0] / 2)),
+            )
+        )
+
+        imageUpsample = xp.real(rowKern @ imageCorr @ colKern)
+        return imageUpsample
