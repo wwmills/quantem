@@ -81,7 +81,7 @@ def to_cpu(arrs: Any) -> np.ndarray | Sequence:
     elif isinstance(arrs, tuple):
         return tuple([to_cpu(i) for i in arrs])
     else:
-        raise NotImplementedError(f"Unkown type: {type(arrs)}")
+        raise NotImplementedError(f"Unknown type: {type(arrs)}")
 
 
 # endregion
