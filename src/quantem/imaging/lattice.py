@@ -11,6 +11,16 @@ from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 
 
+from quantem.core import config
+
+import matplotlib.pyplot as plt
+if config.get("has_cupy"):
+    import cupy as cp
+else:
+    import numpy as cp
+
+from scipy.ndimage import gaussian_filter
+
 class Lattice(AutoSerialize):
     """
     Atomic lattice fitting in 2D.
@@ -74,10 +84,9 @@ class Lattice(AutoSerialize):
         block_size: int = -1,
         plot_lattice=True,
         bound_num_vectors=None,
-        mask=None,
+        input_mask=None,
         refine_lattice=True,
         refine_maxiter: int = 200,
-        debugging=False,
         **kwargs,
     ):
         # Lattice
@@ -176,6 +185,14 @@ class Lattice(AutoSerialize):
                     & np.isfinite(y)
                 )
 
+                if input_mask is not None:
+                    pixel_buffer = 1028
+                    input_mask_padded = np.zeros([input_mask.shape[0] + 2*pixel_buffer,input_mask.shape[1] + 2*pixel_buffer]).astype(bool)
+                    input_mask_padded[pixel_buffer:-pixel_buffer, pixel_buffer:-pixel_buffer] = input_mask
+                    x_round = np.round(x).astype(np.int32) + pixel_buffer
+                    y_round = np.round(y).astype(np.int32) + pixel_buffer
+                    valid_mask &= input_mask_padded[x_round, y_round] & input_mask_padded[x_round+1, y_round] & input_mask_padded[x_round, y_round+1] & input_mask_padded[x_round+1, y_round+1]
+
                 n_valid = np.sum(valid_mask)
                 if n_valid == 0:
                     return -PENALTY
@@ -183,7 +200,7 @@ class Lattice(AutoSerialize):
                 x_valid = x[valid_mask]
                 y_valid = y[valid_mask]
 
-                # Use pre-allocated arrays
+
                 x0, y0 = x0_cache[:n_valid], y0_cache[:n_valid]
                 dx, dy = dx_cache[:n_valid], dy_cache[:n_valid]
 
@@ -238,10 +255,6 @@ class Lattice(AutoSerialize):
                 # Update for next iteration
                 lat_flat = res.x
                 self._lat = res.x.reshape(3, 2)
-
-                if debugging:
-                    print(f"Current Block Size: {curr_block_size}")
-                    print(f"Current params : {self._lat}")
 
         # plotting
         if plot_lattice:
@@ -732,8 +745,110 @@ class Lattice(AutoSerialize):
 
             self.atoms.set_data(updated, s)
 
+
+
+
+        if hasattr(self, "check_for_dislocations"):
+            if self.check_for_dislocations is True:
+                # Ensure extra fields exist
+                needed = [f for f in ("sigma", "int_bg") if f not in self.atoms_dislocation.fields]
+                if needed:
+                    self.atoms_dislocation.add_fields(needed)
+
+                # Single lookup of column indices for writing
+                idx_x = self.atoms_dislocation.fields.index("x")
+                idx_y = self.atoms_dislocation.fields.index("y")
+                idx_amp = self.atoms_dislocation.fields.index("int_peak")
+                idx_sigma = self.atoms_dislocation.fields.index("sigma")
+                idx_bg = self.atoms_dislocation.fields.index("int_bg")
+
+                for s in range(self._num_sites):
+                    row = self.atoms_dislocation.get_data(s)
+                    if isinstance(row, list) or row is None or row.size == 0:
+                        continue
+
+                    # Intuitive reads: per-cell field arrays
+                    x_arr = self.atoms_dislocation[s]["x"]
+                    y_arr = self.atoms_dislocation[s]["y"]
+
+                    updated = row.copy()
+                    for i in range(row.shape[0]):
+                        x0, y0 = float(x_arr[i]), float(y_arr[i])
+
+                        ix0, iy0 = int(np.floor(x0)), int(np.floor(y0))
+                        i0, i1 = max(0, ix0 - R), min(H - 1, ix0 + R)
+                        j0, j1 = max(0, iy0 - R), min(W - 1, iy0 + R)
+                        if i1 <= i0 or j1 <= j0:
+                            continue
+
+                        patch = im[i0 : i1 + 1, j0 : j1 + 1]
+
+                        # broadcast coordinate grids to patch shape
+                        ii = np.arange(i0, i1 + 1)[:, None]
+                        jj = np.arange(j0, j1 + 1)[None, :]
+                        II = np.broadcast_to(ii, patch.shape)
+                        JJ = np.broadcast_to(jj, patch.shape)
+
+                        r2 = (II - x0) ** 2 + (JJ - y0) ** 2
+                        mask = r2 <= (r_fit * r_fit)
+                        if not np.any(mask):
+                            continue
+
+                        vals = patch[mask].astype(float).ravel()
+                        pmin, pmax = float(vals.min()), float(vals.max())
+                        bg0 = float(np.median(patch[~mask])) if np.any(~mask) else float(np.median(patch))
+                        amp0 = max(float(im[np.clip(ix0, 0, H - 1), np.clip(iy0, 0, W - 1)] - bg0), 1e-6)
+                        sig0 = max(r_fit * 0.5, 0.5)
+
+                        x_coords = II[mask].astype(float).ravel()
+                        y_coords = JJ[mask].astype(float).ravel()
+
+                        def residual(theta):
+                            x_c, y_c, amp, sig, bg = theta
+                            sig2 = max(sig, 1e-6) ** 2
+                            rr = (x_coords - x_c) ** 2 + (y_coords - y_c) ** 2
+                            model = amp * np.exp(-0.5 * rr / sig2) + bg
+                            return model - vals
+
+                        # movement-limited bounds + image bounds
+                        x_lb = max(x0 - max_move, 0.0)
+                        x_ub = min(x0 + max_move, H - 1.0)
+                        y_lb = max(y0 - max_move, 0.0)
+                        y_ub = min(y0 + max_move, W - 1.0)
+
+                        lb = [x_lb, y_lb, 0.0, 0.25, pmin - (pmax - pmin)]
+                        ub = [
+                            x_ub,
+                            y_ub,
+                            max(pmax - pmin, amp0 * 4.0),
+                            max(2.0 * r_fit, 1.0),
+                            pmax + (pmax - pmin),
+                        ]
+                        theta0 = [x0, y0, amp0, sig0, bg0]
+
+                        res = least_squares(
+                            residual,
+                            theta0,
+                            bounds=(lb, ub),
+                            method="trf",
+                            loss="soft_l1",
+                            max_nfev=int(max_nfev),
+                            xtol=1e-6,
+                            ftol=1e-6,
+                            gtol=1e-6,
+                        )
+
+                        x_c, y_c, amp, sig, bg = res.x
+                        updated[i, idx_x] = x_c
+                        updated[i, idx_y] = y_c
+                        updated[i, idx_amp] = amp
+                        updated[i, idx_sigma] = sig
+                        updated[i, idx_bg] = bg
+
+                    self.atoms_dislocation.set_data(updated, s)
+
         if plot_atoms:
-            fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
+            fig, ax = show_2d(self._image.array, figsize = (10,10),returnfig=True, **kwargs)
             if ax.images:
                 ax.images[-1].set_zorder(0)
             for s in range(self._num_sites):
@@ -753,10 +868,1910 @@ class Lattice(AutoSerialize):
                     marker="o",
                     zorder=25,
                 )
+                if hasattr(self, "check_for_dislocations"):
+                    if self.check_for_dislocations is True:
+                        # print("trying to plot dislocations")
+                        cell = self.atoms_dislocation.get_data(s)
+                        if isinstance(cell, list) or cell is None or cell.size == 0:
+                            continue
+                        xs = self.atoms_dislocation[s]["x"]
+                        ys = self.atoms_dislocation[s]["y"]
+                        # print(xs)
+                        rgb = site_colors(int(self._numbers[s]+1))
+                        ax.scatter(
+                            ys,
+                            xs,
+                            s=18,
+                            facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+                            edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+                            linewidths=0.75,
+                            marker="o",
+                            zorder=25,
+                        )
+
             ax.set_xlim(0, W)
             ax.set_ylim(H, 0)
 
         return self
+
+    def atoms_first(
+        self,
+        origin = None,
+        u = None,
+        v = None,
+        positions_frac = None,
+        tolerance_uv: float = 1.1,
+        numbers=None,
+        edge_min_dist_px=None,
+        subpixel: str = "poly",
+        upsample_factor: int = 16,
+        sigma: float = 0,
+        minAbsoluteIntensity: float = 0,
+        minRelativeIntensity: float = 0,
+        relativeToPeak: float = 0,
+        minSpacing: float = 0,
+        edgeBoundary: int = 1,
+        maxNumPeaks: int = 5000,
+        plot_atoms=True,
+        input_mask=None,
+        refine_lattice=True,
+        refine_maxiter: int = 200,
+        intensity_radius = None,
+        intensity_min: float | None = None,
+        contrast_min=None,
+        annulus_radii = None,
+        check_for_dislocations = False,
+        merge_dislocation = False,
+        **kwargs,
+    ):
+        self.check_for_dislocations = check_for_dislocations
+        # find all candidates above threshold
+        maxima_candidates = self.get_maxima_2D(
+            self.image.array, 
+            subpixel = subpixel,
+            upsample_factor = upsample_factor,
+            sigma = sigma,
+            minAbsoluteIntensity = minAbsoluteIntensity,
+            minRelativeIntensity = minRelativeIntensity,
+            relativeToPeak = relativeToPeak,
+            minSpacing = minSpacing,
+            edgeBoundary = edgeBoundary,
+            maxNumPeaks = maxNumPeaks,
+            )
+        H, W = self._image.shape  # x=rows, y=cols
+
+        if origin is None:
+            max_intensity_index = np.argmax(maxima_candidates[:]['intensity'])
+            origin_x = maxima_candidates[max_intensity_index]['x']
+            origin_y = maxima_candidates[max_intensity_index]['y']
+            origin = np.array([origin_x, origin_y])
+
+        if u is None or v is None:
+            num_peaks_search = 20
+            num_peaks_use = 2
+            center_ignore_buffer = 15
+            minSpacingPeaks = 5
+            uv_result_inv = self.auto_peak_finder(num_peaks_search = num_peaks_search, num_peaks_use = num_peaks_use, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
+
+            g_vector_1_c = np.array([uv_result_inv[0]['x'], uv_result_inv[0]['y']])
+            g_vector_2_c = np.array([uv_result_inv[1]['x'], uv_result_inv[1]['y']])
+            g_vec1 = np.zeros(2)
+            g_vec1[0] = ((g_vector_1_c[0] - (0.5*H))/H)
+            g_vec1[1] = ((g_vector_1_c[1] - (0.5*W))/W)
+            g_vec2 = np.zeros(2)
+            g_vec2[0] = ((g_vector_2_c[0] - (0.5*H))/H)
+            g_vec2[1] = ((g_vector_2_c[1] - (0.5*W))/W)
+            g_matrix = np.array([g_vec1, g_vec2])
+            a_matrix = np.linalg.inv(g_matrix)
+            a_transpose = a_matrix.T
+            u = np.array([a_transpose[0,0], a_transpose[0,1]])
+            v = np.array([a_transpose[1,0], a_transpose[1,1]])
+
+        if positions_frac is None:
+            positions_frac = np.atleast_2d(np.array((0,0))),
+
+        self._positions_frac = np.atleast_2d(np.array(positions_frac, dtype=float))
+        self._num_sites = self._positions_frac.shape[0]
+        self._numbers = (
+            np.arange(1, self._num_sites + 1, dtype=int)
+            if numbers is None
+            else np.atleast_1d(np.array(numbers, dtype=int))
+        )
+
+        self._lat = np.vstack(
+            (
+                np.array(origin),
+                np.array(u),
+                np.array(v),
+            )
+        )
+
+        im = np.asarray(self._image.array, dtype=float)
+        r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+        A = np.column_stack((u, v))
+
+        def _auto_radius_px() -> float:
+            S = self._positions_frac
+            if S.shape[0] >= 2:
+                d = S[:, None, :] - S[None, :, :]
+                d = d - np.round(d)
+                same = (np.abs(d[..., 0]) < 1e-12) & (np.abs(d[..., 1]) < 1e-12)
+                dpix = d @ A.T
+                dist = np.linalg.norm(dpix, axis=2)
+                dist[same] = np.inf
+                nn = float(np.min(dist))
+            else:
+                nn = float(np.min(np.linalg.norm(np.stack((u, v, u + v, u - v)), axis=1)))
+            if not np.isfinite(nn) or nn <= 0:
+                nn = max(1.0, 0.25 * (np.linalg.norm(u) + np.linalg.norm(v)))
+            return 0.5 * nn
+
+        r_px = float(intensity_radius) if intensity_radius is not None else _auto_radius_px()
+        rin, rout = (1.5 * r_px, 3.0 * r_px) if annulus_radii is None else annulus_radii
+        R_disk = int(np.ceil(r_px))
+        R_ring = int(np.ceil(rout))
+
+        def mean_disk(x: float, y: float) -> float:
+            ix0, iy0 = int(np.floor(x)), int(np.floor(y))
+            i0, i1 = max(0, ix0 - R_disk), min(H - 1, ix0 + R_disk)
+            j0, j1 = max(0, iy0 - R_disk), min(W - 1, iy0 + R_disk)
+            ii = np.arange(i0, i1 + 1)[:, None]
+            jj = np.arange(j0, j1 + 1)[None, :]
+            dx, dy = ii - x, jj - y
+            mask_circle = (dx * dx + dy * dy) <= (r_px * r_px)
+            vals = im[i0 : i1 + 1, j0 : j1 + 1][mask_circle]
+            if vals.size == 0:
+                return float(im[np.clip(round(x), 0, H - 1), np.clip(round(y), 0, W - 1)])
+            return float(vals.mean())
+
+        def mean_std_annulus(x: float, y: float) -> tuple[float, float]:
+            ix0, iy0 = int(np.floor(x)), int(np.floor(y))
+            i0, i1 = max(0, ix0 - R_ring), min(H - 1, ix0 + R_ring)
+            j0, j1 = max(0, iy0 - R_ring), min(W - 1, iy0 + R_ring)
+            ii = np.arange(i0, i1 + 1)[:, None]
+            jj = np.arange(j0, j1 + 1)[None, :]
+            dx, dy = ii - x, jj - y
+            r2 = dx * dx + dy * dy
+            mask_ring = (r2 >= rin * rin) & (r2 <= rout * rout)
+            vals = im[i0 : i1 + 1, j0 : j1 + 1][mask_ring]
+            if vals.size == 0:
+                val = float(im[np.clip(round(x), 0, H - 1), np.clip(round(y), 0, W - 1)])
+                return val, 0.0
+            return float(vals.mean()), float(vals.std(ddof=0))
+
+        # mask of where in real space maxima can occur
+        edge_thresh = float(edge_min_dist_px) if edge_min_dist_px is not None else 0.0
+
+        DT = None
+        if input_mask is not None:
+            m = np.asarray(input_mask).astype(bool)
+            if m.shape != (H, W):
+                raise ValueError(f"mask shape {m.shape} must match image shape {(H, W)}")
+            try:
+                from scipy.ndimage import distance_transform_edt
+
+                DT = distance_transform_edt(m)
+            except Exception:
+                DT = None
+
+        # find the maxima closest to the origin:
+        maxima_candidates_x = maxima_candidates[:]['x']
+        maxima_candidates_y = maxima_candidates[:]['y']
+
+        pm_arr = np.array([-1,0,1])
+        u_norm = np.linalg.norm(u)
+        v_norm = np.linalg.norm(v)
+        uv_arr = np.array([np.asarray(u),np.asarray(v)])
+        uv_norm = 0.5 * (u_norm + v_norm)
+        self.uv_norm = uv_norm
+        self.uv_arr = uv_arr
+        self.tolerance_uv = tolerance_uv
+        x = maxima_candidates_x
+        y = maxima_candidates_y
+
+        in_bounds = (x >= 0.0) & (x <= H - 1) & (y >= 0.0) & (y <= W - 1)
+        border_ok = (
+            (x - edge_thresh >= 0.0)
+            & (x + edge_thresh <= H - 1)
+            & (y - edge_thresh >= 0.0)
+            & (y + edge_thresh <= W - 1)
+        )
+        if input_mask is not None:
+            if DT is not None:
+                ii = np.clip(np.round(x).astype(int), 0, H - 1)
+                jj = np.clip(np.round(y).astype(int), 0, W - 1)
+                mask_ok = DT[ii, jj] >= edge_thresh
+            else:
+                m = np.asarray(input_mask).astype(bool)
+                mask_ok = m[
+                    np.clip(np.round(x).astype(int), 0, H - 1),
+                    np.clip(np.round(y).astype(int), 0, W - 1),
+                ]
+        else:
+            mask_ok = np.ones_like(in_bounds, dtype=bool)
+
+        int_center = np.empty(x.shape[0], dtype=float)
+        for i in range(x.shape[0]):
+            int_center[i] = mean_disk(x[i], y[i])
+
+        keep = in_bounds & border_ok & mask_ok
+        if intensity_min is not None:
+            keep &= int_center >= float(intensity_min)
+        if contrast_min is not None:
+            bg_mean = np.empty(x.shape[0], dtype=float)
+            for i in range(x.shape[0]):
+                bg_mean[i], _ = mean_std_annulus(x[i], y[i])
+            keep &= (int_center - bg_mean) >= float(contrast_min)
+
+        if np.any(keep):
+            maxima_candidates = maxima_candidates[keep]
+        else:
+            raise ValueError("Zero maxima candidates kept")
+
+        # find the maxima closest to the origin:
+        maxima_candidates_x = maxima_candidates[:]['x']
+        maxima_candidates_y = maxima_candidates[:]['y']
+        maxima_candidates_intensity = maxima_candidates[:]['intensity']
+
+        # the unique ids array is an array of the original index, candidacy, a (of a * u), and b (of b * v)
+        unique_ids = np.zeros([5, len(maxima_candidates)])
+        unique_ids[0,:] = np.arange(0,len(maxima_candidates))
+        unique_ids[-1,:] = -1*np.arange(1,1+len(maxima_candidates))
+
+        # Show the candidates that were found (tuning the find peaks functionality)
+        if plot_atoms:
+            fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
+            if ax.images:
+                ax.images[-1].set_zorder(0)
+            xs = maxima_candidates_x
+            ys = maxima_candidates_y
+            rgb = site_colors(int(self._numbers[0]))
+            ax.scatter(
+                ys,
+                xs,
+                s=18,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+                edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+                linewidths=0.75,
+                marker="o",
+                zorder=25,
+            )
+            ax.set_xlim(0, W)
+            ax.set_ylim(H, 0)
+
+        radial_dist = ((maxima_candidates_x - origin[0])**2 + (maxima_candidates_y - origin[1])**2)**(0.5)
+        origin_candidate_index = np.argmin(radial_dist) # use the first minima, if there are multiple
+        unique_ids[1,origin_candidate_index] = 1
+        unique_ids[4,origin_candidate_index] = 0
+
+        atoms_found_this_iteration = np.zeros(len(maxima_candidates))
+        atoms_found_prev_iteration = np.zeros(len(maxima_candidates))
+        atoms_found_previous_iterations = np.zeros(len(maxima_candidates), dtype = bool)
+        atoms_found_prev_iteration[origin_candidate_index] = 1
+        found_atoms_in_prev_iteration = True
+        iteration_while = 0
+        while found_atoms_in_prev_iteration is True:
+            for atom_index in range(len(maxima_candidates)):
+                if atoms_found_prev_iteration[atom_index] > 0:
+                    for pm in pm_arr:
+                        for uv_index, lat_vec in enumerate(uv_arr):
+                            position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
+                            position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
+                            radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+                            radial_dist[atom_index] = uv_norm * (tolerance_uv - 1) * 2 # make sure that self is outside of range
+                            if (radial_dist < (uv_norm * (tolerance_uv - 1))).any():
+                                successful_candidate_index = np.argmin(radial_dist)
+                                if unique_ids[1, successful_candidate_index] == 0:
+                                    atoms_found_this_iteration[successful_candidate_index] += 1
+                                    unique_ids[1, successful_candidate_index] = 1
+                                    unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uv_index == 0)
+                                    unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uv_index == 1)
+                                    unique_ids[4, successful_candidate_index] = 0
+            # check if any atom was somehow still found twice:
+            assert np.max(atoms_found_this_iteration) < 2
+            # check if any found atoms have the same uv index
+            uv_pairs = unique_ids[1:5,:].T
+            unique_pairs, inverse, counts = np.unique(uv_pairs, axis=0, return_inverse=True, return_counts=True)
+            duplicate_groups = [np.where(inverse == k)[0] for k, c in enumerate(counts) if c > 1]
+            mask_atoms_found = atoms_found_this_iteration.astype(bool)
+            if len(duplicate_groups) != 0:
+                for duplicate_group in duplicate_groups:
+                    duplicate_group = np.asarray(duplicate_group)
+                    duplicate_atoms_index_found_previous_iterations = duplicate_group[atoms_found_previous_iterations[duplicate_group]]
+                    if duplicate_atoms_index_found_previous_iterations.size > 1:
+                        if origin_candidate_index not in duplicate_group:
+                            raise ValueError("The duplicate atoms finding code is somehow bugged")
+                        else:
+                            kept_index = origin_candidate_index
+                    elif duplicate_atoms_index_found_previous_iterations.size == 1:
+                        kept_index = duplicate_atoms_index_found_previous_iterations
+                    else:
+                        kept_index = duplicate_group[mask_atoms_found[duplicate_group]][0]
+                    wipe_indicies = duplicate_group[duplicate_group != kept_index]
+                    unique_ids[1, wipe_indicies] = 2 # signals to not accept for this maxima anymore
+                    unique_ids[2:4,wipe_indicies] = 0
+                    unique_ids[4,wipe_indicies] = -1*(wipe_indicies+1)
+                    atoms_found_previous_iterations[wipe_indicies] = False
+                    mask_atoms_found[wipe_indicies] = False
+                    atoms_found_this_iteration[wipe_indicies] = 0
+            if np.sum(atoms_found_this_iteration) == 0:
+                found_atoms_in_prev_iteration = False
+                print('stopping search')
+
+            atoms_found_previous_iterations |= atoms_found_this_iteration.astype(bool)
+
+            atoms_found_prev_iteration = atoms_found_this_iteration.copy()
+            atoms_found_this_iteration = np.zeros(len(maxima_candidates))
+            iteration_while += 1
+
+        if check_for_dislocations:
+            for atom_index in range(len(maxima_candidates)):
+                if unique_ids[1,atom_index] == 1:
+                    for pm in pm_arr:
+                        for uvw_index, lat_vec in enumerate(uv_arr):
+                            position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
+                            position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
+                            radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+                            radial_dist[atom_index] = uv_norm * (tolerance_uv - 1) * 2 # make sure that self is outside of range
+                            if (radial_dist < (uv_norm * (tolerance_uv - 1))).any():
+                                successful_candidate_index = np.argmin(radial_dist)
+                                if unique_ids[1, successful_candidate_index] == 2:
+                                    atoms_found_this_iteration[successful_candidate_index] += 1
+                                    unique_ids[1, successful_candidate_index] = 3 # for being found in dislocation search
+                                    unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uvw_index == 0) + pm*int(uvw_index == 2)
+                                    unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uvw_index == 1) - pm*int(uvw_index == 2)
+                                    unique_ids[4, successful_candidate_index] = 0
+            maxima_dislocation_x = maxima_candidates_x[unique_ids[1,:] == 3]
+            maxima_dislocation_y = maxima_candidates_y[unique_ids[1,:] == 3]
+            maxima_dislocation_u = unique_ids[2,unique_ids[1,:] == 3]
+            maxima_dislocation_v = unique_ids[3,unique_ids[1,:] == 3]
+            maxima_dislocation_intensity = maxima_candidates_intensity[unique_ids[1,:] == 3]
+
+            self.atoms_dislocation = Vector.from_shape(
+                shape=(self._num_sites),
+                fields=("x", "y", "a", "b", "int_peak"),
+                units=("px", "px", "ind", "ind", "counts"),
+            )
+
+            arr = np.vstack(
+                (maxima_dislocation_x, maxima_dislocation_y, maxima_dislocation_u, maxima_dislocation_v, maxima_dislocation_intensity)
+            ).T
+            self.atoms_dislocation.set_data(arr, 0)
+
+        maxima_accepted_x = maxima_candidates_x[unique_ids[1,:] == 1]
+        maxima_accepted_y = maxima_candidates_y[unique_ids[1,:] == 1]
+
+        maxima_accepted_u = unique_ids[2, unique_ids[1,:] == 1]
+        maxima_accepted_v = unique_ids[3, unique_ids[1,:] == 1]
+
+        maxima_accepted_intensity = maxima_candidates_intensity[unique_ids[1,:] == 1]
+
+        self.atoms = Vector.from_shape(
+            shape=(self._num_sites),
+            fields=("x", "y", "a", "b", "int_peak"),
+            units=("px", "px", "ind", "ind", "counts"),
+        )
+        if not merge_dislocation or not check_for_dislocations:
+            arr = np.vstack(
+                (maxima_accepted_x, maxima_accepted_y, maxima_accepted_u, maxima_accepted_v, maxima_accepted_intensity)
+            ).T
+            self.atoms.set_data(arr, 0)
+
+        if merge_dislocation and check_for_dislocations:
+            maxima_merge_x = np.concatenate(maxima_accepted_x, maxima_dislocation_x)
+            maxima_merge_y = np.concatenate(maxima_accepted_y, maxima_dislocation_y)
+            maxima_merge_u = np.concatenate(maxima_accepted_u, maxima_dislocation_u)
+            maxima_merge_v = np.concatenate(maxima_accepted_v, maxima_dislocation_v)
+            maxima_merge_intensity = np.concatenate(maxima_accepted_intensity, maxima_dislocation_intensity)
+            arr = np.vstack(
+                (maxima_merge_x, maxima_merge_y, maxima_merge_u, maxima_merge_v, maxima_merge_intensity)
+            ).T
+            self.atoms.set_data(arr, 0)
+
+        if plot_atoms:
+            fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
+            if ax.images:
+                ax.images[-1].set_zorder(0)
+            xs = maxima_accepted_x
+            ys = maxima_accepted_y
+            rgb = site_colors(int(self._numbers[0]))
+            ax.scatter(
+                ys,
+                xs,
+                s=18,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+                edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+                linewidths=0.75,
+                marker="o",
+                zorder=25,
+            )
+            ax.set_xlim(0, W)
+            ax.set_ylim(H, 0)
+
+            # plt.figure(figsize = (10,10))
+            # plt.imshow(self._image.array, origin = 'lower')
+            # plt.scatter(maxima_accepted_y, maxima_accepted_x, c= maxima_accepted_u, alpha = 0.7, s = 20, cmap = 'tab20')
+            # plt.gca().invert_yaxis()
+            # plt.figure(figsize = (10,10))
+            # plt.imshow(self._image.array, origin = 'lower')
+            # plt.scatter(maxima_accepted_y, maxima_accepted_x, c= maxima_accepted_v, alpha = 0.7, s = 20, cmap = 'tab20')
+            # plt.gca().invert_yaxis()
+
+        return self
+
+    def atoms_first_uvw(
+        self,
+        origin = None,
+        u = None,
+        v = None,
+        positions_frac = None,
+        tolerance_uvw: float = 1.1,
+        w = None,
+        numbers=None,
+        edge_min_dist_px=None,
+        subpixel: str = "poly",
+        upsample_factor: int = 16,
+        sigma: float = 0,
+        minAbsoluteIntensity: float = 0,
+        minRelativeIntensity: float = 0,
+        relativeToPeak: float = 0,
+        minSpacing: float = 0,
+        edgeBoundary: int = 1,
+        maxNumPeaks: int = 5000,
+        plot_atoms=True,
+        input_mask=None,
+        refine_lattice=True,
+        refine_maxiter: int = 200,
+        intensity_radius = None,
+        intensity_min: float | None = None,
+        contrast_min=None,
+        annulus_radii = None,
+        check_uv_duplication = True,
+        check_for_dislocations = False,
+        merge_dislocation = False,
+        **kwargs,
+    ):
+        self.check_for_dislocations = check_for_dislocations
+        # find all candidates above threshold
+        maxima_candidates = self.get_maxima_2D(
+            self.image.array, 
+            subpixel = subpixel,
+            upsample_factor = upsample_factor,
+            sigma = sigma,
+            minAbsoluteIntensity = minAbsoluteIntensity,
+            minRelativeIntensity = minRelativeIntensity,
+            relativeToPeak = relativeToPeak,
+            minSpacing = minSpacing,
+            edgeBoundary = edgeBoundary,
+            maxNumPeaks = maxNumPeaks,
+            )
+
+        H, W = self._image.shape  # x=rows, y=cols
+
+        if origin is None:
+            max_intensity_index = np.argmax(maxima_candidates[:]['intensity'])
+            origin_x = maxima_candidates[max_intensity_index]['x']
+            origin_y = maxima_candidates[max_intensity_index]['y']
+            origin = np.array([origin_x, origin_y])
+
+        if u is None or v is None:
+            num_peaks_search = 20
+            num_peaks_use = 2
+            center_ignore_buffer = 15
+            minSpacingPeaks = 5
+            uv_result_inv = self.auto_peak_finder(num_peaks_search = num_peaks_search, num_peaks_use = num_peaks_use, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
+
+            g_vector_1_c = np.array([uv_result_inv[0]['x'], uv_result_inv[0]['y']])
+            g_vector_2_c = np.array([uv_result_inv[1]['x'], uv_result_inv[1]['y']])
+            g_vec1 = np.zeros(2)
+            g_vec1[0] = ((g_vector_1_c[0] - (0.5*H))/H)
+            g_vec1[1] = ((g_vector_1_c[1] - (0.5*W))/W)
+            g_vec2 = np.zeros(2)
+            g_vec2[0] = ((g_vector_2_c[0] - (0.5*H))/H)
+            g_vec2[1] = ((g_vector_2_c[1] - (0.5*W))/W)
+            g_matrix = np.array([g_vec1, g_vec2])
+            a_matrix = np.linalg.inv(g_matrix)
+            a_transpose = a_matrix.T
+            u = np.array([a_transpose[0,0], a_transpose[0,1]])
+            v = np.array([a_transpose[1,0], a_transpose[1,1]])
+
+        if positions_frac is None:
+            positions_frac = np.atleast_2d(np.array((0,0))),
+
+        self._positions_frac = np.atleast_2d(np.array(positions_frac, dtype=float))
+        self._num_sites = self._positions_frac.shape[0]
+        self._numbers = (
+            np.arange(1, self._num_sites + 1, dtype=int)
+            if numbers is None
+            else np.atleast_1d(np.array(numbers, dtype=int))
+        )
+        if w is None:
+            if np.abs(np.rad2deg(np.arccos(np.dot(u, v)/(np.linalg.norm(u) * np.linalg.norm(v))))) > np.deg2rad(90):
+                w = np.asarray(u)+np.asarray(v)
+                w_sign = 1
+            else:
+                w = np.asarray(u)-np.asarray(v)
+                w_sign = -1
+        else:
+            w_sign = 1
+
+        self._lat = np.vstack(
+            (
+                np.array(origin),
+                np.array(u),
+                np.array(v),
+            )
+        )
+
+        im = np.asarray(self._image.array, dtype=float)
+        r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+        A = np.column_stack((u, v))
+
+        def _auto_radius_px() -> float:
+            S = self._positions_frac
+            if S.shape[0] >= 2:
+                d = S[:, None, :] - S[None, :, :]
+                d = d - np.round(d)
+                same = (np.abs(d[..., 0]) < 1e-12) & (np.abs(d[..., 1]) < 1e-12)
+                dpix = d @ A.T
+                dist = np.linalg.norm(dpix, axis=2)
+                dist[same] = np.inf
+                nn = float(np.min(dist))
+            else:
+                nn = float(np.min(np.linalg.norm(np.stack((u, v, u + v, u - v)), axis=1)))
+            if not np.isfinite(nn) or nn <= 0:
+                nn = max(1.0, 0.25 * (np.linalg.norm(u) + np.linalg.norm(v)))
+            return 0.5 * nn
+
+        r_px = float(intensity_radius) if intensity_radius is not None else _auto_radius_px()
+        rin, rout = (1.5 * r_px, 3.0 * r_px) if annulus_radii is None else annulus_radii
+        R_disk = int(np.ceil(r_px))
+        R_ring = int(np.ceil(rout))
+
+        def mean_disk(x: float, y: float) -> float:
+            ix0, iy0 = int(np.floor(x)), int(np.floor(y))
+            i0, i1 = max(0, ix0 - R_disk), min(H - 1, ix0 + R_disk)
+            j0, j1 = max(0, iy0 - R_disk), min(W - 1, iy0 + R_disk)
+            ii = np.arange(i0, i1 + 1)[:, None]
+            jj = np.arange(j0, j1 + 1)[None, :]
+            dx, dy = ii - x, jj - y
+            mask_circle = (dx * dx + dy * dy) <= (r_px * r_px)
+            vals = im[i0 : i1 + 1, j0 : j1 + 1][mask_circle]
+            if vals.size == 0:
+                return float(im[np.clip(round(x), 0, H - 1), np.clip(round(y), 0, W - 1)])
+            return float(vals.mean())
+
+        def mean_std_annulus(x: float, y: float) -> tuple[float, float]:
+            ix0, iy0 = int(np.floor(x)), int(np.floor(y))
+            i0, i1 = max(0, ix0 - R_ring), min(H - 1, ix0 + R_ring)
+            j0, j1 = max(0, iy0 - R_ring), min(W - 1, iy0 + R_ring)
+            ii = np.arange(i0, i1 + 1)[:, None]
+            jj = np.arange(j0, j1 + 1)[None, :]
+            dx, dy = ii - x, jj - y
+            r2 = dx * dx + dy * dy
+            mask_ring = (r2 >= rin * rin) & (r2 <= rout * rout)
+            vals = im[i0 : i1 + 1, j0 : j1 + 1][mask_ring]
+            if vals.size == 0:
+                val = float(im[np.clip(round(x), 0, H - 1), np.clip(round(y), 0, W - 1)])
+                return val, 0.0
+            return float(vals.mean()), float(vals.std(ddof=0))
+
+        # mask of where in real space maxima can occur
+        H, W = self._image.shape  # x=rows, y=cols
+        edge_thresh = float(edge_min_dist_px) if edge_min_dist_px is not None else 0.0
+
+        DT = None
+        if input_mask is not None:
+            m = np.asarray(input_mask).astype(bool)
+            if m.shape != (H, W):
+                raise ValueError(f"mask shape {m.shape} must match image shape {(H, W)}")
+            try:
+                from scipy.ndimage import distance_transform_edt
+
+                DT = distance_transform_edt(m)
+            except Exception:
+                DT = None
+
+        # find the maxima closest to the origin:
+        maxima_candidates_x = maxima_candidates[:]['x']
+        maxima_candidates_y = maxima_candidates[:]['y']
+
+        pm_arr = np.array([-1,0,1])
+        u_norm = np.linalg.norm(u)
+        v_norm = np.linalg.norm(v)
+        w_norm = np.linalg.norm(w)
+        uvw_arr = np.array([np.asarray(u),np.asarray(v),np.asarray(w)])
+        uvw_norm = 0.5 * (u_norm + v_norm + w_norm)
+        self.uv_norm = uvw_norm
+        self.uv_arr = uvw_arr
+        self.tolerance_uv = tolerance_uvw
+        x = maxima_candidates_x
+        y = maxima_candidates_y
+
+        in_bounds = (x >= 0.0) & (x <= H - 1) & (y >= 0.0) & (y <= W - 1)
+        border_ok = (
+            (x - edge_thresh >= 0.0)
+            & (x + edge_thresh <= H - 1)
+            & (y - edge_thresh >= 0.0)
+            & (y + edge_thresh <= W - 1)
+        )
+        if input_mask is not None:
+            if DT is not None:
+                ii = np.clip(np.round(x).astype(int), 0, H - 1)
+                jj = np.clip(np.round(y).astype(int), 0, W - 1)
+                mask_ok = DT[ii, jj] >= edge_thresh
+            else:
+                m = np.asarray(input_mask).astype(bool)
+                mask_ok = m[
+                    np.clip(np.round(x).astype(int), 0, H - 1),
+                    np.clip(np.round(y).astype(int), 0, W - 1),
+                ]
+        else:
+            mask_ok = np.ones_like(in_bounds, dtype=bool)
+
+        int_center = np.empty(x.shape[0], dtype=float)
+        for i in range(x.shape[0]):
+            int_center[i] = mean_disk(x[i], y[i])
+
+        keep = in_bounds & border_ok & mask_ok
+        if intensity_min is not None:
+            keep &= int_center >= float(intensity_min)
+        if contrast_min is not None:
+            bg_mean = np.empty(x.shape[0], dtype=float)
+            for i in range(x.shape[0]):
+                bg_mean[i], _ = mean_std_annulus(x[i], y[i])
+            keep &= (int_center - bg_mean) >= float(contrast_min)
+
+        if np.any(keep):
+            maxima_candidates = maxima_candidates[keep]
+        else:
+            raise ValueError("Zero maxima candidates kept")
+
+        # find the maxima closest to the origin:
+        maxima_candidates_x = maxima_candidates[:]['x']
+        maxima_candidates_y = maxima_candidates[:]['y']
+        maxima_candidates_intensity = maxima_candidates[:]['intensity']
+
+        # the unique ids array is an array of the original index, candidacy, a (of a * u), and b (of b * v), and c (of c * w)
+        unique_ids = np.zeros([5, len(maxima_candidates)])
+        unique_ids[0,:] = np.arange(0,len(maxima_candidates))
+        unique_ids[-1,:] = -1*np.arange(1,1+len(maxima_candidates))
+
+        if plot_atoms:
+            fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
+            if ax.images:
+                ax.images[-1].set_zorder(0)
+            xs = maxima_candidates_x
+            ys = maxima_candidates_y
+            rgb = site_colors(int(self._numbers[0]))
+            ax.scatter(
+                ys,
+                xs,
+                s=18,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+                edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+                linewidths=0.75,
+                marker="o",
+                zorder=25,
+            )
+            ax.set_xlim(0, W)
+            ax.set_ylim(H, 0)
+
+        radial_dist = ((maxima_candidates_x - origin[0])**2 + (maxima_candidates_y - origin[1])**2)**(0.5)
+        origin_candidate_index = np.argmin(radial_dist) # use the first minima, if there are multiple
+        unique_ids[1,origin_candidate_index] = 1
+        unique_ids[4,origin_candidate_index] = 0
+
+        atoms_found_this_iteration = np.zeros(len(maxima_candidates))
+        atoms_found_prev_iteration = np.zeros(len(maxima_candidates))
+        atoms_found_previous_iterations = np.zeros(len(maxima_candidates), dtype = bool)
+        atoms_found_prev_iteration[origin_candidate_index] = 1
+        found_atoms_in_prev_iteration = True
+        iteration_while = 0
+        while found_atoms_in_prev_iteration is True:
+            for atom_index in range(len(maxima_candidates)):
+                if atoms_found_prev_iteration[atom_index] > 0:
+                    for pm in pm_arr:
+                        for uvw_index, lat_vec in enumerate(uvw_arr):
+                            position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
+                            position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
+                            radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+                            radial_dist[atom_index] = uvw_norm * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
+                            if (radial_dist < (uvw_norm * (tolerance_uvw - 1))).any():
+                                successful_candidate_index = np.argmin(radial_dist)
+                                if unique_ids[1, successful_candidate_index] == 0:
+                                    atoms_found_this_iteration[successful_candidate_index] += 1
+                                    unique_ids[1, successful_candidate_index] = 1
+                                    unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uvw_index == 0) + pm*int(uvw_index == 2)
+                                    unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uvw_index == 1) + w_sign*pm*int(uvw_index == 2)
+                                    unique_ids[4, successful_candidate_index] = 0
+            # check if any atom was somehow still found twice:
+            assert np.max(atoms_found_this_iteration) < 2
+            # check if any found atoms have the same uv index
+            if check_uv_duplication:
+                uv_pairs = unique_ids[1:5,:].T
+                unique_pairs, inverse, counts = np.unique(uv_pairs, axis=0, return_inverse=True, return_counts=True)
+                duplicate_groups = [np.where(inverse == k)[0] for k, c in enumerate(counts) if c > 1]
+                mask_atoms_found = atoms_found_this_iteration.astype(bool)
+                if len(duplicate_groups) != 0:
+                    for duplicate_group in duplicate_groups:
+                        duplicate_group = np.asarray(duplicate_group)
+                        duplicate_atoms_index_found_previous_iterations = duplicate_group[atoms_found_previous_iterations[duplicate_group]]
+                        if duplicate_atoms_index_found_previous_iterations.size > 1:
+                            if origin_candidate_index not in duplicate_group:
+                                raise ValueError("The duplicate atoms finding code is somehow bugged")
+                            else:
+                                kept_index = origin_candidate_index
+                        elif duplicate_atoms_index_found_previous_iterations.size == 1:
+                            kept_index = duplicate_atoms_index_found_previous_iterations
+                        else:
+                            kept_index = duplicate_group[mask_atoms_found[duplicate_group]][0]
+                        wipe_indicies = duplicate_group[duplicate_group != kept_index]
+                        unique_ids[1, wipe_indicies] = 2 # this signals to not accept for this maxima anymore (and flags this as a dulpicate)
+                        unique_ids[2:4,wipe_indicies] = 0
+                        unique_ids[4,wipe_indicies] = -1*(wipe_indicies+1)
+                        atoms_found_previous_iterations[wipe_indicies] = False
+                        mask_atoms_found[wipe_indicies] = False
+                        atoms_found_this_iteration[wipe_indicies] = 0
+            if np.sum(atoms_found_this_iteration) == 0:
+                found_atoms_in_prev_iteration = False
+                print('stopping search')
+            
+
+            atoms_found_previous_iterations |= atoms_found_this_iteration.astype(bool)
+
+            atoms_found_prev_iteration = atoms_found_this_iteration.copy()
+            atoms_found_this_iteration = np.zeros(len(maxima_candidates))
+            iteration_while += 1
+
+
+        if check_for_dislocations:
+            for atom_index in range(len(maxima_candidates)):
+                if unique_ids[1,atom_index] == 1:
+                    for pm in pm_arr:
+                        for uvw_index, lat_vec in enumerate(uvw_arr):
+                            position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
+                            position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
+                            radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+                            radial_dist[atom_index] = uvw_norm * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
+                            if (radial_dist < (uvw_norm * (tolerance_uvw - 1))).any():
+                                successful_candidate_index = np.argmin(radial_dist)
+                                if unique_ids[1, successful_candidate_index] == 2:
+                                    atoms_found_this_iteration[successful_candidate_index] += 1
+                                    unique_ids[1, successful_candidate_index] = 3 # for being found in dislocation search
+                                    unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uvw_index == 0) + pm*int(uvw_index == 2)
+                                    unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uvw_index == 1) - pm*int(uvw_index == 2)
+                                    unique_ids[4, successful_candidate_index] = 0
+            maxima_dislocation_x = maxima_candidates_x[unique_ids[1,:] == 3]
+            maxima_dislocation_y = maxima_candidates_y[unique_ids[1,:] == 3]
+            maxima_dislocation_u = unique_ids[2,unique_ids[1,:] == 3]
+            maxima_dislocation_v = unique_ids[3,unique_ids[1,:] == 3]
+            maxima_dislocation_intensity = maxima_candidates_intensity[unique_ids[1,:] == 3]
+
+            self.atoms_dislocation = Vector.from_shape(
+                shape=(self._num_sites),
+                fields=("x", "y", "a", "b", "int_peak"),
+                units=("px", "px", "ind", "ind", "counts"),
+            )
+
+            arr = np.vstack(
+                (maxima_dislocation_x, maxima_dislocation_y, maxima_dislocation_u, maxima_dislocation_v, maxima_dislocation_intensity)
+            ).T
+            self.atoms_dislocation.set_data(arr, 0)
+
+
+
+        maxima_accepted_x = maxima_candidates_x[unique_ids[1,:] == 1]
+        maxima_accepted_y = maxima_candidates_y[unique_ids[1,:] == 1]
+
+        maxima_accepted_u = unique_ids[2, unique_ids[1,:] == 1]
+        maxima_accepted_v = unique_ids[3, unique_ids[1,:] == 1]
+
+        maxima_accepted_intensity = maxima_candidates_intensity[unique_ids[1,:] == 1]
+
+        self.atoms = Vector.from_shape(
+            shape=(self._num_sites),
+            fields=("x", "y", "a", "b", "int_peak"),
+            units=("px", "px", "ind", "ind", "counts"),
+        )
+
+        if not merge_dislocation or not check_for_dislocations:
+            arr = np.vstack(
+                (maxima_accepted_x, maxima_accepted_y, maxima_accepted_u, maxima_accepted_v, maxima_accepted_intensity)
+            ).T
+            self.atoms.set_data(arr, 0)
+
+        if merge_dislocation and check_for_dislocations:
+
+            maxima_merge_x = maxima_candidates_x[np.isin(unique_ids[1, :], [1, 3])]
+            maxima_merge_y = maxima_candidates_y[np.isin(unique_ids[1, :], [1, 3])]
+
+            maxima_merge_u = unique_ids[2, np.isin(unique_ids[1, :], [1, 3])]
+            maxima_merge_v = unique_ids[3, np.isin(unique_ids[1, :], [1, 3])]
+
+            maxima_merge_intensity = maxima_candidates_intensity[np.isin(unique_ids[1, :], [1, 3])]
+            arr = np.vstack(
+                (maxima_merge_x, maxima_merge_y, maxima_merge_u, maxima_merge_v, maxima_merge_intensity)
+            ).T
+            self.atoms.set_data(arr, 0)
+
+
+        if plot_atoms:
+            fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
+            if ax.images:
+                ax.images[-1].set_zorder(0)
+            xs = maxima_accepted_x
+            ys = maxima_accepted_y
+            rgb = site_colors(int(self._numbers[0]))
+            ax.scatter(
+                ys,
+                xs,
+                s=18,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+                edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+                linewidths=0.75,
+                marker="o",
+                zorder=25,
+            )
+            ax.set_xlim(0, W)
+            ax.set_ylim(H, 0)
+
+            # plt.figure(figsize = (10,10))
+            # plt.imshow(self._image.array, origin = 'lower')
+            # plt.scatter(maxima_accepted_y, maxima_accepted_x, c= maxima_accepted_u, alpha = 0.7, s = 20, cmap = 'tab20')
+            # plt.gca().invert_yaxis()
+            # plt.figure(figsize = (10,10))
+            # plt.imshow(self._image.array, origin = 'lower')
+            # plt.scatter(maxima_accepted_y, maxima_accepted_x, c= maxima_accepted_v, alpha = 0.7, s = 20, cmap = 'tab20')
+            # plt.gca().invert_yaxis()
+
+        return self
+
+    # def organize_nearest_neighbors(
+    #     self,
+    #     site_search_radius = 2,
+    #     num_bins = 128,
+    # ):
+    #     for a0 in range(self._num_sites):
+    #         # atoms_arr = self.atoms.get_data(a0)
+    #         a_x = self.atoms[a0]["x"][:]
+    #         a_y = self.atoms[a0]["y"][:]
+    #         a_int = self.atoms[a0]["int_peak"][:]
+
+
+    #         a_int_max = np.max(a_int)
+    #         a_int_min = np.min(a_int)
+    #         bins_arr = np.arange(a_int_min,a_int_max,num_bins)
+    #         for atom_index in range(a_x.size):
+    #             a_x_this_atom = a_x[atom_index]
+    #             a_y_this_atom = a_y[atom_index]
+
+    #             radial_dist = ((a_x - a_x_this_atom)**2 + (a_y - a_y_this_atom)**2)**(0.5)
+    #             radial_dist[atom_index] = 2e4 # make sure that self is outside of range
+    #             if (radial_dist < (self.uv_norm * site_search_radius)).any():
+    #                 smallestRadiiIndices = np.argsort(radial_dist)
+    #                 radial_dist_sorted = radial_dist[smallestRadiiIndices]
+    #                 a_int_sorted = a_int[smallestRadiiIndices]
+    #                 # get number valid sites
+    #                 valid_sites_int = a_int_sorted[radial_dist_sorted < (self.uv_norm * site_search_radius)]
+    #                 num_valid_sites = valid_sites_int.size[0]
+
+
+    #                 # successful_candidate_index = np.argmin(radial_dist)
+
+
+    def organize_nearest_neighbors(
+        self,
+        site_search_radius = 2,
+        num_bins = 128,
+    ):
+        for a0 in range(self._num_sites):
+            atoms_arr = self.atoms.get_data(a0)
+            a_x = atoms_arr[:,0]
+            a_y = atoms_arr[:,1]
+            pm_arr = np.array([1,-1])
+
+            atom_neighbor_arr = np.empty((6, a_x.shape[0]), dtype=object)
+            has_six_neighbors_arr = np.zeros(a_x.shape[0])
+            for atom_index in range(a_x.shape[0]):
+                for pm in pm_arr:
+                    for uvw_index, lat_vec in enumerate(self.uv_arr):
+                        position_x = pm * lat_vec[0] + a_x[atom_index]
+                        position_y = pm * lat_vec[1] + a_y[atom_index]
+                        radial_dist = ((a_x - position_x)**2 + (a_y - position_y)**2)**(0.5)
+                        radial_dist[atom_index] = self.uv_norm * (self.tolerance_uv - 1) * 2 # make sure that self is outside of range
+                        if (radial_dist < (self.uv_norm * (self.tolerance_uv - 1))).any():
+                            successful_candidate_index = np.argmin(radial_dist)
+                            if (pm == 1 and uvw_index == 0):
+                                atom_neighbor_arr[0,atom_index] = int(successful_candidate_index)
+                                has_six_neighbors_arr[atom_index] += 1
+                                # print(0)
+
+                            if (pm == -1 and uvw_index == 0):
+                                atom_neighbor_arr[1,atom_index] = int(successful_candidate_index) 
+                                has_six_neighbors_arr[atom_index] += 1
+                                # print(1)
+
+                            if (pm == 1 and uvw_index == 1):
+                                atom_neighbor_arr[2,atom_index] = int(successful_candidate_index) 
+                                has_six_neighbors_arr[atom_index] += 1
+                                # print(2)
+
+                            if (pm == -1 and uvw_index == 1):
+                                atom_neighbor_arr[3,atom_index] = int(successful_candidate_index) 
+                                has_six_neighbors_arr[atom_index] += 1
+                                # print(3)
+
+                            if (pm == 1 and uvw_index == 2):
+                                atom_neighbor_arr[4,atom_index] = int(successful_candidate_index) 
+                                has_six_neighbors_arr[atom_index] += 1
+                                # print(4)
+
+                            if (pm == -1 and uvw_index == 2):
+                                atom_neighbor_arr[5,atom_index] = int(successful_candidate_index) 
+                                has_six_neighbors_arr[atom_index] += 1
+                                # print(5)
+            # print(has_six_neighbors_arr)
+            # has_six_neighbors_arr[has_six_neighbors_arr < 6] = 0
+            # has_six_neighbors_arr[has_six_neighbors_arr > 0] = 0
+            # self.has_six_neighbors_arr = has_six_neighbors_arr.astype(bool)
+            self.has_six_neighbors_arr = has_six_neighbors_arr == 6
+            # print(self.has_six_neighbors_arr[self.has_six_neighbors_arr == True])
+            # plt.figure()
+            # for atom_index in range(a_x.shape[0]):
+            #     if self.has_six_neighbors_arr[atom_index]:
+            #         a_x = self.atoms[a0]["x"][atom_index]
+            #         a_y = self.atoms[a0]["y"][atom_index]
+            #         plt.scatter(a_y, a_x, c = 'red')
+            #         plt.gca().invert_yaxis()
+            # atom_index = 110 #for test
+            # print(atom_neighbor_arr)
+            # a_x = self.atoms[a0]["x"][atom_neighbor_arr[:,atom_index]]
+            # a_y = self.atoms[a0]["y"][atom_neighbor_arr[:,atom_index]]
+            # plt.figure()
+            # for atom_index in np.arange(100,610):
+            #     # atom_index = 300
+            #     neighbor_idxs = [i for i in atom_neighbor_arr[:, atom_index] if i is not None]
+            #     a_x = self.atoms[a0]["x"][neighbor_idxs]
+            #     a_y = self.atoms[a0]["y"][neighbor_idxs]
+            #     plt.scatter(a_y, a_x, alpha = 0.5)
+            #     plt.scatter(atoms_arr[atom_index,1], atoms_arr[atom_index,0], c = 'red')
+            #     plt.gca().invert_yaxis()
+            self.atom_neighbor_arr = atom_neighbor_arr
+        return self
+
+
+    # def neighborhood(
+    #     self,
+    #     neighborhood_units = 2,
+    # ):
+    #     for a0 in range(self._num_sites):
+    #         atoms_arr = self.atoms.get_data(a0)
+    #         a_x = atoms_arr[:,0]
+    #         a_y = atoms_arr[:,1]
+    #         pm_arr = np.array([1,-1])
+
+    #         atom_neighbor_arr = np.empty((6, a_x.shape[0]), dtype=object)
+    #         for atom_index in range(a_x.shape[0]):
+    #             neighbor_search_arr_1 = self.atom_neighbor_arr[atom_index]
+    #             for neighborhood_index in range(neighborhood_units):
+    #                 if neighborhood_index < neighborhood_units - 1:
+    #                     break
+    #                 for atom_neighbor in neighbor_search_arr_1:
+                        
+
+
+    def get_next_neighborhood_layer(
+        self,
+        atom_index,
+    ):
+        return np.asarray([i for i in self.atom_neighbor_arr[:, atom_index] if i is not None], dtype = int)
+
+    def get_next_neighborhood_layer_arr(
+        self,
+        atom_indexes,
+    ):
+        atom_indexes_less_none =  [i for i in atom_indexes if i is not None]
+        
+        arr_present = False
+        arr = None
+        for atom_index in atom_indexes_less_none:
+            if arr_present:
+                arr = np.concatenate((arr, np.asarray(self.get_next_neighborhood_layer(atom_index))))
+            else:
+                arr = np.asarray(self.get_next_neighborhood_layer(atom_index))
+                arr_present = True
+        # print(arr)
+        if arr is None:
+            print('something wrong here')
+            arr = np.asarray([0])
+        return np.asarray(arr, dtype = int)
+
+    def neighborhood(
+        self,
+        neighborhood_units = 2,
+    ):
+        for a0 in range(self._num_sites):
+            atoms_arr = self.atoms.get_data(a0)
+            a_x = atoms_arr[:,0]
+            a_y = atoms_arr[:,1]
+            pm_arr = np.array([1,-1])
+
+            # atom_neighbor_arr = np.arange(0, a_x.shape[0])
+            atom_neighbor_list = []
+            for atom_index in range(a_x.shape[0]):
+                neighbors_search = np.asarray([atom_index])
+                neighbors_search_out = np.asarray([atom_index])
+                for neighbor_iteration in range(neighborhood_units):
+                    neighbors_search_out = self.get_next_neighborhood_layer_arr(neighbors_search_out)
+                    # print(neighbors_search_out)
+                    neighbors_search = np.concatenate((neighbors_search, neighbors_search_out))
+                neighbors_search = np.unique(neighbors_search) # temporary measure to remove duplicates
+                atom_neighbor_list.append(neighbors_search)
+        # self.atom_neighbor_layer_arr = np.asarray(atom_neighbor_list)
+        # print(atom_neighbor_list)
+        # self.
+        self.atom_neighbor_layer_arr = atom_neighbor_list
+
+        # atom_index = 110 #for test
+        # print(atom_neighbor_arr)
+        # a_x = self.atoms[a0]["x"][atom_neighbor_arr[:,atom_index]]
+        # a_y = self.atoms[a0]["y"][atom_neighbor_arr[:,atom_index]]
+        # plt.figure()
+        # for atom_index in np.arange(100,250):
+        #     # atom_index = 300
+        #     atoms_arr = self.atoms.get_data(0)
+
+        #     # neighbor_idxs = [i for i in self.atom_neighbor_layer_arr[:, atom_index] if i is not None]
+        #     a_x = self.atoms[a0]["x"][atom_neighbor_list[atom_index]]
+        #     a_y = self.atoms[a0]["y"][atom_neighbor_list[atom_index]]
+        #     print(atom_neighbor_list[atom_index])
+        #     plt.scatter(a_y, a_x, alpha = 0.5)
+        #     plt.scatter(atoms_arr[atom_index,1], atoms_arr[atom_index,0], c = 'red')
+        #     plt.gca().invert_yaxis()
+        return self
+
+
+
+
+    def intensity_neighborhood(
+        self,
+        neighborhood_units = 2,
+        return_delta = False,
+    ):
+        self.neighborhood(neighborhood_units = neighborhood_units)
+        # print(self.atom_neighbor_layer_arr[:20])
+
+        for a0 in range(self._num_sites):
+            atoms_arr = self.atoms.get_data(a0)
+            # a_x = atoms_arr[:,0]
+            # a_y = atoms_arr[:,1]
+            # idx_x = self.atoms_dislocation.fields.index("x")
+            # idx_y = self.atoms_dislocation.fields.index("y")
+            # idx_amp = self.atoms_dislocation.fields.index("int_peak")
+
+            a_x = self.atoms[0]["x"]
+            a_y = self.atoms[0]["y"]
+            a_intensity = self.atoms[0]["int_peak"]
+            delta_intensity = np.zeros([a_x.shape[0]])
+
+
+            # a_intensity = atoms_arr[:,-1]
+            print(a_intensity[:50])
+            for atom_index in range(len(self.atom_neighbor_layer_arr)):
+                if atom_index <10:
+                    print(self.atom_neighbor_layer_arr[atom_index])
+                # if self.has_six_neighbors_arr[atom_index]:
+                neighbor_intensities = a_intensity[self.atom_neighbor_layer_arr[atom_index]]
+                median_intensity = np.median(neighbor_intensities)
+                delta_intensity[atom_index] = a_intensity[atom_index] - median_intensity
+                # else:
+                    # delta_intensity[atom_index] = 1
+        self.delta_intensities = delta_intensity
+        if return_delta:
+            return delta_intensity
+        else:
+            return self
+
+
+
+
+
+
+        # for a0 in range(self._num_sites):
+        #     atoms_arr = self.atoms.get_data(a0)
+        #     a_x = atoms_arr[:,0]
+        #     a_y = atoms_arr[:,1]
+        #     pm_arr = np.array([1,-1])
+
+        #     atom_neighbor_arr = np.empty((6, a_x.shape[0]), dtype=object)
+        #     for atom_index in range(a_x.shape[0]):
+        #         neighbors_found = np.array([atom_index])
+        #         neighbor_idxs = [i for i in atom_neighbor_arr[:, atom_index] if i is not None]
+        #         for neighborhood_index in range(neighborhood_units):
+        #             # if neighborhood_index < neighborhood_units - 1:
+        #             #     break
+        #             neighbors_found = np.concatenate([atom_index, neighbor_idxs])
+        #             for atom_neighbor in neighbor_idxs:
+
+        #     for atom_index in range(a_x.shape[0]):
+
+            
+
+
+
+    # def histogram_intensity(
+    #     self,
+    # ):
+    #     for a0 in range(self._num_sites):
+    #         atoms_arr = self.atoms.get_data(a0)
+
+
+
+
+
+
+
+
+
+    # def merge_atoms(
+    #     self,
+    # ):
+    #     ad_arr = None
+    #     for a0 in range(self._num_sites):
+    #         if hasattr(self, "atoms_dislocation"):
+    #             if self.check_for_dislocations is True:
+    #                 ad_arr = self.atoms_dislocation.get_data(a0)
+    #         if hasattr(self, "atoms"):
+    #             if self.check_for_dislocations is True:
+    #                 atom_arr = self.atoms_dislocation.get_data(a0)
+    #         merged_arr = np.append((atom_arr, ad_arr), axis = 0)
+
+
+
+
+
+        # atoms_found_this_iteration = np.zeros(len(maxima_candidates))
+        # atoms_found_this_for_loop_iteration = np.zeros(len(maxima_candidates))
+        # atoms_found_prev_iteration = np.zeros(len(maxima_candidates))
+        # atoms_found_prev_iteration[origin_candidate_index] = 1
+        # pm_u = True
+        # pm_v = False
+        # found_atoms_in_prev_iteration = True
+        # iteration_while = 0
+        # while found_atoms_in_prev_iteration is True:
+        #     for atom_index in range(len(maxima_candidates)):
+        #         if atoms_found_prev_iteration[atom_index] > 0:
+        #             for pm in pm_arr:
+        #                 for lat_vec in uv_arr:
+        #                     position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
+        #                     position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
+        #                     radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+        #                     radial_dist[atom_index] = uv_norm * (tolerance_uv - 1) * 2
+        #                     if (radial_dist < uv_norm * (tolerance_uv - 1)).any():
+        #                         min_val = radial_dist.min() # checking if there are multiple equal minima
+        #                         min_indices = np.where(radial_dist == min_val)[0]
+        #                         if min_indices.size > 1:
+        #                             print("Multiple equal minima at:", min_indices)
+        #                         min_indices = (radial_dist < uv_norm * tolerance_uv) & (radial_dist > uv_norm / tolerance_uv) # checking if there are multiple minima in range
+        #                         # if min_indices.size > 1:
+        #                             # print("Multiple minima in range at:", min_indices)
+                                
+        #                         successful_candidate_index = np.argmin(radial_dist)
+        #                         if unique_ids[1, successful_candidate_index] == 0:
+        #                             atoms_found_this_iteration[successful_candidate_index] += 1
+        #                             atoms_found_this_for_loop_iteration[successful_candidate_index] += 1
+
+        #                             if unique_ids[1, successful_candidate_index] == 0:
+        #                                 unique_ids[1, successful_candidate_index] = 1
+        #                                 unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + int(pm_u)
+        #                                 unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + int(pm_v)
+        #                                 unique_ids[4, successful_candidate_index] = 0
+        #                     pm_u = ~pm_u
+        #                     pm_v = ~pm_v
+        #         # check if any atom was somehow still found twice:
+        #         assert np.max(atoms_found_this_for_loop_iteration) < 2
+        #         # check if any found atoms have the same uv index
+        #         uv_pairs = unique_ids[2:5,:].T
+        #         unique_pairs, inverse, counts = np.unique(uv_pairs, axis=0, return_inverse=True, return_counts=True)
+        #         duplicate_groups = [np.where(inverse == k)[0] for k, c in enumerate(counts) if c > 1]
+        #         mask_atoms_found = atoms_found_this_for_loop_iteration.astype(bool)
+        #         print(len(duplicate_groups))
+        #         print(duplicate_groups)
+        #         if len(duplicate_groups) != 0:
+        #             for duplicate_group in duplicate_groups:
+        #                 duplicate_group = np.asarray(duplicate_group)
+        #                 duplicate_atoms_index_found_previous_iterations = duplicate_group[~mask_atoms_found[duplicate_group]]
+        #                 if duplicate_atoms_index_found_previous_iterations.size > 1:
+        #                     if origin_candidate_index not in duplicate_group:
+        #                         raise ValueError("The duplicate atoms finding code is somehow bugged")
+        #                     else:
+        #                         kept_index = origin_candidate_index
+        #                 elif duplicate_atoms_index_found_previous_iterations.size == 1:
+        #                     kept_index = duplicate_atoms_index_found_previous_iterations
+        #                 else:
+        #                     kept_index = duplicate_group[mask_atoms_found[duplicate_group]][0]
+        #                 wipe_indicies = duplicate_group[duplicate_group != kept_index]
+        #                 unique_ids[1:4,wipe_indicies] *= 0
+        #         atoms_found_this_for_loop_iteration = np.zeros(len(maxima_candidates))
+        #     if np.sum(atoms_found_this_iteration) == 0:
+        #         found_atoms_in_prev_iteration = False
+        #         print('stopping search')
+
+
+        # atoms_found_this_iteration = np.zeros(len(maxima_candidates))
+        # for atom_index in range(len(maxima_candidates)):
+        #     if unique_ids[1,atom_index] == 1:
+        #         for pm_u in pm_arr:
+        #             for pm_v in pm_arr:
+        #                 if np.abs(pm_u + pm_v) == 1:
+        #                     for lat_vec in uv_arr:
+        #                         position_x = pm_u * lat_vec[0,0] + pm_v * lat_vec[1,0]
+        #                         position_y = pm_u * lat_vec[0,1] + pm_v * lat_vec[1,1]
+        #                         radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+        #                         if radial_dist.any < uv_norm * (tolerance_uv - 1):
+        #                             min_val = radial_dist.min() # checking if there are multiple equal minima
+        #                             min_indices = np.where(radial_dist == min_val)[0]
+        #                             if min_indices.size > 1:
+        #                                 print("Multiple equal minima at:", min_indices)
+                                    
+        #                             min_indices = (radial_dist < uv_norm * tolerance_uv) & (radial_dist > uv_norm / tolerance_uv) # checking if there are multiple minima in range
+        #                             if min_indices.size > 1:
+        #                                 print("Multiple minima in range at:", min_indices)
+                                    
+        #                             successful_candidate_index = np.argmin(radial_dist)
+        #                             atoms_found_this_iteration[successful_candidate_index] += 1
+        #                             if unique_ids[1, successful_candidate_index] == 0:
+        #                                 unique_ids[1, successful_candidate_index] = 1
+        #                                 unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm_u
+        #                                 unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm_v
+
+
+
+        # working version 20250930_1553:
+
+        # radial_dist = ((maxima_candidates_x - origin[0])**2 + (maxima_candidates_y - origin[1])**2)**(0.5)
+        # origin_candidate_index = np.argmin(radial_dist) # use the first minima, if there are multiple
+        # unique_ids[1,origin_candidate_index] = 1
+        # unique_ids[4,origin_candidate_index] = 0
+
+        # atoms_found_this_iteration = np.zeros(len(maxima_candidates))
+        # # atoms_found_this_for_loop_iteration = np.zeros(len(maxima_candidates))
+        # atoms_found_prev_iteration = np.zeros(len(maxima_candidates))
+        # atoms_found_previous_iterations = np.zeros(len(maxima_candidates), dtype = bool)
+        # atoms_found_prev_iteration[origin_candidate_index] = 1
+        # found_atoms_in_prev_iteration = True
+        # iteration_while = 0
+        # while found_atoms_in_prev_iteration is True:
+        #     for atom_index in range(len(maxima_candidates)):
+        #         if atoms_found_prev_iteration[atom_index] > 0:
+        #             # for pm in pm_arr:
+        #             #     for lat_vec in uv_arr:
+        #             #         position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
+        #             #         position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
+        #             #         radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+        #             #         radial_dist[atom_index] = uv_norm * (tolerance_uv - 1) * 2
+        #             #         if (radial_dist < uv_norm * (tolerance_uv - 1)).any():
+        #             #             min_val = radial_dist.min() # checking if there are multiple equal minima
+        #             #             min_indices = np.where(radial_dist == min_val)[0]
+        #             #             if min_indices.size > 1:
+        #             #                 print("Multiple equal minima at:", min_indices)
+        #             #             min_indices = (radial_dist < uv_norm * tolerance_uv) & (radial_dist > uv_norm / tolerance_uv) # checking if there are multiple minima in range
+        #             #             # if min_indices.size > 1:
+        #             #                 # print("Multiple minima in range at:", min_indices)
+                                
+        #             #             successful_candidate_index = np.argmin(radial_dist)
+        #             #             if unique_ids[1, successful_candidate_index] == 0:
+        #             #                 atoms_found_this_iteration[successful_candidate_index] += 1
+        #             #                 unique_ids[1, successful_candidate_index] = 1
+        #             #                 unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + int(pm_u)
+        #             #                 unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + int(pm_v)
+        #             #                 unique_ids[4, successful_candidate_index] = 0
+        #             #         pm_u = ~pm_u
+        #             #         pm_v = ~pm_v
+        #         # if unique_ids[1,atom_index] == 1:
+        #             for pm in pm_arr:
+        #                 for uv_index, lat_vec in enumerate(uv_arr):
+        #                     position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
+        #                     position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
+        #                     radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+        #                     radial_dist[atom_index] = uv_norm * (tolerance_uv - 1) * 2
+        #                     if (radial_dist < uv_norm * (tolerance_uv - 1)).any():
+        #                         min_val = radial_dist.min() # checking if there are multiple equal minima
+        #                         min_indices = np.where(radial_dist == min_val)[0]
+        #                         if min_indices.size > 1:
+        #                             print("Multiple equal minima at:", min_indices)
+        #                         min_indices = (radial_dist < uv_norm * tolerance_uv) & (radial_dist > uv_norm / tolerance_uv) # checking if there are multiple minima in range
+        #                         # if min_indices.size > 1:
+        #                             # print("Multiple minima in range at:", min_indices)
+                                
+        #                         successful_candidate_index = np.argmin(radial_dist)
+        #                         if unique_ids[1, successful_candidate_index] == 0:
+        #                             atoms_found_this_iteration[successful_candidate_index] += 1
+        #                             unique_ids[1, successful_candidate_index] = 1
+        #                             unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uv_index == 0)
+        #                             unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uv_index == 1)
+        #                             unique_ids[4, successful_candidate_index] = 0
+        #                     # pm_u = not pm_u
+        #                     # pm_v = not pm_v
+        #                     # print("pm u",pm_u)
+        #                     # print("pm v",pm_v)
+        #     # check if any atom was somehow still found twice:
+        #     assert np.max(atoms_found_this_iteration) < 2
+        #     # check if any found atoms have the same uv index
+        #     uv_pairs = unique_ids[1:5,:].T
+        #     # print(atoms_found_this_iteration)
+        #     unique_pairs, inverse, counts = np.unique(uv_pairs, axis=0, return_inverse=True, return_counts=True)
+        #     duplicate_groups = [np.where(inverse == k)[0] for k, c in enumerate(counts) if c > 1]
+        #     mask_atoms_found = atoms_found_this_iteration.astype(bool)
+        #     # print(duplicate_groups)
+        #     if len(duplicate_groups) != 0:
+        #         for duplicate_group in duplicate_groups:
+        #             # print(uv_pairs[duplicate_group])
+        #             duplicate_group = np.asarray(duplicate_group)
+        #             duplicate_atoms_index_found_previous_iterations = duplicate_group[atoms_found_previous_iterations[duplicate_group]]
+        #             if duplicate_atoms_index_found_previous_iterations.size > 1:
+        #                 if origin_candidate_index not in duplicate_group:
+        #                     raise ValueError("The duplicate atoms finding code is somehow bugged")
+        #                 else:
+        #                     kept_index = origin_candidate_index
+        #             elif duplicate_atoms_index_found_previous_iterations.size == 1:
+        #                 kept_index = duplicate_atoms_index_found_previous_iterations
+        #             else:
+        #                 kept_index = duplicate_group[mask_atoms_found[duplicate_group]][0]
+        #             wipe_indicies = duplicate_group[duplicate_group != kept_index]
+        #             # print(duplicate_group)
+        #             # print(wipe_indicies)
+        #             # print(kept_index)
+        #             unique_ids[1, wipe_indicies] = 2 # signals to not accept for this maxima anymore
+        #             unique_ids[2:4,wipe_indicies] = 0
+        #             unique_ids[4,wipe_indicies] = -1*(wipe_indicies+1)
+        #             atoms_found_previous_iterations[wipe_indicies] = False
+        #             mask_atoms_found[wipe_indicies] = False
+        #             atoms_found_this_iteration[wipe_indicies] = 0
+        #     if np.sum(atoms_found_this_iteration) == 0:
+        #         found_atoms_in_prev_iteration = False
+        #         print('stopping search')
+
+        #     # print('running another iteration of while loop', iteration_while)
+        #     # print('sum found this iter',np.sum(atoms_found_this_iteration))
+
+        #     atoms_found_previous_iterations |= atoms_found_this_iteration.astype(bool)
+
+        #     atoms_found_prev_iteration = atoms_found_this_iteration.copy()
+        #     atoms_found_this_iteration = np.zeros(len(maxima_candidates))
+        #     iteration_while += 1
+
+
+        # maxima_accepted_x = maxima_candidates_x[unique_ids[1,:] == 1]
+        # maxima_accepted_y = maxima_candidates_y[unique_ids[1,:] == 1]
+
+    def auto_peak_finder(
+        self,
+        num_peaks_search = 20,
+        num_peaks_use = 2,
+        center_ignore_buffer = 15,
+        minSpacingPeaks = 5,
+    ):
+        diffraction_peaks_list = self.locate_diffraction_spots(num_peaks_search, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
+        if num_peaks_use == 2:
+            peakA, peakB = self.locate_first_order_peaks(diffraction_peaks_list)
+            diffraction_peaks_list = np.array([peakA, peakB])
+        else:
+            diffraction_peaks_list = np.array([[diffraction_peaks_list[i]] for i in range(1,(num_peaks_use+1))])
+        return diffraction_peaks_list
+
+
+    def locate_first_order_peaks(
+        self,
+        peakCoordinates: np.dtype([("x", float), ("y", float), ("intensity", float)]),
+        ):
+        """
+        Locate three low-order linearly independent peaks in k-space.
+
+        Parameters
+        ----------
+        peakCoordinates: (number of peaks) np.ndarrary, np.dtype([("x", float), ("y", float), ("intensity", float)])
+            An array of input peaks. This array should contain at least 2 linearly independent Bragg vectors.
+            
+        Returns
+        -------
+        peakA: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            The first peak (closest to central peak).
+        peakB: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            The first peak (second closest to central peak).
+        """
+        nx, ny = self._image.shape 
+        midX = nx//2; midY = ny//2
+        peakCoordinatesRespCenter = np.zeros(len(peakCoordinates), dtype=np.dtype([("x", float), ("y", float), ("intensity", float)]))
+        peakCoordinatesRespCenter['x'] = peakCoordinates['x'] - midX
+        peakCoordinatesRespCenter['y'] = peakCoordinates['y'] - midY
+        peakRadialDistCenter = peakCoordinatesRespCenter['x']**2 + peakCoordinatesRespCenter['y']**2
+        
+        smallestRadiiIndices = np.argsort(peakRadialDistCenter)
+        peakCoordinatesRespCenter = peakCoordinatesRespCenter[smallestRadiiIndices]
+        
+        # The closest peak should be the zero order peak - not interested in that.
+        if peakRadialDistCenter[0] < 5:
+            peakAInd = 1
+            peakBInd = None
+        else:
+            peakAInd = 0
+            peakBInd = None
+
+        crossAWithRest = np.zeros([len(peakCoordinates)-2]) # this 2 comes from the A peak and the central peak that are excluded from consideration for the B and C peaks
+        peakA_xy = self.get_xy(peakCoordinatesRespCenter[peakAInd])
+        for peakIndex in np.arange(2,len(peakCoordinates)):
+            currentPeak = self.get_xy(peakCoordinatesRespCenter[peakIndex])
+            crossAWithRest[peakIndex-2] = np.cross(peakA_xy, currentPeak)
+        threshold = 5 * (np.min(np.abs(crossAWithRest))+0.1)
+
+        thresholdCondition = np.abs(crossAWithRest)>threshold
+        if np.any(thresholdCondition):
+            peakBInd = np.argmax(thresholdCondition) + 2 # returning the 2 that was subtracted above
+        else:
+            print('Lowering threshold B')
+            threshold = 2 * (np.min(np.abs(crossAWithRest))+0.1)
+            thresholdCondition = np.abs(crossAWithRest)>threshold
+            peakBInd = np.argmax(thresholdCondition) + 2
+
+        peakA = np.zeros(1, dtype=np.dtype([("x", float), ("y", float), ("intensity", float)]))
+        peakB = np.zeros(1, dtype=np.dtype([("x", float), ("y", float), ("intensity", float)]))
+
+        peakA['x'] = peakCoordinates['x'][smallestRadiiIndices[peakAInd]]; peakA['y'] = peakCoordinates['y'][smallestRadiiIndices[peakAInd]]; peakA['intensity'] = peakCoordinates['intensity'][smallestRadiiIndices[peakAInd]]
+        peakB['x'] = peakCoordinates['x'][smallestRadiiIndices[peakBInd]]; peakB['y'] = peakCoordinates['y'][smallestRadiiIndices[peakBInd]]; peakB['intensity'] = peakCoordinates['intensity'][smallestRadiiIndices[peakBInd]]
+        return peakA, peakB
+
+    def locate_diffraction_spots(
+        self,
+        maxNumPeaks_in: int,
+        minSpacingPeaks: int = 0,
+        center_ignore_buffer: int | None = None,
+        ):
+        """
+        Calls the maxima finder.
+        
+        Parameters
+        ----------
+        maxNumPeaks_in: int
+            The number of peaks to return. Noisier data should use a smaller value. For 2D crystals, more than 3 peaks should be sought. 
+        Returns
+        -------
+        peakList: (maxNumPeaks_in) np.ndarray, np.dtype([("x", float), ("y", float), ("intensity", float)])
+            An array of peak coordinates with a custom datatype.
+        """
+        nx, ny = self._image.shape 
+        peakList = self.get_maxima_2D(np.abs(np.fft.fftshift(np.fft.fft2(self._image.array))), maxNumPeaks = maxNumPeaks_in, minSpacing = minSpacingPeaks)
+        if center_ignore_buffer != None:
+            x_dist_to_center = peakList['x'] - nx/2
+            y_dist_to_center = peakList['y'] - ny/2
+            rad_dist_to_center = np.sqrt(x_dist_to_center**2 + y_dist_to_center**2)
+            peakList = peakList[rad_dist_to_center>center_ignore_buffer]
+            zero_peak = np.zeros(1, np.dtype([("x", float), ("y", float), ("intensity", float)]))
+            zero_peak['x'] = nx/2
+            zero_peak['y'] = ny/2
+            peakList = np.append(zero_peak, peakList)
+            return peakList
+        else:
+            return peakList
+
+    def get_xy_2(
+        self,
+        coords_arr: np.dtype([("x", float), ("y", float), ("intensity", float)]),
+        ):
+        """
+        Converts the custom dtype to an np.ndarray.
+        
+        Parameters
+        ----------
+        coords_arr: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            A single set of peak coordinates that has not already been indexed.
+        
+        Returns
+        -------
+        xyCoords: (2) np.ndarray
+            A simple array with two entries giving the x (row) and y (column) coordinates of the input peak.
+        """
+        xyCoords = np.array([coords_arr['x'][0], coords_arr['y'][0]])
+        return xyCoords
+
+    def get_xy(
+        self,
+        coords_arr: np.dtype([("x", float), ("y", float), ("intensity", float)]),
+        ):
+        """
+        Converts the custom dtype to an np.ndarray.
+        
+        Parameters
+        ----------
+        coords_arr: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            A single set of peak coordinates.
+            
+        Returns
+        -------
+        xyCoords: (2) np.ndarray
+            A simple array with three entries giving the x (row) and y (column) coordinates of the input peak.
+        """
+        xyCoords = np.array([coords_arr['x'], coords_arr['y']])
+        return xyCoords
+
+
+    def get_maxima_2D(
+        self,
+        ar: np.ndarray,
+        subpixel: str = "poly",
+        upsample_factor: int = 16,
+        sigma: float = 0,
+        minAbsoluteIntensity: float = 0,
+        minRelativeIntensity: float = 0,
+        relativeToPeak: float = 0,
+        minSpacing: float = 0,
+        edgeBoundary: int = 1,
+        maxNumPeaks: int = 1,
+        _ar_FT: np.ndarray | None = None,
+    ):
+        """
+        Finds the maximal points of a 2D array.
+
+        Parameters
+        ----------
+        ar: (nx, ny) np.ndarray
+            The 2D image with peaks.
+        subpixel: string
+            specifies the subpixel resolution algorithm to use.
+            must be in ('pixel','poly','multicorr'), which correspond
+            to pixel resolution, subpixel resolution by fitting a
+            parabola, and subpixel resultion by Fourier upsampling.
+        upsample_factor: int 
+            the upsampling factor for the 'multicorr' algorithm
+        sigma: float
+            If > 0, applies a gaussian filter
+        maxNumPeaks: int
+            The maximum number of maxima to return
+        minAbsoluteIntensity, minRelativeIntensity, relativeToPeak,
+            minSpacing, edgeBoundary, maxNumPeaks: filtering applied
+            after maximum detection and before subpixel refinement.
+            Parameter descriptions in filter_2D_maxima.
+        _ar_FT: (nx, ny) np.ndarray, complex
+            If 'multicorr' is used and this is not None, uses this argument
+            as the Fourier transform of `ar`, instead of recomputing it
+
+        Returns
+        -------
+        maxima: np.ndarray, np.dtype([("x", float), ("y", float), ("intensity", float)])
+            A structured array of maxima with fields 'x','y','intensity'
+        """
+
+        subpixel_modes = ("pixel", "poly", "multicorr")
+        er = f"Unrecognized subpixel option {subpixel}. Must be in {subpixel_modes}"
+        assert subpixel in subpixel_modes, er
+
+        # gaussian filtering
+        ar = ar if sigma <= 0 else gaussian_filter(ar, sigma)
+
+        # local pixelwise maxima
+        maxima_bool = (
+            (ar >= np.roll(ar, (-1, 0), axis=(0, 1)))
+            & (ar > np.roll(ar, (1, 0), axis=(0, 1)))
+            & (ar >= np.roll(ar, (0, -1), axis=(0, 1)))
+            & (ar > np.roll(ar, (0, 1), axis=(0, 1)))
+            & (ar >= np.roll(ar, (-1, -1), axis=(0, 1)))
+            & (ar > np.roll(ar, (-1, 1), axis=(0, 1)))
+            & (ar >= np.roll(ar, (1, -1), axis=(0, 1)))
+            & (ar > np.roll(ar, (1, 1), axis=(0, 1)))
+        )
+
+        # remove edges
+        assert isinstance(edgeBoundary, (int, np.integer))
+        if edgeBoundary < 1:
+            edgeBoundary = 1
+        maxima_bool[:edgeBoundary, :] = False
+        maxima_bool[-edgeBoundary:, :] = False
+        maxima_bool[:, :edgeBoundary] = False
+        maxima_bool[:, -edgeBoundary:] = False
+
+        # get indices
+        # sort by intensity
+        maxima_x, maxima_y = np.nonzero(maxima_bool)
+        dtype = np.dtype([("x", float), ("y", float), ("intensity", float)])
+        maxima = np.zeros(len(maxima_x), dtype=dtype)
+        maxima["x"] = maxima_x
+        maxima["y"] = maxima_y
+        maxima["intensity"] = ar[maxima_x, maxima_y]
+        maxima = np.sort(maxima, order="intensity")[::-1]
+
+        if len(maxima) == 0:
+            return maxima
+
+        # filter
+        maxima = self.filter_2D_maxima(
+            maxima,
+            minAbsoluteIntensity=minAbsoluteIntensity,
+            minRelativeIntensity=minRelativeIntensity,
+            relativeToPeak=relativeToPeak,
+            minSpacing=minSpacing,
+            edgeBoundary=edgeBoundary,
+            maxNumPeaks=maxNumPeaks,
+        )
+
+        if subpixel == "pixel":
+            return maxima
+
+        # Parabolic subpixel refinement
+        for i in range(len(maxima)):
+            Ix1_ = ar[int(maxima["x"][i]) - 1, int(maxima["y"][i])].astype(np.float64)
+            Ix0 = ar[int(maxima["x"][i]), int(maxima["y"][i])].astype(np.float64)
+            Ix1 = ar[int(maxima["x"][i]) + 1, int(maxima["y"][i])].astype(np.float64)
+            Iy1_ = ar[int(maxima["x"][i]), int(maxima["y"][i]) - 1].astype(np.float64)
+            Iy0 = ar[int(maxima["x"][i]), int(maxima["y"][i])].astype(np.float64)
+            Iy1 = ar[int(maxima["x"][i]), int(maxima["y"][i]) + 1].astype(np.float64)
+            deltax = (Ix1 - Ix1_) / (4 * Ix0 - 2 * Ix1 - 2 * Ix1_)
+            deltay = (Iy1 - Iy1_) / (4 * Iy0 - 2 * Iy1 - 2 * Iy1_)
+            maxima["x"][i] += deltax
+            maxima["y"][i] += deltay
+            maxima["intensity"][i] = self.linear_interpolation_2D(
+                ar, maxima["x"][i], maxima["y"][i]
+            )
+
+        if subpixel == "poly":
+            return maxima
+
+        # Fourier upsampling
+        if _ar_FT is None:
+            _ar_FT = np.fft.fft2(ar)
+        for ipeak in range(len(maxima["x"])):
+            xyShift = np.array((maxima["x"][ipeak], maxima["y"][ipeak]))
+            # we actually have to lose some precision and go down to half-pixel
+            # accuracy for multicorr
+            xyShift[0] = np.round(xyShift[0] * 2) / 2
+            xyShift[1] = np.round(xyShift[1] * 2) / 2
+
+            subShift = self.upsampled_correlation(_ar_FT, upsample_factor, xyShift)
+            maxima["x"][ipeak] = subShift[0]
+            maxima["y"][ipeak] = subShift[1]
+
+        maxima = np.sort(maxima, order="intensity")[::-1]
+        return maxima
+
+
+
+
+
+    def filter_2D_maxima(
+        self,
+        maxima,
+        minAbsoluteIntensity=0,
+        minRelativeIntensity=0,
+        relativeToPeak=0,
+        minSpacing=0,
+        edgeBoundary=1,
+        maxNumPeaks=1,
+    ):
+        """
+        Args:
+            maxima : a numpy structured array with fields 'x', 'y', 'intensity'
+            minAbsoluteIntensity : delete counts with intensity below this value
+            minRelativeIntensity : delete counts with intensity below this value times
+                the intensity of the i'th peak, where i is given by `relativeToPeak`
+            relativeToPeak : see above
+            minSpacing : if two peaks are within this euclidean distance from one
+                another, delete the less intense of the two
+            edgeBoundary : delete peaks within this distance of the image edge
+            maxNumPeaks : an integer. defaults to 1
+
+        Returns:
+            a numpy structured array with fields 'x', 'y', 'intensity'
+        """
+
+        # Remove maxima which are too dim
+        if minAbsoluteIntensity > 0:
+            deletemask = maxima["intensity"] < minAbsoluteIntensity
+            maxima = maxima[~deletemask]
+
+        # Remove maxima which are too dim, compared to the n-th brightest
+        if (minRelativeIntensity > 0) & (len(maxima) > relativeToPeak):
+            assert isinstance(relativeToPeak, (int, np.integer))
+            deletemask = (
+                maxima["intensity"] / maxima["intensity"][relativeToPeak]
+                < minRelativeIntensity
+            )
+            maxima = maxima[~deletemask]
+
+        # Remove maxima which are too close
+        if minSpacing > 0:
+            deletemask = np.zeros(len(maxima), dtype=bool)
+            for i in range(len(maxima)):
+                if deletemask[i] == False:  # noqa: E712
+                    tooClose = (
+                        (maxima["x"] - maxima["x"][i]) ** 2
+                        + (maxima["y"] - maxima["y"][i]) ** 2
+                    ) < minSpacing**2
+                    tooClose[: i + 1] = False
+                    deletemask[tooClose] = True
+            maxima = maxima[~deletemask]
+
+        # Remove maxima in excess of maxNumPeaks
+        if maxNumPeaks is not None:
+            if len(maxima) > maxNumPeaks:
+                maxima = maxima[:maxNumPeaks]
+
+        return maxima
+
+
+    def linear_interpolation_2D(self, ar, x, y):
+        """
+        Calculates the 2D linear interpolation of array ar at position x,y using the four
+        nearest array elements.
+        """
+        x0, x1 = int(np.floor(x)), int(np.ceil(x))
+        y0, y1 = int(np.floor(y)), int(np.ceil(y))
+        dx = x - x0
+        dy = y - y0
+        return (
+            (1 - dx) * (1 - dy) * ar[x0, y0]
+            + (1 - dx) * dy * ar[x0, y1]
+            + dx * (1 - dy) * ar[x1, y0]
+            + dx * dy * ar[x1, y1]
+        )
+
+
+
+    def upsampled_correlation(self, imageCorr, upsampleFactor, xyShift, device="cpu"):
+        """
+        Refine the correlation peak of imageCorr around xyShift by DFT upsampling.
+
+        There are two approaches to Fourier upsampling for subpixel refinement: (a) one
+        can pad an (appropriately shifted) FFT with zeros and take the inverse transform,
+        or (b) one can compute the DFT by matrix multiplication using modified
+        transformation matrices. The former approach is straightforward but requires
+        performing the FFT algorithm (which is fast) on very large data. The latter method
+        trades one speedup for a slowdown elsewhere: the matrix multiply steps are expensive
+        but we operate on smaller matrices. Since we are only interested in a very small
+        region of the FT around a peak of interest, we use the latter method to get
+        a substantial speedup and enormous decrease in memory requirement. This
+        "DFT upsampling" approach computes the transformation matrices for the matrix-
+        multiply DFT around a small 1.5px wide region in the original `imageCorr`.
+
+        Following the matrix multiply DFT we use parabolic subpixel fitting to
+        get even more precision! (below 1/upsampleFactor pixels)
+
+        NOTE: previous versions of multiCorr operated in two steps: using the zero-
+        padding upsample method for a first-pass factor-2 upsampling, followed by the
+        DFT upsampling (at whatever user-specified factor). I have implemented it
+        differently, to better support iterating over multiple peaks. **The DFT is always
+        upsampled around xyShift, which MUST be specified to HALF-PIXEL precision
+        (no more, no less) to replicate the behavior of the factor-2 step.**
+        (It is possible to refactor this so that peak detection is done on a Fourier
+        upsampled image rather than using the parabolic subpixel and rounding as now...
+        I like keeping it this way because all of the parameters and logic will be identical
+        to the other subpixel methods.)
+
+
+        Args:
+            imageCorr (complex valued ndarray):
+                Complex product of the FFTs of the two images to be registered
+                i.e. m = np.fft.fft2(DP) * probe_kernel_FT;
+                imageCorr = np.abs(m)**(corrPower) * np.exp(1j*np.angle(m))
+            upsampleFactor (int):
+                Upsampling factor. Must be greater than 2. (To do upsampling
+                with factor 2, use upsampleFFT, which is faster.)
+            xyShift:
+                Location in original image coordinates around which to upsample the
+                FT. This should be given to exactly half-pixel precision to
+                replicate the initial FFT step that this implementation skips
+
+        Returns:
+            (2-element np array): Refined location of the peak in image coordinates.
+        """
+
+        if device == "cpu":
+            xp = np
+        elif device == "gpu":
+            xp = cp
+
+        assert upsampleFactor > 2
+
+        xyShift[0] = xp.round(xyShift[0] * upsampleFactor) / upsampleFactor
+        xyShift[1] = xp.round(xyShift[1] * upsampleFactor) / upsampleFactor
+
+        globalShift = xp.fix(xp.ceil(upsampleFactor * 1.5) / 2)
+
+        upsampleCenter = xp.asarray(globalShift - upsampleFactor * xyShift)
+
+        imageCorrUpsample = xp.conj(
+            self.dftUpsample(xp.conj(imageCorr), upsampleFactor, upsampleCenter, device=device)
+        )
+
+        xySubShift = xp.asarray(
+            xp.unravel_index(imageCorrUpsample.argmax(), imageCorrUpsample.shape)
+        )
+
+        # add a subpixel shift via parabolic fitting
+        try:
+            icc = xp.real(
+                imageCorrUpsample[
+                    xySubShift[0] - 1 : xySubShift[0] + 2,
+                    xySubShift[1] - 1 : xySubShift[1] + 2,
+                ]
+            )
+            dx = (icc[2, 1] - icc[0, 1]) / (4 * icc[1, 1] - 2 * icc[2, 1] - 2 * icc[0, 1])
+            dy = (icc[1, 2] - icc[1, 0]) / (4 * icc[1, 1] - 2 * icc[1, 2] - 2 * icc[1, 0])
+        except:
+            dx, dy = (
+                0,
+                0,
+            )  # this is the case when the peak is near the edge and one of the above values does not exist
+
+        xySubShift = xySubShift - globalShift
+
+        xyShift = xyShift + (xySubShift + xp.array([dx, dy])) / upsampleFactor
+
+        return xyShift
+
+
+    def dftUpsample(self, imageCorr, upsampleFactor, xyShift, device="cpu"):
+        """
+        This performs a matrix multiply DFT around a small neighboring region of the inital
+        correlation peak. By using the matrix multiply DFT to do the Fourier upsampling, the
+        efficiency is greatly improved. This is adapted from the subfuction dftups found in
+        the dftregistration function on the Matlab File Exchange.
+
+        https://www.mathworks.com/matlabcentral/fileexchange/18401-efficient-subpixel-image-registration-by-cross-correlation
+
+        The matrix multiplication DFT is from:
+
+        Manuel Guizar-Sicairos, Samuel T. Thurman, and James R. Fienup, "Efficient subpixel
+        image registration algorithms," Opt. Lett. 33, 156-158 (2008).
+        http://www.sciencedirect.com/science/article/pii/S0045790612000778
+
+        Args:
+            imageCorr (complex valued ndarray):
+                Correlation image between two images in Fourier space.
+            upsampleFactor (int):
+                Scalar integer of how much to upsample.
+            xyShift (list of 2 floats):
+                Coordinates in the UPSAMPLED GRID around which to upsample.
+                These must be single-pixel IN THE UPSAMPLED GRID
+
+        Returns:
+            (ndarray):
+                Upsampled image from region around correlation peak.
+        """
+        if device == "cpu":
+            xp = np
+        elif device == "gpu":
+            xp = cp
+
+        imageSize = imageCorr.shape
+        pixelRadius = 1.5
+        numRow = np.ceil(pixelRadius * upsampleFactor)
+        numCol = numRow
+
+        colKern = xp.exp(
+            (-1j * 2 * np.pi / (imageSize[1] * upsampleFactor))
+            * xp.outer(
+                (xp.fft.ifftshift((xp.arange(imageSize[1]))) - xp.floor(imageSize[1] / 2)),
+                (xp.arange(numCol) - xyShift[1]),
+            )
+        )
+
+        rowKern = xp.exp(
+            (-1j * 2 * np.pi / (imageSize[0] * upsampleFactor))
+            * xp.outer(
+                (xp.arange(numRow) - xyShift[0]),
+                (xp.fft.ifftshift(xp.arange(imageSize[0])) - xp.floor(imageSize[0] / 2)),
+            )
+        )
+
+        imageUpsample = xp.real(rowKern @ imageCorr @ colKern)
+        return imageUpsample
+
+
+
+
+
+
+
 
     def measure_polarization(
         self,
@@ -773,6 +2788,11 @@ class Lattice(AutoSerialize):
         # lattice vectors in pixels
         r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
 
+        if coordinates not in ("cartesian", "fractional"):
+            raise ValueError(
+                f"coordinates must be 'cartesian'(default) or 'fractional'. {coordinates} is not valid."
+            )
+
         measure_ind = int(measure_ind)
         reference_ind = int(reference_ind)
 
@@ -786,8 +2806,8 @@ class Lattice(AutoSerialize):
         if is_empty(A_cell) or is_empty(B_cell):
             out = Vector.from_shape(
                 shape=(1,),
-                fields=("x", "y", "a", "b", "da", "db"),
-                units=("px", "px", "ind", "ind", "ind", "ind"),
+                fields=("x", "y", "a", "b", "x_ref", "y_ref"),
+                units=("px", "px", "ind", "ind", "px", "px"),
                 name="polarization",
             )
             out.set_data(np.zeros((0, 6), float), 0)
@@ -800,17 +2820,30 @@ class Lattice(AutoSerialize):
         Ab = self.atoms[measure_ind]["b"]
         Bx = self.atoms[reference_ind]["x"]
         By = self.atoms[reference_ind]["y"]
-        Ba = self.atoms[reference_ind]["a"]
-        Bb = self.atoms[reference_ind]["b"]
 
-        reference_radius = 3
-        L = np.column_stack((u, v))
-        try:
-            L_inv = np.linalg.inv(L)
-        except np.linalg.LinAlgError:
-            raise ValueError("Lattice vectors are singular and cannot be inverted.")
-        query_coords = np.column_stack([Aa, Ab])
-        ref_coords = np.column_stack([Ba, Bb])
+        # Method-specific processing
+        if coordinates == "cartesian":
+            if reference_radius is None:
+                reference_radius = float(min(np.linalg.norm(u), np.linalg.norm(v)))
+
+            query_coords = np.column_stack([Ax, Ay])
+            ref_coords = np.column_stack([Bx, By])
+
+        elif coordinates == "fractional":
+            reference_radius = 3
+            L = np.column_stack((u, v))
+            # try:
+            #     # Not sure if we need this or not, but keeping it for now.
+            #     # Also depends on whether we would be caclulating polarization
+            #     # based on fractional or cartesian coordinates
+            #     L_inv = np.linalg.inv(L)
+            # except np.linalg.LinAlgError:
+            #     raise ValueError("Lattice vectors are singular and cannot be inverted.")
+
+            Ba = self.atoms[reference_ind]["a"]
+            Bb = self.atoms[reference_ind]["b"]
+            query_coords = np.column_stack([Aa, Ab])
+            ref_coords = np.column_stack([Ba, Bb])
 
         # KD-tree query
         tree = cKDTree(ref_coords)
@@ -835,8 +2868,8 @@ class Lattice(AutoSerialize):
         if not np.any(atoms_with_enough_neighbors):
             out = Vector.from_shape(
                 shape=(1,),
-                fields=("x", "y", "a", "b", "da", "db"),
-                units=("px", "px", "ind", "ind", "ind", "ind"),
+                fields=("x", "y", "a", "b", "x_ref", "y_ref"),
+                units=("px", "px", "ind", "ind", "px", "px"),
                 name="polarization",
             )
             out.set_data(np.zeros((0, 6), float), 0)
@@ -851,61 +2884,56 @@ class Lattice(AutoSerialize):
         y_arr = Ay[valid_atom_indices].astype(float)
         a_arr = Aa[valid_atom_indices].astype(float)
         b_arr = Ab[valid_atom_indices].astype(float)
-        da_arr = np.zeros(n_valid, dtype=float)
-        db_arr = np.zeros(n_valid, dtype=float)
+        xr_arr = np.zeros(n_valid, dtype=float)
+        yr_arr = np.zeros(n_valid, dtype=float)
 
-        for i, atom_idx in enumerate(valid_atom_indices):
-            valid_neighbors = valid_mask[atom_idx]
-            if np.sum(valid_neighbors) >= reference_num:
-                valid_dists = dists[atom_idx][valid_neighbors]
-                valid_idxs = idxs[atom_idx][valid_neighbors]
-                closest_order = np.argsort(valid_dists)[:reference_num]
-                nbr_idx = valid_idxs[closest_order].astype(int)
+        if coordinates == "cartesian":
+            # Vectorized reference position calculation for xy method
+            for i, atom_idx in enumerate(valid_atom_indices):
+                valid_neighbors = valid_mask[atom_idx]
+                if np.sum(valid_neighbors) >= reference_num:
+                    # Get closest reference_num neighbors
+                    valid_dists = dists[atom_idx][valid_neighbors]
+                    valid_idxs = idxs[atom_idx][valid_neighbors]
+                    closest_order = np.argsort(valid_dists)[:reference_num]
+                    nbr_idx = valid_idxs[closest_order].astype(int)
 
-                # Actual Cartesian position of the atom
-                actual_pos = np.array([x_arr[i], y_arr[i]])
+                    xr_arr[i] = np.mean(Bx[nbr_idx])
+                    yr_arr[i] = np.mean(By[nbr_idx])
 
-                # Fractional indices
-                a, b = a_arr[i], b_arr[i]
-                ai, bi = Ba[nbr_idx], Bb[nbr_idx]
+        else:  # coordinates == "fractional"
+            # Vectorized calculation for fractional coordinates method
+            for i, atom_idx in enumerate(valid_atom_indices):
+                valid_neighbors = valid_mask[atom_idx]
+                if np.sum(valid_neighbors) >= reference_num:
+                    # Get closest reference_num neighbors
+                    valid_dists = dists[atom_idx][valid_neighbors]
+                    valid_idxs = idxs[atom_idx][valid_neighbors]
+                    closest_order = np.argsort(valid_dists)[:reference_num]
+                    nbr_idx = valid_idxs[closest_order].astype(int)
 
-                # Cartesian positions of neighbors
-                xi, yi = Bx[nbr_idx], By[nbr_idx]
+                    # Vectorized matrix operations
+                    a, b = a_arr[i], b_arr[i]
+                    xi, yi = Bx[nbr_idx], By[nbr_idx]
+                    ai, bi = Ba[nbr_idx], Bb[nbr_idx]
 
-                # For each neighbor, calculate where the atom should be
-                # based on fractional index difference
-                fractional_diff = np.array([a - ai, b - bi])  # (2, n_neighbors)
-                neighbor_positions = np.array([xi, yi])  # (2, n_neighbors)
+                    diff_ind = np.array([a - ai, b - bi])  # (2, n_neighbors)
+                    neighbor_positions = np.array([xi, yi])  # (2, n_neighbors)
+                    transformed = L @ diff_ind + neighbor_positions
+                    exp_pos = np.mean(transformed, axis=1)  # (2,)
 
-                # Expected position = neighbor_position + L @ fractional_difference
-                expected_positions = neighbor_positions + L @ fractional_diff  # (2, n_neighbors)
-
-                # Average the expected positions from all neighbors
-                expected_position = np.mean(expected_positions, axis=1)  # (2,)
-
-                # Calculate displacement in Cartesian coordinates
-                displacement_cartesian = actual_pos - expected_position
-
-                # Convert displacement back to fractional coordinates
-                displacement_fractional = L_inv @ displacement_cartesian
-
-                # Store with consistent sign convention
-                da_arr[i] = displacement_fractional[0]
-                db_arr[i] = displacement_fractional[1]
+                    xr_arr[i] = exp_pos[0]
+                    yr_arr[i] = exp_pos[1]
 
         out = Vector.from_shape(
             shape=(1,),
-            fields=("x", "y", "a", "b", "da", "db"),
-            units=("px", "px", "ind", "ind", "ind", "ind"),
+            fields=("x", "y", "a", "b", "x_ref", "y_ref"),
+            units=("px", "px", "ind", "ind", "px", "px"),
             name="polarization",
         )
 
-        arr = np.column_stack([x_arr, y_arr, a_arr, b_arr, da_arr, db_arr])
-
-        filtered_arr = arr[(np.abs(arr[:, -2]) < 0.1) & (np.abs(arr[:, -1]) < 0.1)]
-        out.set_data(filtered_arr, 0)
-
-        # out.set_data(arr, 0)
+        arr = np.column_stack([x_arr, y_arr, a_arr, b_arr, xr_arr, yr_arr])
+        out.set_data(arr, 0)
 
         if plot_polarization_vectors:
             self.plot_polarization_vectors(out, **plot_kwargs)
@@ -965,23 +2993,12 @@ class Lattice(AutoSerialize):
         # Fields
         xA = pol_vec[0]["x"]
         yA = pol_vec[0]["y"]
-        # xR = pol_vec[0]["x_ref"]
-        # yR = pol_vec[0]["y_ref"]
-        da = pol_vec[0]["da"]
-        db = pol_vec[0]["db"]
-
-        r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
-        L = np.column_stack((u, v))
-        dr = L @ np.vstack((da, db))
-        dr_raw = dr[0].astype(float)
-        dc_raw = dr[1].astype(float)
-
-        xR = xA - dr_raw
-        yR = yA - dc_raw
+        xR = pol_vec[0]["x_ref"]
+        yR = pol_vec[0]["y_ref"]
 
         # Displacements (rows, cols)
-        # dr_raw = (xA - xR).astype(float)  # down +
-        # dc_raw = (yA - yR).astype(float)  # right +
+        dr_raw = (xA - xR).astype(float)  # down +
+        dc_raw = (yA - yR).astype(float)  # right +
 
         # --- Unified color mapping (identical across scripts) ---
         dr, dc, amp, disp_cap_px = _compute_polar_color_mapping(
@@ -1188,20 +3205,16 @@ class Lattice(AutoSerialize):
             return img_rgb
 
         # fields
+        xA = pol_vec[0]["x"]
+        yA = pol_vec[0]["y"]
+        xR = pol_vec[0]["x_ref"]
+        yR = pol_vec[0]["y_ref"]
         a_raw = pol_vec[0]["a"]
         b_raw = pol_vec[0]["b"]
-        da = pol_vec[0]["da"]  # fractional displacement in a direction
-        db = pol_vec[0]["db"]  # fractional displacement in b direction
 
-        # Convert fractional displacements to Cartesian displacements
-        r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
-        L = np.column_stack((u, v))
-        displacement_fractional = np.vstack((da, db))
-        displacement_cartesian = L @ displacement_fractional
-
-        # Extract Cartesian displacements
-        dr_raw = displacement_cartesian[0].astype(float)  # down +
-        dc_raw = displacement_cartesian[1].astype(float)  # right +
+        # displacements (rows/cols)
+        dr_raw = (xA - xR).astype(float)  # down +
+        dc_raw = (yA - yR).astype(float)  # right +
 
         # --- Unified color mapping (identical to arrow plot) ---
         dr, dc, amp, disp_cap_px = _compute_polar_color_mapping(
@@ -1260,35 +3273,35 @@ class Lattice(AutoSerialize):
 
             img_rgb[r0 : r0 + pixel_size, c0 : c0 + pixel_size, :] = color
 
-        # r_0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
-        # theta_u = np.arctan2(u[1], u[0])
-        # handedness = u[0] * v[1] - u[1] * v[0] > 0
+        r_0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+        theta_u = -np.arctan2(u[1], u[0])
+        handedness = u[0] * v[1] - u[1] * v[0] > 0
 
-        # if theta_u > np.pi / 36 or theta_u < -np.pi / 36:
-        #     from scipy.ndimage import rotate
+        if theta_u > np.pi / 36 or theta_u < -np.pi / 36:
+            from scipy.ndimage import rotate
 
-        #     if not handedness:
-        #         img_rgb = np.fliplr(img_rgb)
+            if not handedness:
+                img_rgb = np.fliplr(img_rgb)
 
-        #     img_rgb = rotate(
-        #         img_rgb,
-        #         np.degrees(theta_u),
-        #         axes=(1, 0),
-        #         reshape=True,
-        #         order=1,
-        #         mode="constant",
-        #         cval=0.0,
-        #     )
+            img_rgb = rotate(
+                img_rgb,
+                -np.degrees(theta_u),
+                axes=(1, 0),
+                reshape=True,
+                order=1,
+                mode="constant",
+                cval=0.0,
+            )
 
-        #     # Crop the image to deal with artifacts due to rotation
-        #     mask = np.linalg.norm(img_rgb, axis=2) > 0
-        #     rows, cols = np.where(mask)
+            # Crop the image to deal with artifacts due to rotation
+            mask = np.linalg.norm(img_rgb, axis=2) > 0
+            rows, cols = np.where(mask)
 
-        #     if len(rows) > 0 and len(cols) > 0:
-        #         r_min, r_max = rows.min(), rows.max()
-        #         c_min, c_max = cols.min(), cols.max()
+            if len(rows) > 0 and len(cols) > 0:
+                r_min, r_max = rows.min(), rows.max()
+                c_min, c_max = cols.min(), cols.max()
 
-        #         img_rgb = img_rgb[r_min : r_max + 1, c_min : c_max + 1, :]
+                img_rgb = img_rgb[r_min : r_max + 1, c_min : c_max + 1, :]
 
         # --- Optional rendering with legend ---
         if plot:
