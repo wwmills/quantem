@@ -1764,7 +1764,10 @@ class Lattice(AutoSerialize):
         self,
         site_search_radius = 2,
         num_bins = 128,
+        tolerance_uv = None,
     ):
+        if tolerance_uv is None:
+            tolerance_uv = self.tolerance_uv
         for a0 in range(self._num_sites):
             atoms_arr = self.atoms.get_data(a0)
             a_x = atoms_arr[:,0]
@@ -1779,8 +1782,8 @@ class Lattice(AutoSerialize):
                         position_x = pm * lat_vec[0] + a_x[atom_index]
                         position_y = pm * lat_vec[1] + a_y[atom_index]
                         radial_dist = ((a_x - position_x)**2 + (a_y - position_y)**2)**(0.5)
-                        radial_dist[atom_index] = self.uv_norm * (self.tolerance_uv - 1) * 2 # make sure that self is outside of range
-                        if (radial_dist < (self.uv_norm * (self.tolerance_uv - 1))).any():
+                        radial_dist[atom_index] = self.uv_norm * (tolerance_uv - 1) * 2 # make sure that self is outside of range
+                        if (radial_dist < (self.uv_norm * (tolerance_uv - 1))).any():
                             successful_candidate_index = np.argmin(radial_dist)
                             if (pm == 1 and uvw_index == 0):
                                 atom_neighbor_arr[0,atom_index] = int(successful_candidate_index)
@@ -1840,39 +1843,22 @@ class Lattice(AutoSerialize):
             self.atom_neighbor_arr = atom_neighbor_arr
         return self
 
-
-    # def neighborhood(
-    #     self,
-    #     neighborhood_units = 2,
-    # ):
-    #     for a0 in range(self._num_sites):
-    #         atoms_arr = self.atoms.get_data(a0)
-    #         a_x = atoms_arr[:,0]
-    #         a_y = atoms_arr[:,1]
-    #         pm_arr = np.array([1,-1])
-
-    #         atom_neighbor_arr = np.empty((6, a_x.shape[0]), dtype=object)
-    #         for atom_index in range(a_x.shape[0]):
-    #             neighbor_search_arr_1 = self.atom_neighbor_arr[atom_index]
-    #             for neighborhood_index in range(neighborhood_units):
-    #                 if neighborhood_index < neighborhood_units - 1:
-    #                     break
-    #                 for atom_neighbor in neighbor_search_arr_1:
-                        
-
-
     def get_next_neighborhood_layer(
         self,
         atom_index,
     ):
-        return np.asarray([i for i in self.atom_neighbor_arr[:, atom_index] if i is not None], dtype = int)
+        neighbor_arr = np.asarray([i for i in self.atom_neighbor_arr[:, atom_index] if i is not None], dtype = int)
+        neighbors_pass = [i for i in neighbor_arr if not self.added_to_neighbor_list_already[i]]
+
+        self.added_to_neighbor_list_already[neighbors_pass] = 1
+
+        return neighbors_pass
 
     def get_next_neighborhood_layer_arr(
         self,
         atom_indexes,
     ):
         atom_indexes_less_none =  [i for i in atom_indexes if i is not None]
-        
         arr_present = False
         arr = None
         for atom_index in atom_indexes_less_none:
@@ -1883,9 +1869,13 @@ class Lattice(AutoSerialize):
                 arr_present = True
         # print(arr)
         if arr is None:
-            print('something wrong here')
-            arr = np.asarray([0])
-        return np.asarray(arr, dtype = int)
+            # # print(atom_indexes_less_none)
+            # # print(atom_indexes)
+            # # print('something wrong here')
+            # arr = np.asarray([0])
+            return None
+        else:
+            return np.asarray(arr, dtype = int)
 
     def neighborhood(
         self,
@@ -1894,29 +1884,60 @@ class Lattice(AutoSerialize):
         for a0 in range(self._num_sites):
             atoms_arr = self.atoms.get_data(a0)
             a_x = atoms_arr[:,0]
-            a_y = atoms_arr[:,1]
-            pm_arr = np.array([1,-1])
 
-            # atom_neighbor_arr = np.arange(0, a_x.shape[0])
             atom_neighbor_list = []
+            self.added_to_neighbor_list_already = np.zeros(a_x.shape[0])
+            self.num_neighbors = np.zeros(a_x.shape[0])
+            # atoms_with_bug = np.zeros(a_x.shape[0], dtype = bool)
             for atom_index in range(a_x.shape[0]):
                 neighbors_search = np.asarray([atom_index])
-                neighbors_search_out = np.asarray([atom_index])
+                self.added_to_neighbor_list_already[atom_index] = 1
+                neighbors_search_out = np.array([atom_index])
                 for neighbor_iteration in range(neighborhood_units):
                     neighbors_search_out = self.get_next_neighborhood_layer_arr(neighbors_search_out)
-                    # print(neighbors_search_out)
                     neighbors_search = np.concatenate((neighbors_search, neighbors_search_out))
-                neighbors_search = np.unique(neighbors_search) # temporary measure to remove duplicates
+                    if neighbors_search_out.size == 0:
+                        break
+                        # atoms_with_bug[atom_index] = True
                 atom_neighbor_list.append(neighbors_search)
-        # self.atom_neighbor_layer_arr = np.asarray(atom_neighbor_list)
-        # print(atom_neighbor_list)
-        # self.
+                self.num_neighbors[atom_index] = np.sum(self.added_to_neighbor_list_already) - 1 # minus one because the central atom is not neighbor
+                self.added_to_neighbor_list_already = np.zeros(a_x.shape[0])
         self.atom_neighbor_layer_arr = atom_neighbor_list
 
         # atom_index = 110 #for test
         # print(atom_neighbor_arr)
         # a_x = self.atoms[a0]["x"][atom_neighbor_arr[:,atom_index]]
         # a_y = self.atoms[a0]["y"][atom_neighbor_arr[:,atom_index]]
+        # plt.figure()
+        # atoms_arr = self.atoms.get_data(0)
+        # a_x = atoms_arr[:,0]
+        # for atom_index in np.arange(0, a_x.shape[0])[atoms_with_bug]:
+        #     # atom_index = 300
+
+        #     # neighbor_idxs = [i for i in self.atom_neighbor_layer_arr[:, atom_index] if i is not None]
+        #     a_x = self.atoms[a0]["x"][atom_neighbor_list[atom_index]]
+        #     a_y = self.atoms[a0]["y"][atom_neighbor_list[atom_index]]
+        #     # print(atom_neighbor_list[atom_index])
+        #     plt.scatter(a_y, a_x, alpha = 0.5)
+        #     plt.scatter(atoms_arr[atom_index,1], atoms_arr[atom_index,0], alpha = 0.5, c = 'red')
+        #     plt.gca().invert_yaxis()
+        #     plt.imshow(self.image.array, cmap = 'gray')
+        # # atoms_arr = self.atoms.get_data(0)
+
+
+        # plt.figure()
+        # a_x = atoms_arr[:,0]
+        # for atom_index in np.arange(0, a_x.shape[0])[atoms_with_bug]:
+        #     # atom_index = 300
+        #     neighbor_arr = np.asarray([i for i in self.atom_neighbor_arr[:, atom_index] if i is not None], dtype = int)
+        #     # neighbor_idxs = [i for i in self.atom_neighbor_layer_arr[:, atom_index] if i is not None]
+        #     a_x = self.atoms[a0]["x"][neighbor_arr]
+        #     a_y = self.atoms[a0]["y"][neighbor_arr]
+        #     # print(atom_neighbor_list[atom_index])
+        #     plt.scatter(a_y, a_x, alpha = 0.5)
+        #     plt.scatter(atoms_arr[atom_index,1], atoms_arr[atom_index,0], alpha = 0.5, c = 'red')
+        #     plt.gca().invert_yaxis()
+        #     plt.imshow(self.image.array, cmap = 'gray')
         # plt.figure()
         # for atom_index in np.arange(100,250):
         #     # atom_index = 300
@@ -1929,6 +1950,7 @@ class Lattice(AutoSerialize):
         #     plt.scatter(a_y, a_x, alpha = 0.5)
         #     plt.scatter(atoms_arr[atom_index,1], atoms_arr[atom_index,0], c = 'red')
         #     plt.gca().invert_yaxis()
+        #     plt.imshow(self.image.array)
         return self
 
 
@@ -1957,19 +1979,19 @@ class Lattice(AutoSerialize):
 
 
             # a_intensity = atoms_arr[:,-1]
-            print(a_intensity[:50])
+            # print(a_intensity[:50])
             for atom_index in range(len(self.atom_neighbor_layer_arr)):
-                if atom_index <10:
-                    print(self.atom_neighbor_layer_arr[atom_index])
+                # if atom_index <10:
+                    # print(self.atom_neighbor_layer_arr[atom_index])
                 # if self.has_six_neighbors_arr[atom_index]:
-                neighbor_intensities = a_intensity[self.atom_neighbor_layer_arr[atom_index]]
+                neighbor_intensities = a_intensity[self.atom_neighbor_layer_arr[atom_index][1:]] # 1: excludes the first one, which is itself
                 median_intensity = np.median(neighbor_intensities)
                 delta_intensity[atom_index] = a_intensity[atom_index] - median_intensity
                 # else:
                     # delta_intensity[atom_index] = 1
         self.delta_intensities = delta_intensity
         if return_delta:
-            return delta_intensity
+            return delta_intensity, self.num_neighbors
         else:
             return self
 
