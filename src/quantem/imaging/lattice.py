@@ -1288,15 +1288,6 @@ class Lattice(AutoSerialize):
             ax.set_xlim(0, W)
             ax.set_ylim(H, 0)
 
-            # plt.figure(figsize = (10,10))
-            # plt.imshow(self._image.array, origin = 'lower')
-            # plt.scatter(maxima_accepted_y, maxima_accepted_x, c= maxima_accepted_u, alpha = 0.7, s = 20, cmap = 'tab20')
-            # plt.gca().invert_yaxis()
-            # plt.figure(figsize = (10,10))
-            # plt.imshow(self._image.array, origin = 'lower')
-            # plt.scatter(maxima_accepted_y, maxima_accepted_x, c= maxima_accepted_v, alpha = 0.7, s = 20, cmap = 'tab20')
-            # plt.gca().invert_yaxis()
-
         return self
 
     def atoms_first_uvw(
@@ -1716,49 +1707,7 @@ class Lattice(AutoSerialize):
             ax.set_xlim(0, W)
             ax.set_ylim(H, 0)
 
-            # plt.figure(figsize = (10,10))
-            # plt.imshow(self._image.array, origin = 'lower')
-            # plt.scatter(maxima_accepted_y, maxima_accepted_x, c= maxima_accepted_u, alpha = 0.7, s = 20, cmap = 'tab20')
-            # plt.gca().invert_yaxis()
-            # plt.figure(figsize = (10,10))
-            # plt.imshow(self._image.array, origin = 'lower')
-            # plt.scatter(maxima_accepted_y, maxima_accepted_x, c= maxima_accepted_v, alpha = 0.7, s = 20, cmap = 'tab20')
-            # plt.gca().invert_yaxis()
-
         return self
-
-    # def organize_nearest_neighbors(
-    #     self,
-    #     site_search_radius = 2,
-    #     num_bins = 128,
-    # ):
-    #     for a0 in range(self._num_sites):
-    #         # atoms_arr = self.atoms.get_data(a0)
-    #         a_x = self.atoms[a0]["x"][:]
-    #         a_y = self.atoms[a0]["y"][:]
-    #         a_int = self.atoms[a0]["int_peak"][:]
-
-
-    #         a_int_max = np.max(a_int)
-    #         a_int_min = np.min(a_int)
-    #         bins_arr = np.arange(a_int_min,a_int_max,num_bins)
-    #         for atom_index in range(a_x.size):
-    #             a_x_this_atom = a_x[atom_index]
-    #             a_y_this_atom = a_y[atom_index]
-
-    #             radial_dist = ((a_x - a_x_this_atom)**2 + (a_y - a_y_this_atom)**2)**(0.5)
-    #             radial_dist[atom_index] = 2e4 # make sure that self is outside of range
-    #             if (radial_dist < (self.uv_norm * site_search_radius)).any():
-    #                 smallestRadiiIndices = np.argsort(radial_dist)
-    #                 radial_dist_sorted = radial_dist[smallestRadiiIndices]
-    #                 a_int_sorted = a_int[smallestRadiiIndices]
-    #                 # get number valid sites
-    #                 valid_sites_int = a_int_sorted[radial_dist_sorted < (self.uv_norm * site_search_radius)]
-    #                 num_valid_sites = valid_sites_int.size[0]
-
-
-    #                 # successful_candidate_index = np.argmin(radial_dist)
-
 
     def organize_nearest_neighbors(
         self,
@@ -1788,58 +1737,27 @@ class Lattice(AutoSerialize):
                             if (pm == 1 and uvw_index == 0):
                                 atom_neighbor_arr[0,atom_index] = int(successful_candidate_index)
                                 has_six_neighbors_arr[atom_index] += 1
-                                # print(0)
 
                             if (pm == -1 and uvw_index == 0):
                                 atom_neighbor_arr[1,atom_index] = int(successful_candidate_index) 
                                 has_six_neighbors_arr[atom_index] += 1
-                                # print(1)
 
                             if (pm == 1 and uvw_index == 1):
                                 atom_neighbor_arr[2,atom_index] = int(successful_candidate_index) 
                                 has_six_neighbors_arr[atom_index] += 1
-                                # print(2)
 
                             if (pm == -1 and uvw_index == 1):
                                 atom_neighbor_arr[3,atom_index] = int(successful_candidate_index) 
                                 has_six_neighbors_arr[atom_index] += 1
-                                # print(3)
 
                             if (pm == 1 and uvw_index == 2):
                                 atom_neighbor_arr[4,atom_index] = int(successful_candidate_index) 
                                 has_six_neighbors_arr[atom_index] += 1
-                                # print(4)
 
                             if (pm == -1 and uvw_index == 2):
                                 atom_neighbor_arr[5,atom_index] = int(successful_candidate_index) 
                                 has_six_neighbors_arr[atom_index] += 1
-                                # print(5)
-            # print(has_six_neighbors_arr)
-            # has_six_neighbors_arr[has_six_neighbors_arr < 6] = 0
-            # has_six_neighbors_arr[has_six_neighbors_arr > 0] = 0
-            # self.has_six_neighbors_arr = has_six_neighbors_arr.astype(bool)
             self.has_six_neighbors_arr = has_six_neighbors_arr == 6
-            # print(self.has_six_neighbors_arr[self.has_six_neighbors_arr == True])
-            # plt.figure()
-            # for atom_index in range(a_x.shape[0]):
-            #     if self.has_six_neighbors_arr[atom_index]:
-            #         a_x = self.atoms[a0]["x"][atom_index]
-            #         a_y = self.atoms[a0]["y"][atom_index]
-            #         plt.scatter(a_y, a_x, c = 'red')
-            #         plt.gca().invert_yaxis()
-            # atom_index = 110 #for test
-            # print(atom_neighbor_arr)
-            # a_x = self.atoms[a0]["x"][atom_neighbor_arr[:,atom_index]]
-            # a_y = self.atoms[a0]["y"][atom_neighbor_arr[:,atom_index]]
-            # plt.figure()
-            # for atom_index in np.arange(100,610):
-            #     # atom_index = 300
-            #     neighbor_idxs = [i for i in atom_neighbor_arr[:, atom_index] if i is not None]
-            #     a_x = self.atoms[a0]["x"][neighbor_idxs]
-            #     a_y = self.atoms[a0]["y"][neighbor_idxs]
-            #     plt.scatter(a_y, a_x, alpha = 0.5)
-            #     plt.scatter(atoms_arr[atom_index,1], atoms_arr[atom_index,0], c = 'red')
-            #     plt.gca().invert_yaxis()
             self.atom_neighbor_arr = atom_neighbor_arr
         return self
 
@@ -1867,12 +1785,7 @@ class Lattice(AutoSerialize):
             else:
                 arr = np.asarray(self.get_next_neighborhood_layer(atom_index))
                 arr_present = True
-        # print(arr)
         if arr is None:
-            # # print(atom_indexes_less_none)
-            # # print(atom_indexes)
-            # # print('something wrong here')
-            # arr = np.asarray([0])
             return None
         else:
             return np.asarray(arr, dtype = int)
@@ -1884,11 +1797,9 @@ class Lattice(AutoSerialize):
         for a0 in range(self._num_sites):
             atoms_arr = self.atoms.get_data(a0)
             a_x = atoms_arr[:,0]
-
             atom_neighbor_list = []
             self.added_to_neighbor_list_already = np.zeros(a_x.shape[0])
             self.num_neighbors = np.zeros(a_x.shape[0])
-            # atoms_with_bug = np.zeros(a_x.shape[0], dtype = bool)
             for atom_index in range(a_x.shape[0]):
                 neighbors_search = np.asarray([atom_index])
                 self.added_to_neighbor_list_already[atom_index] = 1
@@ -1898,63 +1809,11 @@ class Lattice(AutoSerialize):
                     neighbors_search = np.concatenate((neighbors_search, neighbors_search_out))
                     if neighbors_search_out.size == 0:
                         break
-                        # atoms_with_bug[atom_index] = True
                 atom_neighbor_list.append(neighbors_search)
                 self.num_neighbors[atom_index] = np.sum(self.added_to_neighbor_list_already) - 1 # minus one because the central atom is not neighbor
                 self.added_to_neighbor_list_already = np.zeros(a_x.shape[0])
         self.atom_neighbor_layer_arr = atom_neighbor_list
-
-        # atom_index = 110 #for test
-        # print(atom_neighbor_arr)
-        # a_x = self.atoms[a0]["x"][atom_neighbor_arr[:,atom_index]]
-        # a_y = self.atoms[a0]["y"][atom_neighbor_arr[:,atom_index]]
-        # plt.figure()
-        # atoms_arr = self.atoms.get_data(0)
-        # a_x = atoms_arr[:,0]
-        # for atom_index in np.arange(0, a_x.shape[0])[atoms_with_bug]:
-        #     # atom_index = 300
-
-        #     # neighbor_idxs = [i for i in self.atom_neighbor_layer_arr[:, atom_index] if i is not None]
-        #     a_x = self.atoms[a0]["x"][atom_neighbor_list[atom_index]]
-        #     a_y = self.atoms[a0]["y"][atom_neighbor_list[atom_index]]
-        #     # print(atom_neighbor_list[atom_index])
-        #     plt.scatter(a_y, a_x, alpha = 0.5)
-        #     plt.scatter(atoms_arr[atom_index,1], atoms_arr[atom_index,0], alpha = 0.5, c = 'red')
-        #     plt.gca().invert_yaxis()
-        #     plt.imshow(self.image.array, cmap = 'gray')
-        # # atoms_arr = self.atoms.get_data(0)
-
-
-        # plt.figure()
-        # a_x = atoms_arr[:,0]
-        # for atom_index in np.arange(0, a_x.shape[0])[atoms_with_bug]:
-        #     # atom_index = 300
-        #     neighbor_arr = np.asarray([i for i in self.atom_neighbor_arr[:, atom_index] if i is not None], dtype = int)
-        #     # neighbor_idxs = [i for i in self.atom_neighbor_layer_arr[:, atom_index] if i is not None]
-        #     a_x = self.atoms[a0]["x"][neighbor_arr]
-        #     a_y = self.atoms[a0]["y"][neighbor_arr]
-        #     # print(atom_neighbor_list[atom_index])
-        #     plt.scatter(a_y, a_x, alpha = 0.5)
-        #     plt.scatter(atoms_arr[atom_index,1], atoms_arr[atom_index,0], alpha = 0.5, c = 'red')
-        #     plt.gca().invert_yaxis()
-        #     plt.imshow(self.image.array, cmap = 'gray')
-        # plt.figure()
-        # for atom_index in np.arange(100,250):
-        #     # atom_index = 300
-        #     atoms_arr = self.atoms.get_data(0)
-
-        #     # neighbor_idxs = [i for i in self.atom_neighbor_layer_arr[:, atom_index] if i is not None]
-        #     a_x = self.atoms[a0]["x"][atom_neighbor_list[atom_index]]
-        #     a_y = self.atoms[a0]["y"][atom_neighbor_list[atom_index]]
-        #     print(atom_neighbor_list[atom_index])
-        #     plt.scatter(a_y, a_x, alpha = 0.5)
-        #     plt.scatter(atoms_arr[atom_index,1], atoms_arr[atom_index,0], c = 'red')
-        #     plt.gca().invert_yaxis()
-        #     plt.imshow(self.image.array)
         return self
-
-
-
 
     def intensity_neighborhood(
         self,
@@ -1962,311 +1821,20 @@ class Lattice(AutoSerialize):
         return_delta = False,
     ):
         self.neighborhood(neighborhood_units = neighborhood_units)
-        # print(self.atom_neighbor_layer_arr[:20])
-
         for a0 in range(self._num_sites):
-            atoms_arr = self.atoms.get_data(a0)
-            # a_x = atoms_arr[:,0]
-            # a_y = atoms_arr[:,1]
-            # idx_x = self.atoms_dislocation.fields.index("x")
-            # idx_y = self.atoms_dislocation.fields.index("y")
-            # idx_amp = self.atoms_dislocation.fields.index("int_peak")
-
             a_x = self.atoms[0]["x"]
             a_y = self.atoms[0]["y"]
             a_intensity = self.atoms[0]["int_peak"]
             delta_intensity = np.zeros([a_x.shape[0]])
-
-
-            # a_intensity = atoms_arr[:,-1]
-            # print(a_intensity[:50])
             for atom_index in range(len(self.atom_neighbor_layer_arr)):
-                # if atom_index <10:
-                    # print(self.atom_neighbor_layer_arr[atom_index])
-                # if self.has_six_neighbors_arr[atom_index]:
                 neighbor_intensities = a_intensity[self.atom_neighbor_layer_arr[atom_index][1:]] # 1: excludes the first one, which is itself
                 median_intensity = np.median(neighbor_intensities)
                 delta_intensity[atom_index] = a_intensity[atom_index] - median_intensity
-                # else:
-                    # delta_intensity[atom_index] = 1
         self.delta_intensities = delta_intensity
         if return_delta:
             return delta_intensity, self.num_neighbors
         else:
             return self
-
-
-
-
-
-
-        # for a0 in range(self._num_sites):
-        #     atoms_arr = self.atoms.get_data(a0)
-        #     a_x = atoms_arr[:,0]
-        #     a_y = atoms_arr[:,1]
-        #     pm_arr = np.array([1,-1])
-
-        #     atom_neighbor_arr = np.empty((6, a_x.shape[0]), dtype=object)
-        #     for atom_index in range(a_x.shape[0]):
-        #         neighbors_found = np.array([atom_index])
-        #         neighbor_idxs = [i for i in atom_neighbor_arr[:, atom_index] if i is not None]
-        #         for neighborhood_index in range(neighborhood_units):
-        #             # if neighborhood_index < neighborhood_units - 1:
-        #             #     break
-        #             neighbors_found = np.concatenate([atom_index, neighbor_idxs])
-        #             for atom_neighbor in neighbor_idxs:
-
-        #     for atom_index in range(a_x.shape[0]):
-
-            
-
-
-
-    # def histogram_intensity(
-    #     self,
-    # ):
-    #     for a0 in range(self._num_sites):
-    #         atoms_arr = self.atoms.get_data(a0)
-
-
-
-
-
-
-
-
-
-    # def merge_atoms(
-    #     self,
-    # ):
-    #     ad_arr = None
-    #     for a0 in range(self._num_sites):
-    #         if hasattr(self, "atoms_dislocation"):
-    #             if self.check_for_dislocations is True:
-    #                 ad_arr = self.atoms_dislocation.get_data(a0)
-    #         if hasattr(self, "atoms"):
-    #             if self.check_for_dislocations is True:
-    #                 atom_arr = self.atoms_dislocation.get_data(a0)
-    #         merged_arr = np.append((atom_arr, ad_arr), axis = 0)
-
-
-
-
-
-        # atoms_found_this_iteration = np.zeros(len(maxima_candidates))
-        # atoms_found_this_for_loop_iteration = np.zeros(len(maxima_candidates))
-        # atoms_found_prev_iteration = np.zeros(len(maxima_candidates))
-        # atoms_found_prev_iteration[origin_candidate_index] = 1
-        # pm_u = True
-        # pm_v = False
-        # found_atoms_in_prev_iteration = True
-        # iteration_while = 0
-        # while found_atoms_in_prev_iteration is True:
-        #     for atom_index in range(len(maxima_candidates)):
-        #         if atoms_found_prev_iteration[atom_index] > 0:
-        #             for pm in pm_arr:
-        #                 for lat_vec in uv_arr:
-        #                     position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
-        #                     position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
-        #                     radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
-        #                     radial_dist[atom_index] = uv_norm * (tolerance_uv - 1) * 2
-        #                     if (radial_dist < uv_norm * (tolerance_uv - 1)).any():
-        #                         min_val = radial_dist.min() # checking if there are multiple equal minima
-        #                         min_indices = np.where(radial_dist == min_val)[0]
-        #                         if min_indices.size > 1:
-        #                             print("Multiple equal minima at:", min_indices)
-        #                         min_indices = (radial_dist < uv_norm * tolerance_uv) & (radial_dist > uv_norm / tolerance_uv) # checking if there are multiple minima in range
-        #                         # if min_indices.size > 1:
-        #                             # print("Multiple minima in range at:", min_indices)
-                                
-        #                         successful_candidate_index = np.argmin(radial_dist)
-        #                         if unique_ids[1, successful_candidate_index] == 0:
-        #                             atoms_found_this_iteration[successful_candidate_index] += 1
-        #                             atoms_found_this_for_loop_iteration[successful_candidate_index] += 1
-
-        #                             if unique_ids[1, successful_candidate_index] == 0:
-        #                                 unique_ids[1, successful_candidate_index] = 1
-        #                                 unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + int(pm_u)
-        #                                 unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + int(pm_v)
-        #                                 unique_ids[4, successful_candidate_index] = 0
-        #                     pm_u = ~pm_u
-        #                     pm_v = ~pm_v
-        #         # check if any atom was somehow still found twice:
-        #         assert np.max(atoms_found_this_for_loop_iteration) < 2
-        #         # check if any found atoms have the same uv index
-        #         uv_pairs = unique_ids[2:5,:].T
-        #         unique_pairs, inverse, counts = np.unique(uv_pairs, axis=0, return_inverse=True, return_counts=True)
-        #         duplicate_groups = [np.where(inverse == k)[0] for k, c in enumerate(counts) if c > 1]
-        #         mask_atoms_found = atoms_found_this_for_loop_iteration.astype(bool)
-        #         print(len(duplicate_groups))
-        #         print(duplicate_groups)
-        #         if len(duplicate_groups) != 0:
-        #             for duplicate_group in duplicate_groups:
-        #                 duplicate_group = np.asarray(duplicate_group)
-        #                 duplicate_atoms_index_found_previous_iterations = duplicate_group[~mask_atoms_found[duplicate_group]]
-        #                 if duplicate_atoms_index_found_previous_iterations.size > 1:
-        #                     if origin_candidate_index not in duplicate_group:
-        #                         raise ValueError("The duplicate atoms finding code is somehow bugged")
-        #                     else:
-        #                         kept_index = origin_candidate_index
-        #                 elif duplicate_atoms_index_found_previous_iterations.size == 1:
-        #                     kept_index = duplicate_atoms_index_found_previous_iterations
-        #                 else:
-        #                     kept_index = duplicate_group[mask_atoms_found[duplicate_group]][0]
-        #                 wipe_indicies = duplicate_group[duplicate_group != kept_index]
-        #                 unique_ids[1:4,wipe_indicies] *= 0
-        #         atoms_found_this_for_loop_iteration = np.zeros(len(maxima_candidates))
-        #     if np.sum(atoms_found_this_iteration) == 0:
-        #         found_atoms_in_prev_iteration = False
-        #         print('stopping search')
-
-
-        # atoms_found_this_iteration = np.zeros(len(maxima_candidates))
-        # for atom_index in range(len(maxima_candidates)):
-        #     if unique_ids[1,atom_index] == 1:
-        #         for pm_u in pm_arr:
-        #             for pm_v in pm_arr:
-        #                 if np.abs(pm_u + pm_v) == 1:
-        #                     for lat_vec in uv_arr:
-        #                         position_x = pm_u * lat_vec[0,0] + pm_v * lat_vec[1,0]
-        #                         position_y = pm_u * lat_vec[0,1] + pm_v * lat_vec[1,1]
-        #                         radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
-        #                         if radial_dist.any < uv_norm * (tolerance_uv - 1):
-        #                             min_val = radial_dist.min() # checking if there are multiple equal minima
-        #                             min_indices = np.where(radial_dist == min_val)[0]
-        #                             if min_indices.size > 1:
-        #                                 print("Multiple equal minima at:", min_indices)
-                                    
-        #                             min_indices = (radial_dist < uv_norm * tolerance_uv) & (radial_dist > uv_norm / tolerance_uv) # checking if there are multiple minima in range
-        #                             if min_indices.size > 1:
-        #                                 print("Multiple minima in range at:", min_indices)
-                                    
-        #                             successful_candidate_index = np.argmin(radial_dist)
-        #                             atoms_found_this_iteration[successful_candidate_index] += 1
-        #                             if unique_ids[1, successful_candidate_index] == 0:
-        #                                 unique_ids[1, successful_candidate_index] = 1
-        #                                 unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm_u
-        #                                 unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm_v
-
-
-
-        # working version 20250930_1553:
-
-        # radial_dist = ((maxima_candidates_x - origin[0])**2 + (maxima_candidates_y - origin[1])**2)**(0.5)
-        # origin_candidate_index = np.argmin(radial_dist) # use the first minima, if there are multiple
-        # unique_ids[1,origin_candidate_index] = 1
-        # unique_ids[4,origin_candidate_index] = 0
-
-        # atoms_found_this_iteration = np.zeros(len(maxima_candidates))
-        # # atoms_found_this_for_loop_iteration = np.zeros(len(maxima_candidates))
-        # atoms_found_prev_iteration = np.zeros(len(maxima_candidates))
-        # atoms_found_previous_iterations = np.zeros(len(maxima_candidates), dtype = bool)
-        # atoms_found_prev_iteration[origin_candidate_index] = 1
-        # found_atoms_in_prev_iteration = True
-        # iteration_while = 0
-        # while found_atoms_in_prev_iteration is True:
-        #     for atom_index in range(len(maxima_candidates)):
-        #         if atoms_found_prev_iteration[atom_index] > 0:
-        #             # for pm in pm_arr:
-        #             #     for lat_vec in uv_arr:
-        #             #         position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
-        #             #         position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
-        #             #         radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
-        #             #         radial_dist[atom_index] = uv_norm * (tolerance_uv - 1) * 2
-        #             #         if (radial_dist < uv_norm * (tolerance_uv - 1)).any():
-        #             #             min_val = radial_dist.min() # checking if there are multiple equal minima
-        #             #             min_indices = np.where(radial_dist == min_val)[0]
-        #             #             if min_indices.size > 1:
-        #             #                 print("Multiple equal minima at:", min_indices)
-        #             #             min_indices = (radial_dist < uv_norm * tolerance_uv) & (radial_dist > uv_norm / tolerance_uv) # checking if there are multiple minima in range
-        #             #             # if min_indices.size > 1:
-        #             #                 # print("Multiple minima in range at:", min_indices)
-                                
-        #             #             successful_candidate_index = np.argmin(radial_dist)
-        #             #             if unique_ids[1, successful_candidate_index] == 0:
-        #             #                 atoms_found_this_iteration[successful_candidate_index] += 1
-        #             #                 unique_ids[1, successful_candidate_index] = 1
-        #             #                 unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + int(pm_u)
-        #             #                 unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + int(pm_v)
-        #             #                 unique_ids[4, successful_candidate_index] = 0
-        #             #         pm_u = ~pm_u
-        #             #         pm_v = ~pm_v
-        #         # if unique_ids[1,atom_index] == 1:
-        #             for pm in pm_arr:
-        #                 for uv_index, lat_vec in enumerate(uv_arr):
-        #                     position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
-        #                     position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
-        #                     radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
-        #                     radial_dist[atom_index] = uv_norm * (tolerance_uv - 1) * 2
-        #                     if (radial_dist < uv_norm * (tolerance_uv - 1)).any():
-        #                         min_val = radial_dist.min() # checking if there are multiple equal minima
-        #                         min_indices = np.where(radial_dist == min_val)[0]
-        #                         if min_indices.size > 1:
-        #                             print("Multiple equal minima at:", min_indices)
-        #                         min_indices = (radial_dist < uv_norm * tolerance_uv) & (radial_dist > uv_norm / tolerance_uv) # checking if there are multiple minima in range
-        #                         # if min_indices.size > 1:
-        #                             # print("Multiple minima in range at:", min_indices)
-                                
-        #                         successful_candidate_index = np.argmin(radial_dist)
-        #                         if unique_ids[1, successful_candidate_index] == 0:
-        #                             atoms_found_this_iteration[successful_candidate_index] += 1
-        #                             unique_ids[1, successful_candidate_index] = 1
-        #                             unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uv_index == 0)
-        #                             unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uv_index == 1)
-        #                             unique_ids[4, successful_candidate_index] = 0
-        #                     # pm_u = not pm_u
-        #                     # pm_v = not pm_v
-        #                     # print("pm u",pm_u)
-        #                     # print("pm v",pm_v)
-        #     # check if any atom was somehow still found twice:
-        #     assert np.max(atoms_found_this_iteration) < 2
-        #     # check if any found atoms have the same uv index
-        #     uv_pairs = unique_ids[1:5,:].T
-        #     # print(atoms_found_this_iteration)
-        #     unique_pairs, inverse, counts = np.unique(uv_pairs, axis=0, return_inverse=True, return_counts=True)
-        #     duplicate_groups = [np.where(inverse == k)[0] for k, c in enumerate(counts) if c > 1]
-        #     mask_atoms_found = atoms_found_this_iteration.astype(bool)
-        #     # print(duplicate_groups)
-        #     if len(duplicate_groups) != 0:
-        #         for duplicate_group in duplicate_groups:
-        #             # print(uv_pairs[duplicate_group])
-        #             duplicate_group = np.asarray(duplicate_group)
-        #             duplicate_atoms_index_found_previous_iterations = duplicate_group[atoms_found_previous_iterations[duplicate_group]]
-        #             if duplicate_atoms_index_found_previous_iterations.size > 1:
-        #                 if origin_candidate_index not in duplicate_group:
-        #                     raise ValueError("The duplicate atoms finding code is somehow bugged")
-        #                 else:
-        #                     kept_index = origin_candidate_index
-        #             elif duplicate_atoms_index_found_previous_iterations.size == 1:
-        #                 kept_index = duplicate_atoms_index_found_previous_iterations
-        #             else:
-        #                 kept_index = duplicate_group[mask_atoms_found[duplicate_group]][0]
-        #             wipe_indicies = duplicate_group[duplicate_group != kept_index]
-        #             # print(duplicate_group)
-        #             # print(wipe_indicies)
-        #             # print(kept_index)
-        #             unique_ids[1, wipe_indicies] = 2 # signals to not accept for this maxima anymore
-        #             unique_ids[2:4,wipe_indicies] = 0
-        #             unique_ids[4,wipe_indicies] = -1*(wipe_indicies+1)
-        #             atoms_found_previous_iterations[wipe_indicies] = False
-        #             mask_atoms_found[wipe_indicies] = False
-        #             atoms_found_this_iteration[wipe_indicies] = 0
-        #     if np.sum(atoms_found_this_iteration) == 0:
-        #         found_atoms_in_prev_iteration = False
-        #         print('stopping search')
-
-        #     # print('running another iteration of while loop', iteration_while)
-        #     # print('sum found this iter',np.sum(atoms_found_this_iteration))
-
-        #     atoms_found_previous_iterations |= atoms_found_this_iteration.astype(bool)
-
-        #     atoms_found_prev_iteration = atoms_found_this_iteration.copy()
-        #     atoms_found_this_iteration = np.zeros(len(maxima_candidates))
-        #     iteration_while += 1
-
-
-        # maxima_accepted_x = maxima_candidates_x[unique_ids[1,:] == 1]
-        # maxima_accepted_y = maxima_candidates_y[unique_ids[1,:] == 1]
 
     def auto_peak_finder(
         self,
