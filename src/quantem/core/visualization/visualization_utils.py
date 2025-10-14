@@ -13,6 +13,7 @@ from numpy.typing import NDArray
 from scipy.stats import binned_statistic_2d
 
 from quantem.core.visualization.custom_normalizations import CustomNormalization
+import matplotlib.font_manager as fm
 
 
 def array_to_rgba(
@@ -150,6 +151,7 @@ class ScalebarConfig:
     pad_px: float = 0.5
     color: str = "white"
     loc: Union[str, int] = "lower right"
+    font_size: float = 2
 
 
 def _resolve_scalebar(cfg: Any) -> Optional[ScalebarConfig]:
@@ -227,6 +229,7 @@ def add_scalebar_to_ax(
     pad_px: float,
     color: str,
     loc: Union[str, int],
+    font_size: float,
 ) -> None:
     """Add a scale bar to a matplotlib axis.
 
@@ -267,6 +270,7 @@ def add_scalebar_to_ax(
         loc_strings = {v: k for k, v in loc_codes.items()}
         loc = loc_strings[loc]
 
+    fontprops = fm.FontProperties(size=font_size, family='monospace')
     bar = AnchoredSizeBar(
         ax.transData,
         length_px,
@@ -277,6 +281,7 @@ def add_scalebar_to_ax(
         frameon=False,
         label_top=loc[:3] == "low",
         size_vertical=int(width_px),  # Convert to int as required by AnchoredSizeBar
+        fontproperties=fontprops,
     )
     ax.add_artist(bar)
 

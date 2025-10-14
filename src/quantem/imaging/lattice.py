@@ -659,6 +659,8 @@ class Lattice(AutoSerialize):
         idx_amp = self.atoms.fields.index("int_peak")
         idx_sigma = self.atoms.fields.index("sigma")
         idx_bg = self.atoms.fields.index("int_bg")
+        # i_arr = np.arange(205,209)
+        # i_arr = np.arange(3380,3385)
 
         for s in range(self._num_sites):
             row = self.atoms.get_data(s)
@@ -676,7 +678,7 @@ class Lattice(AutoSerialize):
                 ix0, iy0 = int(np.floor(x0)), int(np.floor(y0))
                 i0, i1 = max(0, ix0 - R), min(H - 1, ix0 + R)
                 j0, j1 = max(0, iy0 - R), min(W - 1, iy0 + R)
-                if i1 <= i0 or j1 <= j0:
+                if i1 <= i0 or j1 <= j0: # this doesn't do anything
                     continue
 
                 patch = im[i0 : i1 + 1, j0 : j1 + 1]
@@ -688,8 +690,8 @@ class Lattice(AutoSerialize):
                 JJ = np.broadcast_to(jj, patch.shape)
 
                 r2 = (II - x0) ** 2 + (JJ - y0) ** 2
-                mask = r2 <= (r_fit * r_fit)
-                if not np.any(mask):
+                mask = r2 <= (r_fit * r_fit) # why not just square this with **? Or square root instead of r2
+                if not np.any(mask): # this doesn't do anything...
                     continue
 
                 vals = patch[mask].astype(float).ravel()
@@ -742,6 +744,27 @@ class Lattice(AutoSerialize):
                 updated[i, idx_amp] = amp
                 updated[i, idx_sigma] = sig
                 updated[i, idx_bg] = bg
+                # if i in i_arr:
+                #     # print(r_fit)
+                #     plt.figure(figsize = (10,3))
+                #     # plt.subplot(121)
+                #     plt.imshow(patch)
+                #     plt.colorbar()
+                #     plt.title('V site')
+                #     # plt.title('W site')
+                #     # plt.title('amp: '+ str(np.round(amp,2)) + ', max: '+str(np.round(np.max(patch),2)))
+                #     plt.axis('off')
+                #     plt.tight_layout()
+                #     print('Fit amplitude:', np.round(amp, 2))
+                #     print('Raw max amplitude:', np.round(np.max(patch), 2))
+                #     patch[mask]=0
+                #     print('Background median:', np.round(np.median(patch[patch>0]), 2))
+                #     # plt.subplot(122)
+                #     # plt.imshow(patch)
+                #     # # plt.title('bg med: '+str(np.round(np.median(patch[patch>0]),2)))
+                #     # plt.title('amp: '+ str(np.round(amp,2)) + ', max: '+str(np.round(np.max(patch),2)))
+                #     # plt.subplot(133)
+                #     # plt.imshow(mask)
 
             self.atoms.set_data(updated, s)
 
@@ -966,6 +989,8 @@ class Lattice(AutoSerialize):
             a_transpose = a_matrix.T
             u = np.array([a_transpose[0,0], a_transpose[0,1]])
             v = np.array([a_transpose[1,0], a_transpose[1,1]])
+            self.u = u
+            self.v = v
 
         if positions_frac is None:
             positions_frac = np.atleast_2d(np.array((0,0))),
@@ -1365,6 +1390,9 @@ class Lattice(AutoSerialize):
             a_transpose = a_matrix.T
             u = np.array([a_transpose[0,0], a_transpose[0,1]])
             v = np.array([a_transpose[1,0], a_transpose[1,1]])
+            self.u = u
+            self.v = v
+
 
         if positions_frac is None:
             positions_frac = np.atleast_2d(np.array((0,0))),
