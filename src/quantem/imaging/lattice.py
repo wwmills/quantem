@@ -9,7 +9,7 @@ from quantem.core.datastructures.vector import Vector
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
-
+from scipy.ndimage import map_coordinates
 
 from quantem.core import config
 
@@ -1283,11 +1283,13 @@ class Lattice(AutoSerialize):
             self.atoms.set_data(arr, 0)
 
         if merge_dislocation and check_for_dislocations:
-            maxima_merge_x = np.concatenate(maxima_accepted_x, maxima_dislocation_x)
-            maxima_merge_y = np.concatenate(maxima_accepted_y, maxima_dislocation_y)
-            maxima_merge_u = np.concatenate(maxima_accepted_u, maxima_dislocation_u)
-            maxima_merge_v = np.concatenate(maxima_accepted_v, maxima_dislocation_v)
-            maxima_merge_intensity = np.concatenate(maxima_accepted_intensity, maxima_dislocation_intensity)
+            maxima_merge_x = maxima_candidates_x[np.isin(unique_ids[1, :], [1, 3])]
+            maxima_merge_y = maxima_candidates_y[np.isin(unique_ids[1, :], [1, 3])]
+
+            maxima_merge_u = unique_ids[2, np.isin(unique_ids[1, :], [1, 3])]
+            maxima_merge_v = unique_ids[3, np.isin(unique_ids[1, :], [1, 3])]
+
+            maxima_merge_intensity = maxima_candidates_intensity[np.isin(unique_ids[1, :], [1, 3])]
             arr = np.vstack(
                 (maxima_merge_x, maxima_merge_y, maxima_merge_u, maxima_merge_v, maxima_merge_intensity)
             ).T
@@ -1395,7 +1397,9 @@ class Lattice(AutoSerialize):
 
 
         if positions_frac is None:
-            positions_frac = np.atleast_2d(np.array((0,0))),
+            positions_frac = np.atleast_2d(np.array((1,1)))
+        if (positions_frac[0] == np.array([0,0])).all():
+            positions_frac[0] = np.atleast_2d(np.array((1,1)))
 
         self._positions_frac = np.atleast_2d(np.array(positions_frac, dtype=float))
         self._num_sites = self._positions_frac.shape[0]
@@ -1404,6 +1408,519 @@ class Lattice(AutoSerialize):
             if numbers is None
             else np.atleast_1d(np.array(numbers, dtype=int))
         )
+        if w is None:
+            if np.abs(np.rad2deg(np.arccos(np.dot(u, v)/(np.linalg.norm(u) * np.linalg.norm(v))))) > np.deg2rad(90):
+                w = np.asarray(u)+np.asarray(v)
+                w_sign = 1
+            else:
+                w = np.asarray(u)-np.asarray(v)
+                w_sign = -1
+        else:
+            w_sign = 1
+
+
+
+
+
+        self._lat = np.vstack(
+            (
+                np.array(origin),
+                np.array(u),
+                np.array(v),
+            )
+        )
+
+        im = np.asarray(self._image.array, dtype=float)
+        r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+        A = np.column_stack((u, v))
+
+        def _auto_radius_px() -> float:
+            S = self._positions_frac
+            if S.shape[0] >= 2:
+                d = S[:, None, :] - S[None, :, :]
+                d = d - np.round(d)
+                same = (np.abs(d[..., 0]) < 1e-12) & (np.abs(d[..., 1]) < 1e-12)
+                dpix = d @ A.T
+                dist = np.linalg.norm(dpix, axis=2)
+                dist[same] = np.inf
+                nn = float(np.min(dist))
+            else:
+                nn = float(np.min(np.linalg.norm(np.stack((u, v, u + v, u - v)), axis=1)))
+            if not np.isfinite(nn) or nn <= 0:
+                nn = max(1.0, 0.25 * (np.linalg.norm(u) + np.linalg.norm(v)))
+            return 0.5 * nn
+
+        r_px = float(intensity_radius) if intensity_radius is not None else _auto_radius_px()
+        rin, rout = (1.5 * r_px, 3.0 * r_px) if annulus_radii is None else annulus_radii
+        R_disk = int(np.ceil(r_px))
+        R_ring = int(np.ceil(rout))
+
+        def mean_disk(x: float, y: float) -> float:
+            ix0, iy0 = int(np.floor(x)), int(np.floor(y))
+            i0, i1 = max(0, ix0 - R_disk), min(H - 1, ix0 + R_disk)
+            j0, j1 = max(0, iy0 - R_disk), min(W - 1, iy0 + R_disk)
+            ii = np.arange(i0, i1 + 1)[:, None]
+            jj = np.arange(j0, j1 + 1)[None, :]
+            dx, dy = ii - x, jj - y
+            mask_circle = (dx * dx + dy * dy) <= (r_px * r_px)
+            vals = im[i0 : i1 + 1, j0 : j1 + 1][mask_circle]
+            if vals.size == 0:
+                return float(im[np.clip(round(x), 0, H - 1), np.clip(round(y), 0, W - 1)])
+            return float(vals.mean())
+
+        def mean_std_annulus(x: float, y: float) -> tuple[float, float]:
+            ix0, iy0 = int(np.floor(x)), int(np.floor(y))
+            i0, i1 = max(0, ix0 - R_ring), min(H - 1, ix0 + R_ring)
+            j0, j1 = max(0, iy0 - R_ring), min(W - 1, iy0 + R_ring)
+            ii = np.arange(i0, i1 + 1)[:, None]
+            jj = np.arange(j0, j1 + 1)[None, :]
+            dx, dy = ii - x, jj - y
+            r2 = dx * dx + dy * dy
+            mask_ring = (r2 >= rin * rin) & (r2 <= rout * rout)
+            vals = im[i0 : i1 + 1, j0 : j1 + 1][mask_ring]
+            if vals.size == 0:
+                val = float(im[np.clip(round(x), 0, H - 1), np.clip(round(y), 0, W - 1)])
+                return val, 0.0
+            return float(vals.mean()), float(vals.std(ddof=0))
+
+        # mask of where in real space maxima can occur
+        H, W = self._image.shape  # x=rows, y=cols
+        edge_thresh = float(edge_min_dist_px) if edge_min_dist_px is not None else 0.0
+
+        DT = None
+        if input_mask is not None:
+            m = np.asarray(input_mask).astype(bool)
+            if m.shape != (H, W):
+                raise ValueError(f"mask shape {m.shape} must match image shape {(H, W)}")
+            try:
+                from scipy.ndimage import distance_transform_edt
+
+                DT = distance_transform_edt(m)
+            except Exception:
+                DT = None
+
+        # find the maxima closest to the origin:
+        maxima_candidates_x = maxima_candidates[:]['x']
+        maxima_candidates_y = maxima_candidates[:]['y']
+
+        pm_arr = np.array([-1,0,1])
+        u_norm = np.linalg.norm(u)
+        v_norm = np.linalg.norm(v)
+        w_norm = np.linalg.norm(w)
+        uvw_arr = np.array([np.asarray(u),np.asarray(v),np.asarray(w)])
+        uv_arr = np.array([np.asarray(u), np.asarray(v)])
+        uvw_norm = 0.5 * (u_norm + v_norm + w_norm)
+        self.uv_norm = uvw_norm
+        self.uv_arr = uvw_arr
+        self.tolerance_uv = tolerance_uvw
+        x = maxima_candidates_x
+        y = maxima_candidates_y
+
+        in_bounds = (x >= 0.0) & (x <= H - 1) & (y >= 0.0) & (y <= W - 1)
+        border_ok = (
+            (x - edge_thresh >= 0.0)
+            & (x + edge_thresh <= H - 1)
+            & (y - edge_thresh >= 0.0)
+            & (y + edge_thresh <= W - 1)
+        )
+        if input_mask is not None:
+            if DT is not None:
+                ii = np.clip(np.round(x).astype(int), 0, H - 1)
+                jj = np.clip(np.round(y).astype(int), 0, W - 1)
+                mask_ok = DT[ii, jj] >= edge_thresh
+            else:
+                m = np.asarray(input_mask).astype(bool)
+                mask_ok = m[
+                    np.clip(np.round(x).astype(int), 0, H - 1),
+                    np.clip(np.round(y).astype(int), 0, W - 1),
+                ]
+        else:
+            mask_ok = np.ones_like(in_bounds, dtype=bool)
+
+        int_center = np.empty(x.shape[0], dtype=float)
+        for i in range(x.shape[0]):
+            int_center[i] = mean_disk(x[i], y[i])
+
+        keep = in_bounds & border_ok & mask_ok
+        if intensity_min is not None:
+            keep &= int_center >= float(intensity_min)
+        if contrast_min is not None:
+            bg_mean = np.empty(x.shape[0], dtype=float)
+            for i in range(x.shape[0]):
+                bg_mean[i], _ = mean_std_annulus(x[i], y[i])
+            keep &= (int_center - bg_mean) >= float(contrast_min)
+
+        if np.any(keep):
+            maxima_candidates = maxima_candidates[keep]
+        else:
+            raise ValueError("Zero maxima candidates kept")
+
+        # find the maxima closest to the origin:
+        maxima_candidates_x = maxima_candidates[:]['x']
+        maxima_candidates_y = maxima_candidates[:]['y']
+        maxima_candidates_intensity = maxima_candidates[:]['intensity']
+
+        # the unique ids array is an array of the original index, candidacy, a (of a * u), and b (of b * v), and c (of c * w)
+        unique_ids = np.zeros([6, len(maxima_candidates)])
+        unique_ids[0,:] = np.arange(0,len(maxima_candidates))
+        unique_ids[4,:] = -1*np.arange(1,1+len(maxima_candidates))
+        unique_ids[5,:] -= 1
+
+        if plot_atoms:
+            fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
+            if ax.images:
+                ax.images[-1].set_zorder(0)
+            xs = maxima_candidates_x
+            ys = maxima_candidates_y
+            rgb = site_colors(int(self._numbers[0]))
+            ax.scatter(
+                ys,
+                xs,
+                s=18,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+                edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+                linewidths=0.75,
+                marker="o",
+                zorder=25,
+            )
+            ax.set_xlim(0, W)
+            ax.set_ylim(H, 0)
+
+        radial_dist = ((maxima_candidates_x - origin[0])**2 + (maxima_candidates_y - origin[1])**2)**(0.5)
+        origin_candidate_index = np.argmin(radial_dist) # use the first minima, if there are multiple
+        unique_ids[1,origin_candidate_index] = 1
+        unique_ids[4,origin_candidate_index] = 0
+
+        atoms_found_this_iteration = np.zeros(len(maxima_candidates))
+        atoms_found_prev_iteration = np.zeros(len(maxima_candidates))
+        atoms_found_previous_iterations = np.zeros(len(maxima_candidates), dtype = bool)
+        atoms_found_prev_iteration[origin_candidate_index] = 1
+        found_atoms_in_prev_iteration = True
+        iteration_while = 0
+        def check_dislocations():
+            if check_for_dislocations:
+                for atom_index in range(len(maxima_candidates)):
+                    if unique_ids[1,atom_index] == 1:
+                        for pm in pm_arr:
+                            for uvw_index, lat_vec in enumerate(uvw_arr):
+                                position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
+                                position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
+                                radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+                                radial_dist[atom_index] = uvw_norm * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
+                                if (radial_dist < (uvw_norm * (tolerance_uvw - 1))).any():
+                                    successful_candidate_index = np.argmin(radial_dist)
+                                    if unique_ids[1, successful_candidate_index] == 2:
+                                        atoms_found_this_iteration[successful_candidate_index] += 1
+                                        unique_ids[1, successful_candidate_index] = 3 # for being found in dislocation search
+                                        unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uvw_index == 0) + pm*int(uvw_index == 2)
+                                        unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uvw_index == 1) - w_sign * pm*int(uvw_index == 2)
+                                        unique_ids[4, successful_candidate_index] = 0
+                maxima_dislocation_x = maxima_candidates_x[unique_ids[1,:] == 3]
+                maxima_dislocation_y = maxima_candidates_y[unique_ids[1,:] == 3]
+                maxima_dislocation_u = unique_ids[2,unique_ids[1,:] == 3]
+                maxima_dislocation_v = unique_ids[3,unique_ids[1,:] == 3]
+                maxima_dislocation_intensity = maxima_candidates_intensity[unique_ids[1,:] == 3]
+                arr = np.vstack(
+                    (maxima_dislocation_x, maxima_dislocation_y, maxima_dislocation_u, maxima_dislocation_v, maxima_dislocation_intensity)
+                ).T
+                return arr
+
+        uvw_arr_save = uvw_arr.copy()
+        for a0 in range(self._num_sites):
+            unit_shifts = np.array([self._positions_frac[a0, 0], self._positions_frac[a0, 1]])
+            found_atoms_in_prev_iteration = True
+            while found_atoms_in_prev_iteration is True:
+                for atom_index in range(len(maxima_candidates)):
+                    if not((a0 >0 and unique_ids[5, atom_index] == 0) or a0 == 0):
+                        continue
+                    if atoms_found_prev_iteration[atom_index] > 0:
+                        for pm in pm_arr:
+                            for uvw_index, lat_vec in enumerate(uvw_arr):
+                                position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
+                                position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
+                                radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+                                radial_dist[atom_index] = uvw_norm * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
+                                if (radial_dist < (uvw_norm * (tolerance_uvw - 1))).any():
+                                    successful_candidate_index = np.argmin(radial_dist)
+                                    if unique_ids[1, successful_candidate_index] == 0:
+                                        atoms_found_this_iteration[successful_candidate_index] += 1
+                                        unique_ids[1, successful_candidate_index] = 1
+                                        unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uvw_index == 0)*self._positions_frac[a0, 0] + pm*int(uvw_index == 2)*self._positions_frac[a0, 0]
+                                        unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uvw_index == 1)*self._positions_frac[a0, 1] + w_sign*pm*int(uvw_index == 2)*self._positions_frac[a0, 1]
+                                        unique_ids[4, successful_candidate_index] = 0
+                                        unique_ids[5, successful_candidate_index] = a0
+                # check if any atom was somehow still found twice:
+                assert np.max(atoms_found_this_iteration) < 2
+                # check if any found atoms have the same uv index
+                if check_uv_duplication:
+                    uv_pairs = unique_ids[1:6,:].T
+                    unique_pairs, inverse, counts = np.unique(uv_pairs, axis=0, return_inverse=True, return_counts=True)
+                    duplicate_groups = [np.where(inverse == k)[0] for k, c in enumerate(counts) if c > 1]
+                    mask_atoms_found = atoms_found_this_iteration.astype(bool)
+                    if len(duplicate_groups) != 0:
+                        for duplicate_group in duplicate_groups:
+                            duplicate_group = np.asarray(duplicate_group)
+                            duplicate_atoms_index_found_previous_iterations = duplicate_group[atoms_found_previous_iterations[duplicate_group]]
+                            if duplicate_atoms_index_found_previous_iterations.size > 1:
+                                if origin_candidate_index not in duplicate_group:
+                                    raise ValueError("The duplicate atoms finding code is somehow bugged")
+                                else:
+                                    kept_index = origin_candidate_index
+                            elif duplicate_atoms_index_found_previous_iterations.size == 1:
+                                kept_index = duplicate_atoms_index_found_previous_iterations
+                            else:
+                                kept_index = duplicate_group[mask_atoms_found[duplicate_group]][0]
+                            wipe_indicies = duplicate_group[duplicate_group != kept_index]
+                            unique_ids[1, wipe_indicies] = 2 # this signals to not accept for this maxima anymore (and flags this as a dulpicate)
+                            unique_ids[2:4,wipe_indicies] = 0
+                            unique_ids[5,wipe_indicies] = -1
+                            unique_ids[4,wipe_indicies] = -1*(wipe_indicies+1)
+                            atoms_found_previous_iterations[wipe_indicies] = False
+                            mask_atoms_found[wipe_indicies] = False
+                            atoms_found_this_iteration[wipe_indicies] = 0
+                if np.sum(atoms_found_this_iteration) == 0:
+                    found_atoms_in_prev_iteration = False
+                    print('stopping search')
+                
+
+                atoms_found_previous_iterations |= atoms_found_this_iteration.astype(bool)
+
+                atoms_found_prev_iteration = atoms_found_this_iteration.copy()
+                atoms_found_this_iteration = np.zeros(len(maxima_candidates))
+                iteration_while += 1
+            if a0 == 0:
+                unit_shifts = np.array([self._positions_frac[a0+1, 0], self._positions_frac[a0+1, 1]])
+                atom_arr = check_dislocations()
+
+                self.atoms_dislocation = Vector.from_shape(
+                    shape=(self._num_sites),
+                    fields=("x", "y", "a", "b", "int_peak"),
+                    units=("px", "px", "ind", "ind", "counts"),
+                )
+                self.atoms_dislocation.set_data(atom_arr, 0)
+
+                atoms_found_prev_iteration = atoms_found_previous_iterations.astype(int)
+                positive_vector = unit_shifts.copy()
+                negative_vector = unit_shifts.copy()
+                negative_vector[1] *= -1
+                if np.abs(np.rad2deg(np.arccos(np.dot(positive_vector, negative_vector)/(np.linalg.norm(positive_vector) * np.linalg.norm(negative_vector))))) > np.deg2rad(90):
+                    w_ = np.asarray(positive_vector)+np.asarray(negative_vector)
+                    w_sign = 1
+                else:
+                    w_ = np.asarray(positive_vector)-np.asarray(negative_vector)
+                    w_sign = -1
+                
+                p_v_c = positive_vector @ uv_arr
+                n_v_c = negative_vector @ uv_arr
+                w_v_c = w_ @ uv_arr
+                uvw_arr = np.array([p_v_c, n_v_c, w_v_c])
+
+        maxima_accepted_x = maxima_candidates_x[unique_ids[1,:] == 1]
+        maxima_accepted_y = maxima_candidates_y[unique_ids[1,:] == 1]
+
+        maxima_accepted_u = unique_ids[2, unique_ids[1,:] == 1]
+        maxima_accepted_v = unique_ids[3, unique_ids[1,:] == 1]
+
+        maxima_accepted_intensity = maxima_candidates_intensity[unique_ids[1,:] == 1]
+
+        self.atoms = Vector.from_shape(
+            shape=(self._num_sites),
+            fields=("x", "y", "a", "b", "int_peak"),
+            units=("px", "px", "ind", "ind", "counts"),
+        )
+
+        if not merge_dislocation or not check_for_dislocations:
+            arr = np.vstack(
+                (maxima_accepted_x, maxima_accepted_y, maxima_accepted_u, maxima_accepted_v, maxima_accepted_intensity)
+            ).T
+            self.atoms.set_data(arr, 0)
+
+        if merge_dislocation and check_for_dislocations:
+
+            maxima_merge_x = maxima_candidates_x[np.isin(unique_ids[1, :], [1, 3])]
+            maxima_merge_y = maxima_candidates_y[np.isin(unique_ids[1, :], [1, 3])]
+
+            maxima_merge_u = unique_ids[2, np.isin(unique_ids[1, :], [1, 3])]
+            maxima_merge_v = unique_ids[3, np.isin(unique_ids[1, :], [1, 3])]
+
+            maxima_merge_intensity = maxima_candidates_intensity[np.isin(unique_ids[1, :], [1, 3])]
+            arr = np.vstack(
+                (maxima_merge_x, maxima_merge_y, maxima_merge_u, maxima_merge_v, maxima_merge_intensity)
+            ).T
+            self.atoms.set_data(arr, 0)
+
+
+        if plot_atoms:
+            fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
+            if ax.images:
+                ax.images[-1].set_zorder(0)
+            xs = maxima_accepted_x
+            ys = maxima_accepted_y
+            rgb = site_colors(int(self._numbers[0]))
+            ax.scatter(
+                ys,
+                xs,
+                s=18,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+                edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+                linewidths=0.75,
+                marker="o",
+                zorder=25,
+            )
+            ax.set_xlim(0, W)
+            ax.set_ylim(H, 0)
+
+        return self
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def atoms_first_uvw_(
+        self,
+        origin = None,
+        u = None,
+        v = None,
+        positions_frac = None,
+        tolerance_uvw: float = 1.1,
+        w = None,
+        numbers=None,
+        edge_min_dist_px=None,
+        subpixel: str = "poly",
+        upsample_factor: int = 16,
+        sigma: float = 0,
+        minAbsoluteIntensity: float = 0,
+        minRelativeIntensity: float = 0,
+        relativeToPeak: float = 0,
+        minSpacing: float = 0,
+        edgeBoundary: int = 1,
+        maxNumPeaks: int = 5000,
+        plot_atoms=True,
+        input_mask=None,
+        refine_lattice=True,
+        refine_maxiter: int = 200,
+        intensity_radius = None,
+        intensity_min: float | None = None,
+        contrast_min=None,
+        annulus_radii = None,
+        check_uv_duplication = True,
+        check_for_dislocations = False,
+        merge_dislocation = False,
+        **kwargs,
+    ):
+        self.check_for_dislocations = check_for_dislocations and check_uv_duplication
+        # find all candidates above threshold
+        maxima_candidates = self.get_maxima_2D(
+            self.image.array, 
+            subpixel = subpixel,
+            upsample_factor = upsample_factor,
+            sigma = sigma,
+            minAbsoluteIntensity = minAbsoluteIntensity,
+            minRelativeIntensity = minRelativeIntensity,
+            relativeToPeak = relativeToPeak,
+            minSpacing = minSpacing,
+            edgeBoundary = edgeBoundary,
+            maxNumPeaks = maxNumPeaks,
+            )
+
+        H, W = self._image.shape  # x=rows, y=cols
+
+        if origin is None:
+            max_intensity_index = np.argmax(maxima_candidates[:]['intensity'])
+            origin_x = maxima_candidates[max_intensity_index]['x']
+            origin_y = maxima_candidates[max_intensity_index]['y']
+            origin = np.array([origin_x, origin_y])
+
+        if u is None or v is None:
+            num_peaks_search = 20
+            num_peaks_use = 2
+            center_ignore_buffer = 15
+            minSpacingPeaks = 5
+            uv_result_inv = self.auto_peak_finder(num_peaks_search = num_peaks_search, num_peaks_use = num_peaks_use, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
+
+            g_vector_1_c = np.array([uv_result_inv[0]['x'], uv_result_inv[0]['y']])
+            g_vector_2_c = np.array([uv_result_inv[1]['x'], uv_result_inv[1]['y']])
+            g_vec1 = np.zeros(2)
+            g_vec1[0] = ((g_vector_1_c[0] - (0.5*H))/H)
+            g_vec1[1] = ((g_vector_1_c[1] - (0.5*W))/W)
+            g_vec2 = np.zeros(2)
+            g_vec2[0] = ((g_vector_2_c[0] - (0.5*H))/H)
+            g_vec2[1] = ((g_vector_2_c[1] - (0.5*W))/W)
+            g_matrix = np.array([g_vec1, g_vec2])
+            a_matrix = np.linalg.inv(g_matrix)
+            a_transpose = a_matrix.T
+            u = np.array([a_transpose[0,0], a_transpose[0,1]])
+            v = np.array([a_transpose[1,0], a_transpose[1,1]])
+            self.u = u
+            self.v = v
+
+
+        if positions_frac is None:
+            positions_frac = np.atleast_2d(np.array((0,0))) # 1, 1
+        # if (positions_frac[0] == np.array([0,0])).all():
+            # positions_frac[0] = np.atleast_2d(np.array((1,1)))
+
+        self._positions_frac = np.atleast_2d(np.array(positions_frac, dtype=float))
+        self._num_sites = self._positions_frac.shape[0]
+        if numbers is None:
+            self._numbers = np.arange(1, self._num_sites + 1, dtype=int)
+        else:
+            self._numbers = np.atleast_1d(np.array(numbers, dtype=int))
+
+        print("numbers",self._numbers)
+        print("num sites",self._num_sites)
+        
         if w is None:
             if np.abs(np.rad2deg(np.arccos(np.dot(u, v)/(np.linalg.norm(u) * np.linalg.norm(v))))) > np.deg2rad(90):
                 w = np.asarray(u)+np.asarray(v)
@@ -1495,11 +2012,13 @@ class Lattice(AutoSerialize):
         maxima_candidates_x = maxima_candidates[:]['x']
         maxima_candidates_y = maxima_candidates[:]['y']
 
-        pm_arr = np.array([-1,0,1])
+        pm_arr = np.array([-1,1])
+        # pm_arr = np.array([-1,0,1])
         u_norm = np.linalg.norm(u)
         v_norm = np.linalg.norm(v)
         w_norm = np.linalg.norm(w)
         uvw_arr = np.array([np.asarray(u),np.asarray(v),np.asarray(w)])
+        uv_arr = np.array([np.asarray(u), np.asarray(v)])
         uvw_norm = 0.5 * (u_norm + v_norm + w_norm)
         self.uv_norm = uvw_norm
         self.uv_arr = uvw_arr
@@ -1552,9 +2071,10 @@ class Lattice(AutoSerialize):
         maxima_candidates_intensity = maxima_candidates[:]['intensity']
 
         # the unique ids array is an array of the original index, candidacy, a (of a * u), and b (of b * v), and c (of c * w)
-        unique_ids = np.zeros([5, len(maxima_candidates)])
+        unique_ids = np.zeros([6, len(maxima_candidates)])
         unique_ids[0,:] = np.arange(0,len(maxima_candidates))
-        unique_ids[-1,:] = -1*np.arange(1,1+len(maxima_candidates))
+        unique_ids[4,:] = -1*np.arange(1,1+len(maxima_candidates))
+        unique_ids[5,:] -= 1
 
         if plot_atoms:
             fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
@@ -1587,6 +2107,48 @@ class Lattice(AutoSerialize):
         atoms_found_prev_iteration[origin_candidate_index] = 1
         found_atoms_in_prev_iteration = True
         iteration_while = 0
+
+
+
+
+
+
+
+
+        def check_dislocations():
+            if check_for_dislocations:
+                for atom_index in range(len(maxima_candidates)):
+                    if unique_ids[1,atom_index] == 1:
+                        for pm in pm_arr:
+                            for uvw_index, lat_vec in enumerate(uvw_arr):
+                                position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
+                                position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
+                                radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+                                radial_dist[atom_index] = uvw_norm * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
+                                if (radial_dist < (uvw_norm * (tolerance_uvw - 1))).any():
+                                    successful_candidate_index = np.argmin(radial_dist)
+                                    if unique_ids[1, successful_candidate_index] == 2:
+                                        atoms_found_this_iteration[successful_candidate_index] += 1
+                                        unique_ids[1, successful_candidate_index] = 3 # for being found in dislocation search
+                                        unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uvw_index == 0) + pm*int(uvw_index == 2)
+                                        unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uvw_index == 1) - w_sign * pm*int(uvw_index == 2)
+                                        unique_ids[4, successful_candidate_index] = 0
+                maxima_dislocation_x = maxima_candidates_x[unique_ids[1,:] == 3]
+                maxima_dislocation_y = maxima_candidates_y[unique_ids[1,:] == 3]
+                maxima_dislocation_u = unique_ids[2,unique_ids[1,:] == 3]
+                maxima_dislocation_v = unique_ids[3,unique_ids[1,:] == 3]
+                maxima_dislocation_intensity = maxima_candidates_intensity[unique_ids[1,:] == 3]
+                arr = np.vstack(
+                    (maxima_dislocation_x, maxima_dislocation_y, maxima_dislocation_u, maxima_dislocation_v, maxima_dislocation_intensity)
+                ).T
+                return arr
+
+
+
+
+
+        # first, a loop that finds all of the A sites
+        a0 = 0 # here we are just doing a0
         while found_atoms_in_prev_iteration is True:
             for atom_index in range(len(maxima_candidates)):
                 if atoms_found_prev_iteration[atom_index] > 0:
@@ -1604,11 +2166,12 @@ class Lattice(AutoSerialize):
                                     unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uvw_index == 0) + pm*int(uvw_index == 2)
                                     unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uvw_index == 1) + w_sign*pm*int(uvw_index == 2)
                                     unique_ids[4, successful_candidate_index] = 0
+                                    unique_ids[5, successful_candidate_index] = a0
             # check if any atom was somehow still found twice:
             assert np.max(atoms_found_this_iteration) < 2
             # check if any found atoms have the same uv index
             if check_uv_duplication:
-                uv_pairs = unique_ids[1:5,:].T
+                uv_pairs = unique_ids[1:6,:].T
                 unique_pairs, inverse, counts = np.unique(uv_pairs, axis=0, return_inverse=True, return_counts=True)
                 duplicate_groups = [np.where(inverse == k)[0] for k, c in enumerate(counts) if c > 1]
                 mask_atoms_found = atoms_found_this_iteration.astype(bool)
@@ -1628,6 +2191,7 @@ class Lattice(AutoSerialize):
                         wipe_indicies = duplicate_group[duplicate_group != kept_index]
                         unique_ids[1, wipe_indicies] = 2 # this signals to not accept for this maxima anymore (and flags this as a dulpicate)
                         unique_ids[2:4,wipe_indicies] = 0
+                        unique_ids[5,wipe_indicies] = -1
                         unique_ids[4,wipe_indicies] = -1*(wipe_indicies+1)
                         atoms_found_previous_iterations[wipe_indicies] = False
                         mask_atoms_found[wipe_indicies] = False
@@ -1644,41 +2208,7 @@ class Lattice(AutoSerialize):
             iteration_while += 1
 
 
-        if check_for_dislocations:
-            for atom_index in range(len(maxima_candidates)):
-                if unique_ids[1,atom_index] == 1:
-                    for pm in pm_arr:
-                        for uvw_index, lat_vec in enumerate(uvw_arr):
-                            position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
-                            position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
-                            radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
-                            radial_dist[atom_index] = uvw_norm * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
-                            if (radial_dist < (uvw_norm * (tolerance_uvw - 1))).any():
-                                successful_candidate_index = np.argmin(radial_dist)
-                                if unique_ids[1, successful_candidate_index] == 2:
-                                    atoms_found_this_iteration[successful_candidate_index] += 1
-                                    unique_ids[1, successful_candidate_index] = 3 # for being found in dislocation search
-                                    unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uvw_index == 0) + pm*int(uvw_index == 2)
-                                    unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uvw_index == 1) - pm*int(uvw_index == 2)
-                                    unique_ids[4, successful_candidate_index] = 0
-            maxima_dislocation_x = maxima_candidates_x[unique_ids[1,:] == 3]
-            maxima_dislocation_y = maxima_candidates_y[unique_ids[1,:] == 3]
-            maxima_dislocation_u = unique_ids[2,unique_ids[1,:] == 3]
-            maxima_dislocation_v = unique_ids[3,unique_ids[1,:] == 3]
-            maxima_dislocation_intensity = maxima_candidates_intensity[unique_ids[1,:] == 3]
-
-            self.atoms_dislocation = Vector.from_shape(
-                shape=(self._num_sites),
-                fields=("x", "y", "a", "b", "int_peak"),
-                units=("px", "px", "ind", "ind", "counts"),
-            )
-
-            arr = np.vstack(
-                (maxima_dislocation_x, maxima_dislocation_y, maxima_dislocation_u, maxima_dislocation_v, maxima_dislocation_intensity)
-            ).T
-            self.atoms_dislocation.set_data(arr, 0)
-
-
+        # add interactive bit here
 
         maxima_accepted_x = maxima_candidates_x[unique_ids[1,:] == 1]
         maxima_accepted_y = maxima_candidates_y[unique_ids[1,:] == 1]
@@ -1715,6 +2245,121 @@ class Lattice(AutoSerialize):
             self.atoms.set_data(arr, 0)
 
 
+        # a_x_0 = self.atoms.get_data(0)[:,0]
+        # a_y_0 = self.atoms.get_data(0)[:,1]
+
+
+        # second, a loop that uses these A sites to find all other sites
+        uvw_arr_save = uvw_arr.copy()
+        found_atoms_in_prev_iteration = True
+        while found_atoms_in_prev_iteration is True:
+            for atom_index in range(len(maxima_candidates)):
+                if not unique_ids[5, atom_index] == 0: # skip this 'for' iteration if the atom is not an A site
+                    continue
+                # print(unique_ids[5, atom_index])
+                for a0 in range(self._num_sites-1):
+                    a0 += 1 # we don't need to go over the 0 index again
+                    positions_around_A_site = self.get_xy_shifts(a0)
+                    positions_around_A_site_norm = np.linalg.norm(positions_around_A_site, axis = 1)
+                    for pos_index, pos_vec in enumerate(positions_around_A_site):
+                        position_x = pos_vec[0] + maxima_candidates_x[atom_index]
+                        position_y = pos_vec[1] + maxima_candidates_y[atom_index]
+                        radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+                        radial_dist[atom_index] = positions_around_A_site_norm[pos_index] * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
+                        if (radial_dist < (positions_around_A_site_norm[pos_index] * (tolerance_uvw - 1))).any():
+                            successful_candidate_index = np.argmin(radial_dist)
+                            if unique_ids[1, successful_candidate_index] == 0:
+                                atoms_found_this_iteration[successful_candidate_index] += 1
+                                unique_ids[1, successful_candidate_index] = 1
+                                unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index]
+                                unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index]
+                                unique_ids[4, successful_candidate_index] = 0
+                                unique_ids[5, successful_candidate_index] = a0
+                # check if any atom was somehow still found twice:
+                assert np.max(atoms_found_this_iteration) < 2
+
+                # uv duplication check won't work as is. since our uv coordinates will have to move to a floating point for extra sites, we will need to use a threshold
+
+                # check if any found atoms have the same uv index
+                # if check_uv_duplication:
+                #     uv_pairs = unique_ids[1:6,:].T
+                #     unique_pairs, inverse, counts = np.unique(uv_pairs, axis=0, return_inverse=True, return_counts=True)
+                #     duplicate_groups = [np.where(inverse == k)[0] for k, c in enumerate(counts) if c > 1]
+                #     mask_atoms_found = atoms_found_this_iteration.astype(bool)
+                #     if len(duplicate_groups) != 0:
+                #         for duplicate_group in duplicate_groups:
+                #             duplicate_group = np.asarray(duplicate_group)
+                #             duplicate_atoms_index_found_previous_iterations = duplicate_group[atoms_found_previous_iterations[duplicate_group]]
+                #             if duplicate_atoms_index_found_previous_iterations.size > 1:
+                #                 if origin_candidate_index not in duplicate_group:
+                #                     raise ValueError("The duplicate atoms finding code is somehow bugged")
+                #                 else:
+                #                     kept_index = origin_candidate_index
+                #             elif duplicate_atoms_index_found_previous_iterations.size == 1:
+                #                 kept_index = duplicate_atoms_index_found_previous_iterations
+                #             else:
+                #                 kept_index = duplicate_group[mask_atoms_found[duplicate_group]][0]
+                #             wipe_indicies = duplicate_group[duplicate_group != kept_index]
+                #             unique_ids[1, wipe_indicies] = 2 # this signals to not accept for this maxima anymore (and flags this as a dulpicate)
+                #             unique_ids[2:4,wipe_indicies] = 0
+                #             unique_ids[5,wipe_indicies] = -1
+                #             unique_ids[4,wipe_indicies] = -1*(wipe_indicies+1)
+                #             atoms_found_previous_iterations[wipe_indicies] = False
+                #             mask_atoms_found[wipe_indicies] = False
+                #             atoms_found_this_iteration[wipe_indicies] = 0
+            if np.sum(atoms_found_this_iteration) == 0:
+                found_atoms_in_prev_iteration = False
+                print('stopping search')
+                
+            atoms_found_previous_iterations |= atoms_found_this_iteration.astype(bool)
+
+            atoms_found_prev_iteration = atoms_found_this_iteration.copy()
+            atoms_found_this_iteration = np.zeros(len(maxima_candidates))
+            iteration_while += 1
+
+
+
+
+        if plot_atoms:
+            fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
+            if ax.images:
+                ax.images[-1].set_zorder(0)
+            xs = maxima_accepted_x
+            ys = maxima_accepted_y
+            rgb = site_colors(int(self._numbers[0]))
+            ax.scatter(
+                ys,
+                xs,
+                s=18,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+                edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+                linewidths=0.75,
+                marker="o",
+                zorder=25,
+            )
+            ax.set_xlim(0, W)
+            ax.set_ylim(H, 0)
+
+
+        for a0 in range(self._num_sites -1):
+            a0 += 1
+            mask_1 = unique_ids[1,:] == 1
+            mask_2 = unique_ids[5,:] == a0
+            mask = mask_1.astype(bool) & mask_2.astype(bool)
+            maxima_accepted_x = maxima_candidates_x[mask]
+            maxima_accepted_y = maxima_candidates_y[mask]
+
+            maxima_accepted_u = unique_ids[2, mask]
+            maxima_accepted_v = unique_ids[3, mask]
+
+            maxima_accepted_intensity = maxima_candidates_intensity[mask]
+
+            arr = np.vstack(
+                (maxima_accepted_x, maxima_accepted_y, maxima_accepted_u, maxima_accepted_v, maxima_accepted_intensity)
+            ).T
+            self.atoms.set_data(arr, a0)
+
+
         if plot_atoms:
             fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
             if ax.images:
@@ -1737,15 +2382,515 @@ class Lattice(AutoSerialize):
 
         return self
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def line_profile(
+            self,
+            origin,
+            direction,
+            num_samples=None
+        ):
+
+        nx, ny = self._image.array.shape
+        # print(nx, ny)
+        print(direction)
+        # print(origin)
+        x0, y0 = origin
+        v = np.array(direction, dtype=float)
+        v /= np.linalg.norm(v)
+
+        if num_samples is None:
+            num_samples = int(np.hypot(nx, ny))
+
+        corners = np.array([[0,0],[nx,0],[0,ny],[nx,ny]])
+        t_values = []
+        for corner in corners:
+            dx, dy = corner - origin
+            t_values.append(np.dot([dx,dy], v))  # projection along direction
+        t_min, t_max = min(t_values), max(t_values)
+        # print(t_min, t_max, num_samples)
+        t = np.linspace(t_min, t_max, num_samples)
+
+        # Coordinates along the line
+        x = x0 + v[0] * t
+        y = y0 + v[1] * t
+
+        # Interpolated intensities
+        profile = map_coordinates(self.image.array, [x, y], order=1, mode='nearest')
+
+        # Clip valid region (inside image bounds)
+        mask = (x >= 0) & (x < nx) & (y >= 0) & (y < ny)
+        return t[mask], profile[mask], x[mask], y[mask]
+
+
+
+    def find_b_sites(
+            self,
+            max_perpendicular_distance = 5,
+            sigma_perp = 5,
+            sigma_parallel = 5,
+    ):
+
+        atoms_arr = self.atoms.get_data(0)
+        a_x = atoms_arr[:,0]
+        a_y = atoms_arr[:,1]
+        a_intensity = self.atoms[0]['int_peak']
+        pm_arr = np.array([1,-1])
+
+        for lat_vec in self.uv_arr:
+            for atom_index in range(a_x.shape[0]):
+                # print(neighbor_x)
+                # print(self.atom_neighbor_arr[:,atom_index].astype(int))
+                neighbor_x = [a_x[i] for i in self.atom_neighbor_arr[:,atom_index] if i is not None]
+                neighbor_y = [a_y[i] for i in self.atom_neighbor_arr[:,atom_index] if i is not None]
+                # print(present_neigbors)
+                # neighbor_x = a_x[self.atom_neighbor_arr[:,atom_index].astype(int)]
+                # neighbor_y = a_y[self.atom_neighbor_arr[:,atom_index].astype(int)]
+                atom_x = a_x[atom_index]
+                atom_y = a_y[atom_index]
+                # if atom_index <3:
+                #     plt.figure()
+                #     plt.imshow(self.image.array)
+                #     plt.scatter(neighbor_x, neighbor_y, color = 'red')
+                #     plt.xlim([0,256])
+                #     plt.ylim([0,256])
+                position_x = lat_vec[0] + atom_x
+                position_y = lat_vec[1] + atom_y
+                radial_dist = ((neighbor_x - position_x)**2 + (neighbor_y - position_y)**2)**(0.5)
+                # radial_dist[atom_index] = np.max(radial_dist)
+                if (radial_dist < (self.uv_norm * (self.tolerance_uv - 1))).any():
+                    successful_candidate_index = np.argmin(radial_dist)
+                    successful_candidate_index = self.atom_neighbor_arr[successful_candidate_index, atom_index]
+                    # print(successful_candidate_index)
+                    vec_x = a_x[successful_candidate_index] - atom_x
+                    vec_y = a_y[successful_candidate_index] - atom_y
+                    line_profile_vector = np.array([vec_x, vec_y])
+                    line_profile_origin = np.array([atom_x, atom_y])
+                    slice_coordinates, slice_y, x_coords_slice, y_coords_slice = self.line_profile(line_profile_origin, line_profile_vector)
+                    mask, near_peaks, t_values, distances = self.select_peaks_near_line(atom_index, line_profile_vector, max_perpendicular_distance)
+                    
+                    t_profile = np.asarray(slice_coordinates)
+                    t_values = np.asarray(t_values)
+                    distances = np.asarray(distances)
+
+                    # If amplitude is scalar, broadcast
+                    A = a_intensity[mask]
+
+                    # Attenuate amplitudes by perpendicular distance
+                    A_eff = A * np.exp(-0.5 * (distances / sigma_perp) ** 2)
+
+                    # Compute Gaussian sum along profile
+                    gaussian_sum = np.zeros_like(t_profile, dtype=float)
+                    for t_i, A_i in zip(t_values, A_eff):
+                        gaussian_sum += A_i * np.exp(-0.5 * ((t_profile - t_i) / sigma_parallel) ** 2)
+                    if atom_index < 3:
+                        plt.figure()
+                        plt.plot()
+                        plt.figure(figsize=(10,4))
+                        plt.subplot(1,2,1)
+                        plt.imshow(self.image.array, cmap='gray', origin='upper')
+                        plt.plot(y_coords_slice, x_coords_slice, 'r-', lw=1)
+                        plt.title("Line through image")
+
+                        plt.subplot(1,2,2)
+                        plt.plot(slice_coordinates, slice_y)
+                        plt.plot(slice_coordinates, gaussian_sum)
+                        plt.title("Line profile")
+                        plt.xlabel("Distance along line (pixels)")
+                        plt.ylabel("Intensity")
+                        plt.tight_layout()
+                        plt.show()
+        return self
+
+
+    def unit_vector(
+        self,
+        v,
+        ):
+        v = np.array(v, dtype=float)
+        norm = np.linalg.norm(v)
+        if norm == 0:
+            raise ValueError("direction vector cannot be zero")
+        return v / norm
+
+    def project_point_to_line_rowmajor(
+        self,
+        point,
+        origin,
+        direction
+        ):
+        p = np.array(point, dtype=float)
+        origin = np.array(origin, dtype=float)
+        v = self.unit_vector(direction)
+        dp = p - origin
+        s = np.dot(dp, v)
+        proj = origin + s * v
+        perp_vec = dp - s * v
+        perp_dist = np.linalg.norm(perp_vec)
+        return s, perp_dist, proj
+
+    def select_peaks_near_line(
+            self,
+            atom_index,
+            direction,
+            max_perpendicular_distance,
+    ):
+        atoms_arr = self.atoms.get_data(0)
+        a_xy = atoms_arr[:,0:2]
+        selected_atoms_arr = np.zeros(a_xy.shape[0])
+        v = self.unit_vector(direction)
+        center_atom_to_rest = a_xy - a_xy[atom_index]
+
+        t_values_all = np.dot(center_atom_to_rest, v)
+
+        rest_proj = np.outer(t_values_all, v)
+        perp = center_atom_to_rest - rest_proj
+        distances_all = np.linalg.norm(perp, axis=1)
+
+        # Select peaks within threshold
+        mask = distances_all <= max_perpendicular_distance
+
+        near_peaks = a_xy[mask]
+        t_values = t_values_all[mask]
+        distances = distances_all[mask]
+
+        return mask, near_peaks, t_values, distances
+
+
+    def gaussian(
+        self,
+        s,
+        amp,
+        mu,
+        sigma
+        ):
+        return amp * np.exp(-0.5 * ((s - mu) / sigma)**2)
+
+
+    def get_xy_shifts(
+            self,
+            a0,
+    ):
+        position_fraction = self._positions_frac[a0]
+
+            #         if self.uv_arr.shape[0] == 3:
+            #             if (position_fraction == np.zeros([2])).all():
+            #                 np.array([1,0,0])
+            #                 np.array([-1,0,0])
+            #                 np.array([0,1,0])
+            #                 np.array([0,-1,0])
+            #                 np.array([0,0,1])
+            #                 np.array([0,0,-1])
+            #             else:
+            #                 np.array([0,0,0]) 
+            #                 np.array([-1,0,0])
+            #                 np.array([0,-1,0])
+            #                 np.array([-1,-1,0])
+
+
+            # # 1 0 0
+            # # 0 1 0
+            # # 0 0 1
+            # # -1 0 0
+            # # 0 -1 0
+            # # 0 0 -1
+
+            # # multiply by distance and rot 30 degrees
+
+            #         else:
+        if (position_fraction == np.zeros([2])).all():
+            p1 = np.array([1,0]) @ self.uv_arr[:2]
+            p2 = np.array([-1,0]) @ self.uv_arr[:2]
+            p3 = np.array([0,1]) @ self.uv_arr[:2]
+            p4 = np.array([0,-1]) @ self.uv_arr[:2]
+        else:
+            p1 = (np.array([0,0]) + position_fraction) @ self.uv_arr[:2]
+            p2 = (np.array([-1,0]) + position_fraction) @ self.uv_arr[:2]
+            p3 = (np.array([0,-1]) + position_fraction) @ self.uv_arr[:2]
+            p4 = (np.array([-1,-1]) + position_fraction) @ self.uv_arr[:2]
+
+        return np.array([p1, p2, p3, p4])
+        # if hexagonal, should be able to use same dot product method as before and add two of the positions together to get the b site location (depending on angle between u and v)
+
+
+        # for generic site combination, can find the neighbor locations with respect to the A site and then shift the center to the B or C site by shifting the center (subtract the position coordinates of B with respect to A, e.g.)
+        # this however, will not work
+
+
+        # for now simplify it to finding the neighbors of B sites for a unit cell with four sides. This should be straightforward.
+        # the first neighbor will be at the negative position vector, then [1,0]-pos, [0,1] - pos, and [1,1]-pos.
+        # For the A sites, the neighborins B sites are described above in get_xy_shifts. However, a general method of doing this still eludes me.
+
+    def get_a_positions_near_b_site(
+            self,
+    ):
+        b_frac = self._positions_frac[1]
+        p1 = (np.array([0,0]) - b_frac) @ self.uv_arr[:2]
+        p2 = (np.array([1,0]) - b_frac) @ self.uv_arr[:2]
+        p3 = (np.array([0,1]) - b_frac) @ self.uv_arr[:2]
+        p4 = (np.array([1,1]) - b_frac) @ self.uv_arr[:2]
+        return np.array([p1,p2,p3,p4])
+
+
+    # this function is not really necessary; the lattice vectors should suffice here
+    # def get_b_to_b_neighbors(
+    #     self,
+    # ):
+        
+
+
+    def organize_b_neighbors(
+        self,
+        site_search_radius = 2,
+        num_bins = 128,
+        tolerance_uv = None,
+        num_sites_use = 1,
+    ):
+        a_x_b = self.atoms.get_data(1)[:,0]
+        a_y_b = self.atoms.get_data(1)[:,1]
+        
+        a_x_a = self.atoms.get_data(0)[:,0]
+        a_y_a = self.atoms.get_data(0)[:,1]
+        b_neighbor_arr = np.empty((2, 4, a_x_b.shape[0]), dtype=object)
+        pm_arr = np.array([-1,1])
+        a_positions_around_site = self.get_a_positions_near_b_site()
+        # b_positions_around_site = self.get_xy_shifts(1) # may need to change this to just the regular <1 0> family
+
+
+
+        # positions_around_A_site = self.get_xy_shifts(1)
+        # positions_around_A_site_norm = np.linalg.norm(positions_around_A_site, axis = 1)
+        # for pos_index, pos_vec in enumerate(positions_around_A_site):
+        #     position_x = pos_vec[0] + maxima_candidates_x[atom_index]
+        #     position_y = pos_vec[1] + maxima_candidates_y[atom_index]
+        #     radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+        #     radial_dist[atom_index] = positions_around_A_site_norm[pos_index] * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
+        #     if (radial_dist < (positions_around_A_site_norm[pos_index] * (tolerance_uvw - 1))).any():
+
+
+
+        pm_arr = np.array([-1,1])
+        uvw_arr = self.uv_arr
+        uvw_norm = self.uv_norm
+        tolerance_uv = self.tolerance_uv
+        for atom_index in range(a_x_b.shape[0]):
+            # B sites near the B sites (displaced by the lattice vectors, hopefully)
+            for pm in pm_arr:
+                for uvw_index, lat_vec in enumerate(uvw_arr):
+                    position_x = pm * lat_vec[0] + a_x_b[atom_index]
+                    position_y = pm * lat_vec[1] + a_y_b[atom_index]
+                    radial_dist = ((a_x_b - position_x)**2 + (a_y_b - position_y)**2)**(0.5)
+                    radial_dist[atom_index] = uvw_norm * (tolerance_uv - 1) * 2 # make sure that self is outside of range
+                    if (radial_dist < (uvw_norm * (tolerance_uv - 1))).any():
+                        successful_candidate_index = np.argmin(radial_dist)
+                        if (pm == 1 and uvw_index == 0):
+                            b_neighbor_arr[1, 0,atom_index] = int(successful_candidate_index)
+
+                        if (pm == -1 and uvw_index == 0):
+                            b_neighbor_arr[1, 1,atom_index] = int(successful_candidate_index) 
+
+                        if (pm == 1 and uvw_index == 1):
+                            b_neighbor_arr[1, 2,atom_index] = int(successful_candidate_index) 
+
+                        if (pm == -1 and uvw_index == 1):
+                            b_neighbor_arr[1, 3,atom_index] = int(successful_candidate_index) 
+                        # leaving out the w vector for right now...
+
+
+
+            # for pos_index, pos_vec in enumerate(b_positions_around_site):
+            #     position_x = pos_vec[0] + a_x_b[atom_index]
+            #     position_y = pos_vec[1] + a_y_b[atom_index]
+            #     radial_dist = ((a_x_b - position_x)**2 + (a_y_b - position_y)**2)**(0.5)
+            #     radial_dist[atom_index] = self.uv_norm * (tolerance_uv - 1) * 2 # make sure that self is outside of range
+            #     if (radial_dist < (self.uv_norm * (tolerance_uv - 1))).any():
+            #         successful_candidate_index = np.argmin(radial_dist)
+            #         if (pos_index == 0):
+            #             b_neighbor_arr[1, 0,atom_index] = int(successful_candidate_index)
+
+            #         if (pos_index == 1):
+            #             b_neighbor_arr[1, 1,atom_index] = int(successful_candidate_index) 
+
+            #         if (pos_index == 2):
+            #             b_neighbor_arr[1, 2,atom_index] = int(successful_candidate_index) 
+
+            #         if (pos_index == 3):
+            #             b_neighbor_arr[1, 3,atom_index] = int(successful_candidate_index) 
+
+
+            # A sites near the B sites
+            # critically, the successful candidate indices that are written in this loop are only valid for the A site variables.
+            for pos_index, pos_vec in enumerate(a_positions_around_site):
+                position_x = pos_vec[0] + a_x_b[atom_index]
+                position_y = pos_vec[1] + a_y_b[atom_index]
+                radial_dist = ((a_x_a - position_x)**2 + (a_y_a - position_y)**2)**(0.5)
+                # this line is not necessary because the coordinate of the b site is not in the a site coordinate list
+                # radial_dist[atom_index] = self.uv_norm * (tolerance_uv - 1) * 2 # make sure that self is outside of range
+                if (radial_dist < (self.uv_norm * (tolerance_uv - 1))).any():
+                    successful_candidate_index = np.argmin(radial_dist)
+                    if (pos_index == 0):
+                        b_neighbor_arr[0, 0,atom_index] = int(successful_candidate_index)
+
+                    if (pos_index == 1):
+                        b_neighbor_arr[0, 1,atom_index] = int(successful_candidate_index) 
+
+                    if (pos_index == 2):
+                        b_neighbor_arr[0, 2,atom_index] = int(successful_candidate_index) 
+
+                    if (pos_index == 3):
+                        b_neighbor_arr[0, 3,atom_index] = int(successful_candidate_index)
+                # if atom_index < 2:
+                #     print(b_neighbor_arr[0,:,atom_index])
+        self.b_neighbor_arr = b_neighbor_arr
+        # print(a_positions_around_site)
+        return self
+
+
+    def organize_nearest_neighbors_2(
+        self,
+        site_search_radius = 2,
+        num_bins = 128,
+        tolerance_uv = None,
+        num_sites_use = 1,
+        which_neighbors = None,
+        which_centers = None,
+        return_neigbhor_arr = False,
+    ):
+        if tolerance_uv is None:
+            tolerance_uv = self.tolerance_uv
+
+        if which_neighbors is None:
+            which_neighbors = np.array([0])
+        if which_centers is None:
+            which_centers = np.array([0])
+
+        pm_arr = np.array([1,-1])
+        uv_arr = self.uv_arr
+        uvw_arr = np.zeros([self._num_sites, 3,2])
+        for v0 in range(self._num_sites):
+            unit_shifts = np.array([self._positions_frac[v0, 0], self._positions_frac[v0, 1]])
+            positive_vector = unit_shifts.copy()
+            negative_vector = unit_shifts.copy()
+            negative_vector[1] *= -1
+            if np.abs(np.rad2deg(np.arccos(np.dot(positive_vector, negative_vector)/(np.linalg.norm(positive_vector) * np.linalg.norm(negative_vector))))) > np.deg2rad(90):
+                w_ = np.asarray(positive_vector)+np.asarray(negative_vector)
+                w_sign = 1
+            else:
+                w_ = np.asarray(positive_vector)-np.asarray(negative_vector)
+                w_sign = -1
+            
+            p_v_c = positive_vector @ uv_arr[:2]
+            n_v_c = negative_vector @ uv_arr[:2]
+            w_v_c = w_ @ uv_arr[:2]
+            uvw_arr[v0,:] = np.array([p_v_c, n_v_c, w_v_c])
+
+        a0_iter = 0
+        for a0 in which_centers:
+            a_x_c = self.atoms.get_data(a0)[:,0]
+            a_y_c = self.atoms.get_data(a0)[:,1]
+            atom_neighbor_arr = np.empty((which_centers.shape[0], which_neighbors.shape[0], 6, a_x_c.shape[0]), dtype=object)
+            a1_iter = 0
+            for a1 in which_neighbors:
+                a_x_n = self.atoms.get_data(a1)[:,0]
+                a_y_n = self.atoms.get_data(a1)[:,1]
+                for atom_index in range(a_x_c.shape[0]):
+                    for pm in pm_arr:
+                        for uvw_index, lat_vec in enumerate(uvw_arr[a1]):
+                            position_x = pm * lat_vec[0] + a_x_c[atom_index]
+                            position_y = pm * lat_vec[1] + a_y_c[atom_index]
+                            radial_dist = ((a_x_n - position_x)**2 + (a_y_n - position_y)**2)**(0.5)
+                            radial_dist[atom_index] = self.uv_norm * (tolerance_uv - 1) * 2 # make sure that self is outside of range
+                            if (radial_dist < (self.uv_norm * (tolerance_uv - 1))).any():
+                                successful_candidate_index = np.argmin(radial_dist)
+                                if (pm == 1 and uvw_index == 0):
+                                    atom_neighbor_arr[a0_iter, a1_iter, 0,atom_index] = int(successful_candidate_index)
+
+                                if (pm == -1 and uvw_index == 0):
+                                    atom_neighbor_arr[a0_iter, a1_iter, 1,atom_index] = int(successful_candidate_index) 
+
+                                if (pm == 1 and uvw_index == 1):
+                                    atom_neighbor_arr[a0_iter, a1_iter, 2,atom_index] = int(successful_candidate_index) 
+
+                                if (pm == -1 and uvw_index == 1):
+                                    atom_neighbor_arr[a0_iter, a1_iter, 3,atom_index] = int(successful_candidate_index) 
+
+                                if (pm == 1 and uvw_index == 2):
+                                    atom_neighbor_arr[a0_iter, a1_iter, 4,atom_index] = int(successful_candidate_index) 
+
+                                if (pm == -1 and uvw_index == 2):
+                                    atom_neighbor_arr[a0_iter, a1_iter, 5,atom_index] = int(successful_candidate_index) 
+                a1_iter += 1
+            a0_iter += 1
+        self.atom_neighbor_arr = atom_neighbor_arr
+        self.which_centers = which_centers
+        self.which_neighbors = which_neighbors
+
+
+        plt.figure()
+        index_show = 10
+        print(atom_neighbor_arr[0,0,:,:index_show])
+        for atom_index in range(index_show):
+            not_none_indices = np.asarray([i for i in atom_neighbor_arr[0,0,:,atom_index] if i is not None], dtype = int)
+            plt.scatter(self.atoms.get_data(0)[not_none_indices,1], self.atoms.get_data(0)[not_none_indices,0])
+        if return_neigbhor_arr:
+            return atom_neighbor_arr, which_centers, which_neighbors
+        return self
+
     def organize_nearest_neighbors(
         self,
         site_search_radius = 2,
         num_bins = 128,
         tolerance_uv = None,
+        num_sites_use = 1,
     ):
         if tolerance_uv is None:
             tolerance_uv = self.tolerance_uv
-        for a0 in range(self._num_sites):
+        for a0 in range(num_sites_use):
             atoms_arr = self.atoms.get_data(a0)
             a_x = atoms_arr[:,0]
             a_y = atoms_arr[:,1]
@@ -1785,6 +2930,7 @@ class Lattice(AutoSerialize):
                             if (pm == -1 and uvw_index == 2):
                                 atom_neighbor_arr[5,atom_index] = int(successful_candidate_index) 
                                 has_six_neighbors_arr[atom_index] += 1
+                
             self.has_six_neighbors_arr = has_six_neighbors_arr == 6
             self.atom_neighbor_arr = atom_neighbor_arr
         return self
@@ -1818,7 +2964,45 @@ class Lattice(AutoSerialize):
         else:
             return np.asarray(arr, dtype = int)
 
-    def neighborhood(
+    def get_next_neighborhood_layer_b(
+        self,
+        atom_index,
+        a_or_b,
+    ):
+        neighbor_arr = np.asarray([i for i in self.b_neighbor_arr[a_or_b,:, atom_index] if i is not None], dtype = int)
+        if a_or_b == 0:
+            neighbors_pass = [i for i in neighbor_arr if not self.added_to_neighbor_list_already[i]]
+            self.added_to_neighbor_list_already[neighbors_pass] = 1
+        if a_or_b == 1:
+            neighbors_pass = [i for i in neighbor_arr if not self.added_to_neighbor_list_already_b[i]]
+            self.added_to_neighbor_list_already_b[neighbors_pass] = 1
+
+        return neighbors_pass
+
+    def get_next_neighborhood_layer_arr_b(
+        self,
+        atom_indexes,
+        a_or_b,
+    ):
+        atom_indexes_less_none =  [i for i in atom_indexes if i is not None]
+        arr_present = False
+        arr = None
+        for atom_index in atom_indexes_less_none:
+            if arr_present:
+                arr = np.concatenate((arr, np.asarray(self.get_next_neighborhood_layer_b(atom_index, a_or_b))))
+            else:
+                arr = np.asarray(self.get_next_neighborhood_layer_b(atom_index, a_or_b))
+                arr_present = True
+        
+
+        # if a_or_b  == 0:
+        #     arr = arr[1:] # get rid of the b index
+        if arr is None:
+            return None
+        else:
+            return np.asarray(arr, dtype = int)
+
+    def neighborhood_unfinished(
         self,
         neighborhood_units = 2,
     ):
@@ -1842,6 +3026,95 @@ class Lattice(AutoSerialize):
                 self.added_to_neighbor_list_already = np.zeros(a_x.shape[0])
         self.atom_neighbor_layer_arr = atom_neighbor_list
         return self
+    
+    def neighborhood_a(
+        self,
+        neighborhood_units = 2,
+    ):
+        for a0 in range(1):
+            atoms_arr = self.atoms.get_data(a0)
+            a_x = atoms_arr[:,0]
+            atom_neighbor_list = []
+            self.added_to_neighbor_list_already = np.zeros(a_x.shape[0])
+            self.num_neighbors = np.zeros(a_x.shape[0])
+            for atom_index in range(a_x.shape[0]):
+                neighbors_search = np.asarray([atom_index])
+                self.added_to_neighbor_list_already[atom_index] = 1
+                neighbors_search_out = np.array([atom_index])
+                for neighbor_iteration in range(neighborhood_units):
+                    neighbors_search_out = self.get_next_neighborhood_layer_arr(neighbors_search_out)
+                    neighbors_search = np.concatenate((neighbors_search, neighbors_search_out))
+                    if neighbors_search_out.size == 0:
+                        break
+                atom_neighbor_list.append(neighbors_search)
+                self.num_neighbors[atom_index] = np.sum(self.added_to_neighbor_list_already) - 1 # minus one because the central atom is not neighbor
+                self.added_to_neighbor_list_already = np.zeros(a_x.shape[0])
+        self.atom_neighbor_layer_arr = atom_neighbor_list
+        return self
+
+    # neighborhood b collects all of the b and a neighbors in the vicinity of central b atoms
+    def neighborhood_b(
+            self,
+            neighborhood_units = 2,
+        ):
+
+        a_x_b = self.atoms.get_data(1)[:,0]
+        a_x_a = self.atoms.get_data(0)[:,0]
+        atom_neighbor_list_b = []
+        atom_neighbor_list_a = []
+        self.added_to_neighbor_list_already_b = np.zeros(a_x_b.shape[0])
+        self.added_to_neighbor_list_already = np.zeros(a_x_a.shape[0])
+        self.num_neighbors = np.zeros(a_x_b.shape[0])
+        for atom_b_index in range(a_x_b.shape[0]):
+            neighbors_search_a = np.asarray([atom_b_index])
+            neighbors_search_b = np.asarray([atom_b_index])
+            self.added_to_neighbor_list_already_b[atom_b_index] = 1
+            neighbors_search_out_b = np.array([atom_b_index])
+            neighbors_search_out_a = np.array([atom_b_index])
+            for neighbor_iteration in range(neighborhood_units):
+                if neighbor_iteration == 0:
+                    neighbors_search_out_a = self.get_next_neighborhood_layer_arr_b(neighbors_search_out_a, 0)
+                else:
+                    neighbors_search_out_a = self.get_next_neighborhood_layer_arr(neighbors_search_out_a)
+
+                neighbors_search_out_b = self.get_next_neighborhood_layer_arr_b(neighbors_search_out_b, 1)
+                neighbors_search_a = np.concatenate((neighbors_search_a, neighbors_search_out_a))
+                if neighbor_iteration == 0:
+                    neighbors_search_a = neighbors_search_a[1:]
+                #     if atom_b_index < 2:
+                #         print(atom_b_index)
+                #         print(neighbors_search_a)
+                # if atom_b_index < 10:
+                #     print(neighbors_search_a)
+                neighbors_search_b = np.concatenate((neighbors_search_b, neighbors_search_out_b))
+                if neighbors_search_out_a.size == 0:
+                    break
+            atom_neighbor_list_a.append(neighbors_search_a)
+            atom_neighbor_list_b.append(neighbors_search_b)
+            self.num_neighbors[atom_b_index] = np.sum(self.added_to_neighbor_list_already_b) + np.sum(self.added_to_neighbor_list_already) - 2 # minus one because the central atom is not neighbor, and counted twice
+            self.added_to_neighbor_list_already_b = np.zeros(a_x_b.shape[0])
+        self.atom_neighbor_layer_arr_a = atom_neighbor_list_a
+        self.atom_neighbor_layer_arr_b = atom_neighbor_list_b
+        return self
+
+
+    def plot_neighbors(
+        self
+    ):
+        plt.figure()
+        plt.imshow(self.image.array, cmap = 'gray')
+        a_x_b = self.atoms.get_data(1)[:,0]
+        a_y_b = self.atoms.get_data(1)[:,1]
+        a_x_a = self.atoms.get_data(0)[:,0]
+        a_y_a = self.atoms.get_data(0)[:,1]
+
+        for atom_b_index in range(1):
+            plt.scatter(a_y_b[atom_b_index], a_x_b[atom_b_index], color = 'blue', zorder = 10)
+            plt.scatter(a_y_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)], a_x_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)], color = 'red',  alpha = 0.5)
+            plt.scatter(a_y_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)], a_x_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)], color = 'green')
+
+
+
 
     def intensity_neighborhood(
         self,
@@ -3071,3 +4344,862 @@ def site_colors(number: int) -> tuple[float, float, float]:
     ]
     idx = int(number) % len(palette)
     return palette[idx]
+
+
+
+
+####
+
+    # def slice_along_axis(
+    #         self,
+    #         u = None,
+    #         v = None,
+    # ):
+    #     uv_arr = self.uv_arr
+    #     slice_vectors = self._positions_frac[1:]
+        
+
+
+    # def atoms_first_uvw(
+    #     self,
+    #     origin = None,
+    #     u = None,
+    #     v = None,
+    #     positions_frac = None,
+    #     tolerance_uvw: float = 1.1,
+    #     w = None,
+    #     numbers=None,
+    #     edge_min_dist_px=None,
+    #     subpixel: str = "poly",
+    #     upsample_factor: int = 16,
+    #     sigma: float = 0,
+    #     minAbsoluteIntensity: float = 0,
+    #     minRelativeIntensity: float = 0,
+    #     relativeToPeak: float = 0,
+    #     minSpacing: float = 0,
+    #     edgeBoundary: int = 1,
+    #     maxNumPeaks: int = 5000,
+    #     plot_atoms=True,
+    #     input_mask=None,
+    #     refine_lattice=True,
+    #     refine_maxiter: int = 200,
+    #     intensity_radius = None,
+    #     intensity_min: float | None = None,
+    #     contrast_min=None,
+    #     annulus_radii = None,
+    #     check_uv_duplication = True,
+    #     check_for_dislocations = False,
+    #     merge_dislocation = False,
+    #     **kwargs,
+    # ):
+    #     self.check_for_dislocations = check_for_dislocations
+    #     # find all candidates above threshold
+    #     maxima_candidates = self.get_maxima_2D(
+    #         self.image.array, 
+    #         subpixel = subpixel,
+    #         upsample_factor = upsample_factor,
+    #         sigma = sigma,
+    #         minAbsoluteIntensity = minAbsoluteIntensity,
+    #         minRelativeIntensity = minRelativeIntensity,
+    #         relativeToPeak = relativeToPeak,
+    #         minSpacing = minSpacing,
+    #         edgeBoundary = edgeBoundary,
+    #         maxNumPeaks = maxNumPeaks,
+    #         )
+
+    #     H, W = self._image.shape  # x=rows, y=cols
+
+    #     if origin is None:
+    #         max_intensity_index = np.argmax(maxima_candidates[:]['intensity'])
+    #         origin_x = maxima_candidates[max_intensity_index]['x']
+    #         origin_y = maxima_candidates[max_intensity_index]['y']
+    #         origin = np.array([origin_x, origin_y])
+
+    #     if u is None or v is None:
+    #         num_peaks_search = 20
+    #         num_peaks_use = 2
+    #         center_ignore_buffer = 15
+    #         minSpacingPeaks = 5
+    #         uv_result_inv = self.auto_peak_finder(num_peaks_search = num_peaks_search, num_peaks_use = num_peaks_use, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
+
+    #         g_vector_1_c = np.array([uv_result_inv[0]['x'], uv_result_inv[0]['y']])
+    #         g_vector_2_c = np.array([uv_result_inv[1]['x'], uv_result_inv[1]['y']])
+    #         g_vec1 = np.zeros(2)
+    #         g_vec1[0] = ((g_vector_1_c[0] - (0.5*H))/H)
+    #         g_vec1[1] = ((g_vector_1_c[1] - (0.5*W))/W)
+    #         g_vec2 = np.zeros(2)
+    #         g_vec2[0] = ((g_vector_2_c[0] - (0.5*H))/H)
+    #         g_vec2[1] = ((g_vector_2_c[1] - (0.5*W))/W)
+    #         g_matrix = np.array([g_vec1, g_vec2])
+    #         a_matrix = np.linalg.inv(g_matrix)
+    #         a_transpose = a_matrix.T
+    #         u = np.array([a_transpose[0,0], a_transpose[0,1]])
+    #         v = np.array([a_transpose[1,0], a_transpose[1,1]])
+    #         self.u = u
+    #         self.v = v
+
+
+    #     if positions_frac is None:
+    #         positions_frac = np.atleast_2d(np.array((0,0))),
+
+    #     self._positions_frac = np.atleast_2d(np.array(positions_frac, dtype=float))
+    #     self._num_sites = self._positions_frac.shape[0]
+    #     self._numbers = (
+    #         np.arange(1, self._num_sites + 1, dtype=int)
+    #         if numbers is None
+    #         else np.atleast_1d(np.array(numbers, dtype=int))
+    #     )
+    #     if w is None:
+    #         if np.abs(np.rad2deg(np.arccos(np.dot(u, v)/(np.linalg.norm(u) * np.linalg.norm(v))))) > np.deg2rad(90):
+    #             w = np.asarray(u)+np.asarray(v)
+    #             w_sign = 1
+    #         else:
+    #             w = np.asarray(u)-np.asarray(v)
+    #             w_sign = -1
+    #     else:
+    #         w_sign = 1
+
+    #     self._lat = np.vstack(
+    #         (
+    #             np.array(origin),
+    #             np.array(u),
+    #             np.array(v),
+    #         )
+    #     )
+
+    #     im = np.asarray(self._image.array, dtype=float)
+    #     r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+    #     A = np.column_stack((u, v))
+
+    #     def _auto_radius_px() -> float:
+    #         S = self._positions_frac
+    #         if S.shape[0] >= 2:
+    #             d = S[:, None, :] - S[None, :, :]
+    #             d = d - np.round(d)
+    #             same = (np.abs(d[..., 0]) < 1e-12) & (np.abs(d[..., 1]) < 1e-12)
+    #             dpix = d @ A.T
+    #             dist = np.linalg.norm(dpix, axis=2)
+    #             dist[same] = np.inf
+    #             nn = float(np.min(dist))
+    #         else:
+    #             nn = float(np.min(np.linalg.norm(np.stack((u, v, u + v, u - v)), axis=1)))
+    #         if not np.isfinite(nn) or nn <= 0:
+    #             nn = max(1.0, 0.25 * (np.linalg.norm(u) + np.linalg.norm(v)))
+    #         return 0.5 * nn
+
+    #     r_px = float(intensity_radius) if intensity_radius is not None else _auto_radius_px()
+    #     rin, rout = (1.5 * r_px, 3.0 * r_px) if annulus_radii is None else annulus_radii
+    #     R_disk = int(np.ceil(r_px))
+    #     R_ring = int(np.ceil(rout))
+
+    #     def mean_disk(x: float, y: float) -> float:
+    #         ix0, iy0 = int(np.floor(x)), int(np.floor(y))
+    #         i0, i1 = max(0, ix0 - R_disk), min(H - 1, ix0 + R_disk)
+    #         j0, j1 = max(0, iy0 - R_disk), min(W - 1, iy0 + R_disk)
+    #         ii = np.arange(i0, i1 + 1)[:, None]
+    #         jj = np.arange(j0, j1 + 1)[None, :]
+    #         dx, dy = ii - x, jj - y
+    #         mask_circle = (dx * dx + dy * dy) <= (r_px * r_px)
+    #         vals = im[i0 : i1 + 1, j0 : j1 + 1][mask_circle]
+    #         if vals.size == 0:
+    #             return float(im[np.clip(round(x), 0, H - 1), np.clip(round(y), 0, W - 1)])
+    #         return float(vals.mean())
+
+    #     def mean_std_annulus(x: float, y: float) -> tuple[float, float]:
+    #         ix0, iy0 = int(np.floor(x)), int(np.floor(y))
+    #         i0, i1 = max(0, ix0 - R_ring), min(H - 1, ix0 + R_ring)
+    #         j0, j1 = max(0, iy0 - R_ring), min(W - 1, iy0 + R_ring)
+    #         ii = np.arange(i0, i1 + 1)[:, None]
+    #         jj = np.arange(j0, j1 + 1)[None, :]
+    #         dx, dy = ii - x, jj - y
+    #         r2 = dx * dx + dy * dy
+    #         mask_ring = (r2 >= rin * rin) & (r2 <= rout * rout)
+    #         vals = im[i0 : i1 + 1, j0 : j1 + 1][mask_ring]
+    #         if vals.size == 0:
+    #             val = float(im[np.clip(round(x), 0, H - 1), np.clip(round(y), 0, W - 1)])
+    #             return val, 0.0
+    #         return float(vals.mean()), float(vals.std(ddof=0))
+
+    #     # mask of where in real space maxima can occur
+    #     H, W = self._image.shape  # x=rows, y=cols
+    #     edge_thresh = float(edge_min_dist_px) if edge_min_dist_px is not None else 0.0
+
+    #     DT = None
+    #     if input_mask is not None:
+    #         m = np.asarray(input_mask).astype(bool)
+    #         if m.shape != (H, W):
+    #             raise ValueError(f"mask shape {m.shape} must match image shape {(H, W)}")
+    #         try:
+    #             from scipy.ndimage import distance_transform_edt
+
+    #             DT = distance_transform_edt(m)
+    #         except Exception:
+    #             DT = None
+
+    #     # find the maxima closest to the origin:
+    #     maxima_candidates_x = maxima_candidates[:]['x']
+    #     maxima_candidates_y = maxima_candidates[:]['y']
+
+    #     pm_arr = np.array([-1,0,1])
+    #     u_norm = np.linalg.norm(u)
+    #     v_norm = np.linalg.norm(v)
+    #     w_norm = np.linalg.norm(w)
+    #     uvw_arr = np.array([np.asarray(u),np.asarray(v),np.asarray(w)])
+    #     uvw_norm = 0.5 * (u_norm + v_norm + w_norm)
+    #     self.uv_norm = uvw_norm
+    #     self.uv_arr = uvw_arr
+    #     self.tolerance_uv = tolerance_uvw
+    #     x = maxima_candidates_x
+    #     y = maxima_candidates_y
+
+    #     in_bounds = (x >= 0.0) & (x <= H - 1) & (y >= 0.0) & (y <= W - 1)
+    #     border_ok = (
+    #         (x - edge_thresh >= 0.0)
+    #         & (x + edge_thresh <= H - 1)
+    #         & (y - edge_thresh >= 0.0)
+    #         & (y + edge_thresh <= W - 1)
+    #     )
+    #     if input_mask is not None:
+    #         if DT is not None:
+    #             ii = np.clip(np.round(x).astype(int), 0, H - 1)
+    #             jj = np.clip(np.round(y).astype(int), 0, W - 1)
+    #             mask_ok = DT[ii, jj] >= edge_thresh
+    #         else:
+    #             m = np.asarray(input_mask).astype(bool)
+    #             mask_ok = m[
+    #                 np.clip(np.round(x).astype(int), 0, H - 1),
+    #                 np.clip(np.round(y).astype(int), 0, W - 1),
+    #             ]
+    #     else:
+    #         mask_ok = np.ones_like(in_bounds, dtype=bool)
+
+    #     int_center = np.empty(x.shape[0], dtype=float)
+    #     for i in range(x.shape[0]):
+    #         int_center[i] = mean_disk(x[i], y[i])
+
+    #     keep = in_bounds & border_ok & mask_ok
+    #     if intensity_min is not None:
+    #         keep &= int_center >= float(intensity_min)
+    #     if contrast_min is not None:
+    #         bg_mean = np.empty(x.shape[0], dtype=float)
+    #         for i in range(x.shape[0]):
+    #             bg_mean[i], _ = mean_std_annulus(x[i], y[i])
+    #         keep &= (int_center - bg_mean) >= float(contrast_min)
+
+    #     if np.any(keep):
+    #         maxima_candidates = maxima_candidates[keep]
+    #     else:
+    #         raise ValueError("Zero maxima candidates kept")
+
+    #     # find the maxima closest to the origin:
+    #     maxima_candidates_x = maxima_candidates[:]['x']
+    #     maxima_candidates_y = maxima_candidates[:]['y']
+    #     maxima_candidates_intensity = maxima_candidates[:]['intensity']
+
+    #     # the unique ids array is an array of the original index, candidacy, a (of a * u), and b (of b * v), and c (of c * w)
+    #     unique_ids = np.zeros([5, len(maxima_candidates)])
+    #     unique_ids[0,:] = np.arange(0,len(maxima_candidates))
+    #     unique_ids[-1,:] = -1*np.arange(1,1+len(maxima_candidates))
+
+    #     if plot_atoms:
+    #         fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
+    #         if ax.images:
+    #             ax.images[-1].set_zorder(0)
+    #         xs = maxima_candidates_x
+    #         ys = maxima_candidates_y
+    #         rgb = site_colors(int(self._numbers[0]))
+    #         ax.scatter(
+    #             ys,
+    #             xs,
+    #             s=18,
+    #             facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+    #             edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+    #             linewidths=0.75,
+    #             marker="o",
+    #             zorder=25,
+    #         )
+    #         ax.set_xlim(0, W)
+    #         ax.set_ylim(H, 0)
+
+    #     radial_dist = ((maxima_candidates_x - origin[0])**2 + (maxima_candidates_y - origin[1])**2)**(0.5)
+    #     origin_candidate_index = np.argmin(radial_dist) # use the first minima, if there are multiple
+    #     unique_ids[1,origin_candidate_index] = 1
+    #     unique_ids[4,origin_candidate_index] = 0
+
+    #     atoms_found_this_iteration = np.zeros(len(maxima_candidates))
+    #     atoms_found_prev_iteration = np.zeros(len(maxima_candidates))
+    #     atoms_found_previous_iterations = np.zeros(len(maxima_candidates), dtype = bool)
+    #     atoms_found_prev_iteration[origin_candidate_index] = 1
+    #     found_atoms_in_prev_iteration = True
+    #     iteration_while = 0
+    #     while found_atoms_in_prev_iteration is True:
+    #         for atom_index in range(len(maxima_candidates)):
+    #             if atoms_found_prev_iteration[atom_index] > 0:
+    #                 for pm in pm_arr:
+    #                     for uvw_index, lat_vec in enumerate(uvw_arr):
+    #                         position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
+    #                         position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
+    #                         radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+    #                         radial_dist[atom_index] = uvw_norm * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
+    #                         if (radial_dist < (uvw_norm * (tolerance_uvw - 1))).any():
+    #                             successful_candidate_index = np.argmin(radial_dist)
+    #                             if unique_ids[1, successful_candidate_index] == 0:
+    #                                 atoms_found_this_iteration[successful_candidate_index] += 1
+    #                                 unique_ids[1, successful_candidate_index] = 1
+    #                                 unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uvw_index == 0) + pm*int(uvw_index == 2)
+    #                                 unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uvw_index == 1) + w_sign*pm*int(uvw_index == 2)
+    #                                 unique_ids[4, successful_candidate_index] = 0
+    #         # check if any atom was somehow still found twice:
+    #         assert np.max(atoms_found_this_iteration) < 2
+    #         # check if any found atoms have the same uv index
+    #         if check_uv_duplication:
+    #             uv_pairs = unique_ids[1:5,:].T
+    #             unique_pairs, inverse, counts = np.unique(uv_pairs, axis=0, return_inverse=True, return_counts=True)
+    #             duplicate_groups = [np.where(inverse == k)[0] for k, c in enumerate(counts) if c > 1]
+    #             mask_atoms_found = atoms_found_this_iteration.astype(bool)
+    #             if len(duplicate_groups) != 0:
+    #                 for duplicate_group in duplicate_groups:
+    #                     duplicate_group = np.asarray(duplicate_group)
+    #                     duplicate_atoms_index_found_previous_iterations = duplicate_group[atoms_found_previous_iterations[duplicate_group]]
+    #                     if duplicate_atoms_index_found_previous_iterations.size > 1:
+    #                         if origin_candidate_index not in duplicate_group:
+    #                             raise ValueError("The duplicate atoms finding code is somehow bugged")
+    #                         else:
+    #                             kept_index = origin_candidate_index
+    #                     elif duplicate_atoms_index_found_previous_iterations.size == 1:
+    #                         kept_index = duplicate_atoms_index_found_previous_iterations
+    #                     else:
+    #                         kept_index = duplicate_group[mask_atoms_found[duplicate_group]][0]
+    #                     wipe_indicies = duplicate_group[duplicate_group != kept_index]
+    #                     unique_ids[1, wipe_indicies] = 2 # this signals to not accept for this maxima anymore (and flags this as a dulpicate)
+    #                     unique_ids[2:4,wipe_indicies] = 0
+    #                     unique_ids[4,wipe_indicies] = -1*(wipe_indicies+1)
+    #                     atoms_found_previous_iterations[wipe_indicies] = False
+    #                     mask_atoms_found[wipe_indicies] = False
+    #                     atoms_found_this_iteration[wipe_indicies] = 0
+    #         if np.sum(atoms_found_this_iteration) == 0:
+    #             found_atoms_in_prev_iteration = False
+    #             print('stopping search')
+            
+
+    #         atoms_found_previous_iterations |= atoms_found_this_iteration.astype(bool)
+
+    #         atoms_found_prev_iteration = atoms_found_this_iteration.copy()
+    #         atoms_found_this_iteration = np.zeros(len(maxima_candidates))
+    #         iteration_while += 1
+
+
+    #     if check_for_dislocations:
+    #         for atom_index in range(len(maxima_candidates)):
+    #             if unique_ids[1,atom_index] == 1:
+    #                 for pm in pm_arr:
+    #                     for uvw_index, lat_vec in enumerate(uvw_arr):
+    #                         position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
+    #                         position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
+    #                         radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+    #                         radial_dist[atom_index] = uvw_norm * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
+    #                         if (radial_dist < (uvw_norm * (tolerance_uvw - 1))).any():
+    #                             successful_candidate_index = np.argmin(radial_dist)
+    #                             if unique_ids[1, successful_candidate_index] == 2:
+    #                                 atoms_found_this_iteration[successful_candidate_index] += 1
+    #                                 unique_ids[1, successful_candidate_index] = 3 # for being found in dislocation search
+    #                                 unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uvw_index == 0) + pm*int(uvw_index == 2)
+    #                                 unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uvw_index == 1) - pm*int(uvw_index == 2)
+    #                                 unique_ids[4, successful_candidate_index] = 0
+    #         maxima_dislocation_x = maxima_candidates_x[unique_ids[1,:] == 3]
+    #         maxima_dislocation_y = maxima_candidates_y[unique_ids[1,:] == 3]
+    #         maxima_dislocation_u = unique_ids[2,unique_ids[1,:] == 3]
+    #         maxima_dislocation_v = unique_ids[3,unique_ids[1,:] == 3]
+    #         maxima_dislocation_intensity = maxima_candidates_intensity[unique_ids[1,:] == 3]
+
+    #         self.atoms_dislocation = Vector.from_shape(
+    #             shape=(self._num_sites),
+    #             fields=("x", "y", "a", "b", "int_peak"),
+    #             units=("px", "px", "ind", "ind", "counts"),
+    #         )
+
+    #         arr = np.vstack(
+    #             (maxima_dislocation_x, maxima_dislocation_y, maxima_dislocation_u, maxima_dislocation_v, maxima_dislocation_intensity)
+    #         ).T
+    #         self.atoms_dislocation.set_data(arr, 0)
+
+
+
+    #     maxima_accepted_x = maxima_candidates_x[unique_ids[1,:] == 1]
+    #     maxima_accepted_y = maxima_candidates_y[unique_ids[1,:] == 1]
+
+    #     maxima_accepted_u = unique_ids[2, unique_ids[1,:] == 1]
+    #     maxima_accepted_v = unique_ids[3, unique_ids[1,:] == 1]
+
+    #     maxima_accepted_intensity = maxima_candidates_intensity[unique_ids[1,:] == 1]
+
+    #     self.atoms = Vector.from_shape(
+    #         shape=(self._num_sites),
+    #         fields=("x", "y", "a", "b", "int_peak"),
+    #         units=("px", "px", "ind", "ind", "counts"),
+    #     )
+
+    #     if not merge_dislocation or not check_for_dislocations:
+    #         arr = np.vstack(
+    #             (maxima_accepted_x, maxima_accepted_y, maxima_accepted_u, maxima_accepted_v, maxima_accepted_intensity)
+    #         ).T
+    #         self.atoms.set_data(arr, 0)
+
+    #     if merge_dislocation and check_for_dislocations:
+
+    #         maxima_merge_x = maxima_candidates_x[np.isin(unique_ids[1, :], [1, 3])]
+    #         maxima_merge_y = maxima_candidates_y[np.isin(unique_ids[1, :], [1, 3])]
+
+    #         maxima_merge_u = unique_ids[2, np.isin(unique_ids[1, :], [1, 3])]
+    #         maxima_merge_v = unique_ids[3, np.isin(unique_ids[1, :], [1, 3])]
+
+    #         maxima_merge_intensity = maxima_candidates_intensity[np.isin(unique_ids[1, :], [1, 3])]
+    #         arr = np.vstack(
+    #             (maxima_merge_x, maxima_merge_y, maxima_merge_u, maxima_merge_v, maxima_merge_intensity)
+    #         ).T
+    #         self.atoms.set_data(arr, 0)
+
+
+    #     if plot_atoms:
+    #         fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
+    #         if ax.images:
+    #             ax.images[-1].set_zorder(0)
+    #         xs = maxima_accepted_x
+    #         ys = maxima_accepted_y
+    #         rgb = site_colors(int(self._numbers[0]))
+    #         ax.scatter(
+    #             ys,
+    #             xs,
+    #             s=18,
+    #             facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+    #             edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+    #             linewidths=0.75,
+    #             marker="o",
+    #             zorder=25,
+    #         )
+    #         ax.set_xlim(0, W)
+    #         ax.set_ylim(H, 0)
+
+    #     return self
+
+    # def atoms_first_uvw_bsites(
+    #     self,
+    #     origin = None,
+    #     u = None,
+    #     v = None,
+    #     positions_frac = None,
+    #     tolerance_uvw: float = 1.1,
+    #     w = None,
+    #     numbers=None,
+    #     edge_min_dist_px=None,
+    #     subpixel: str = "poly",
+    #     upsample_factor: int = 16,
+    #     sigma: float = 0,
+    #     minAbsoluteIntensity: float = 0,
+    #     minRelativeIntensity: float = 0,
+    #     relativeToPeak: float = 0,
+    #     minSpacing: float = 0,
+    #     edgeBoundary: int = 1,
+    #     maxNumPeaks: int = 5000,
+    #     plot_atoms=True,
+    #     input_mask=None,
+    #     refine_lattice=True,
+    #     refine_maxiter: int = 200,
+    #     intensity_radius = None,
+    #     intensity_min: float | None = None,
+    #     contrast_min=None,
+    #     annulus_radii = None,
+    #     check_uv_duplication = True,
+    #     check_for_dislocations = False,
+    #     merge_dislocation = False,
+    #     **kwargs,
+    # ):
+    #     self.check_for_dislocations = check_for_dislocations
+    #     # find all candidates above threshold
+    #     maxima_candidates = self.get_maxima_2D(
+    #         self.image.array, 
+    #         subpixel = subpixel,
+    #         upsample_factor = upsample_factor,
+    #         sigma = sigma,
+    #         minAbsoluteIntensity = minAbsoluteIntensity,
+    #         minRelativeIntensity = minRelativeIntensity,
+    #         relativeToPeak = relativeToPeak,
+    #         minSpacing = minSpacing,
+    #         edgeBoundary = edgeBoundary,
+    #         maxNumPeaks = maxNumPeaks,
+    #         )
+
+    #     H, W = self._image.shape  # x=rows, y=cols
+
+    #     if origin is None:
+    #         max_intensity_index = np.argmax(maxima_candidates[:]['intensity'])
+    #         origin_x = maxima_candidates[max_intensity_index]['x']
+    #         origin_y = maxima_candidates[max_intensity_index]['y']
+    #         origin = np.array([origin_x, origin_y])
+
+    #     if u is None or v is None:
+    #         num_peaks_search = 20
+    #         num_peaks_use = 2
+    #         center_ignore_buffer = 15
+    #         minSpacingPeaks = 5
+    #         uv_result_inv = self.auto_peak_finder(num_peaks_search = num_peaks_search, num_peaks_use = num_peaks_use, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
+
+    #         g_vector_1_c = np.array([uv_result_inv[0]['x'], uv_result_inv[0]['y']])
+    #         g_vector_2_c = np.array([uv_result_inv[1]['x'], uv_result_inv[1]['y']])
+    #         g_vec1 = np.zeros(2)
+    #         g_vec1[0] = ((g_vector_1_c[0] - (0.5*H))/H)
+    #         g_vec1[1] = ((g_vector_1_c[1] - (0.5*W))/W)
+    #         g_vec2 = np.zeros(2)
+    #         g_vec2[0] = ((g_vector_2_c[0] - (0.5*H))/H)
+    #         g_vec2[1] = ((g_vector_2_c[1] - (0.5*W))/W)
+    #         g_matrix = np.array([g_vec1, g_vec2])
+    #         a_matrix = np.linalg.inv(g_matrix)
+    #         a_transpose = a_matrix.T
+    #         u = np.array([a_transpose[0,0], a_transpose[0,1]])
+    #         v = np.array([a_transpose[1,0], a_transpose[1,1]])
+    #         self.u = u
+    #         self.v = v
+
+
+    #     if positions_frac is None:
+    #         positions_frac = np.atleast_2d(np.array((0,0))),
+
+    #     self._positions_frac = np.atleast_2d(np.array(positions_frac, dtype=float))
+    #     self._num_sites = self._positions_frac.shape[0]
+    #     self._numbers = (
+    #         np.arange(1, self._num_sites + 1, dtype=int)
+    #         if numbers is None
+    #         else np.atleast_1d(np.array(numbers, dtype=int))
+    #     )
+    #     if w is None:
+    #         if np.abs(np.rad2deg(np.arccos(np.dot(u, v)/(np.linalg.norm(u) * np.linalg.norm(v))))) > np.deg2rad(90):
+    #             w = np.asarray(u)+np.asarray(v)
+    #             w_sign = 1
+    #         else:
+    #             w = np.asarray(u)-np.asarray(v)
+    #             w_sign = -1
+    #     else:
+    #         w_sign = 1
+
+    #     self._lat = np.vstack(
+    #         (
+    #             np.array(origin),
+    #             np.array(u),
+    #             np.array(v),
+    #         )
+    #     )
+
+    #     im = np.asarray(self._image.array, dtype=float)
+    #     r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+    #     A = np.column_stack((u, v))
+
+    #     def _auto_radius_px() -> float:
+    #         S = self._positions_frac
+    #         if S.shape[0] >= 2:
+    #             d = S[:, None, :] - S[None, :, :]
+    #             d = d - np.round(d)
+    #             same = (np.abs(d[..., 0]) < 1e-12) & (np.abs(d[..., 1]) < 1e-12)
+    #             dpix = d @ A.T
+    #             dist = np.linalg.norm(dpix, axis=2)
+    #             dist[same] = np.inf
+    #             nn = float(np.min(dist))
+    #         else:
+    #             nn = float(np.min(np.linalg.norm(np.stack((u, v, u + v, u - v)), axis=1)))
+    #         if not np.isfinite(nn) or nn <= 0:
+    #             nn = max(1.0, 0.25 * (np.linalg.norm(u) + np.linalg.norm(v)))
+    #         return 0.5 * nn
+
+    #     r_px = float(intensity_radius) if intensity_radius is not None else _auto_radius_px()
+    #     rin, rout = (1.5 * r_px, 3.0 * r_px) if annulus_radii is None else annulus_radii
+    #     R_disk = int(np.ceil(r_px))
+    #     R_ring = int(np.ceil(rout))
+
+    #     def mean_disk(x: float, y: float) -> float:
+    #         ix0, iy0 = int(np.floor(x)), int(np.floor(y))
+    #         i0, i1 = max(0, ix0 - R_disk), min(H - 1, ix0 + R_disk)
+    #         j0, j1 = max(0, iy0 - R_disk), min(W - 1, iy0 + R_disk)
+    #         ii = np.arange(i0, i1 + 1)[:, None]
+    #         jj = np.arange(j0, j1 + 1)[None, :]
+    #         dx, dy = ii - x, jj - y
+    #         mask_circle = (dx * dx + dy * dy) <= (r_px * r_px)
+    #         vals = im[i0 : i1 + 1, j0 : j1 + 1][mask_circle]
+    #         if vals.size == 0:
+    #             return float(im[np.clip(round(x), 0, H - 1), np.clip(round(y), 0, W - 1)])
+    #         return float(vals.mean())
+
+    #     def mean_std_annulus(x: float, y: float) -> tuple[float, float]:
+    #         ix0, iy0 = int(np.floor(x)), int(np.floor(y))
+    #         i0, i1 = max(0, ix0 - R_ring), min(H - 1, ix0 + R_ring)
+    #         j0, j1 = max(0, iy0 - R_ring), min(W - 1, iy0 + R_ring)
+    #         ii = np.arange(i0, i1 + 1)[:, None]
+    #         jj = np.arange(j0, j1 + 1)[None, :]
+    #         dx, dy = ii - x, jj - y
+    #         r2 = dx * dx + dy * dy
+    #         mask_ring = (r2 >= rin * rin) & (r2 <= rout * rout)
+    #         vals = im[i0 : i1 + 1, j0 : j1 + 1][mask_ring]
+    #         if vals.size == 0:
+    #             val = float(im[np.clip(round(x), 0, H - 1), np.clip(round(y), 0, W - 1)])
+    #             return val, 0.0
+    #         return float(vals.mean()), float(vals.std(ddof=0))
+
+    #     # mask of where in real space maxima can occur
+    #     H, W = self._image.shape  # x=rows, y=cols
+    #     edge_thresh = float(edge_min_dist_px) if edge_min_dist_px is not None else 0.0
+
+    #     DT = None
+    #     if input_mask is not None:
+    #         m = np.asarray(input_mask).astype(bool)
+    #         if m.shape != (H, W):
+    #             raise ValueError(f"mask shape {m.shape} must match image shape {(H, W)}")
+    #         try:
+    #             from scipy.ndimage import distance_transform_edt
+
+    #             DT = distance_transform_edt(m)
+    #         except Exception:
+    #             DT = None
+
+    #     # find the maxima closest to the origin:
+    #     maxima_candidates_x = maxima_candidates[:]['x']
+    #     maxima_candidates_y = maxima_candidates[:]['y']
+
+    #     pm_arr = np.array([-1,0,1])
+    #     u_norm = np.linalg.norm(u)
+    #     v_norm = np.linalg.norm(v)
+    #     w_norm = np.linalg.norm(w)
+    #     uvw_arr = np.array([np.asarray(u),np.asarray(v),np.asarray(w)])
+    #     uvw_norm = 0.5 * (u_norm + v_norm + w_norm)
+    #     self.uv_norm = uvw_norm
+    #     self.uv_arr = uvw_arr
+    #     self.tolerance_uv = tolerance_uvw
+    #     x = maxima_candidates_x
+    #     y = maxima_candidates_y
+
+    #     in_bounds = (x >= 0.0) & (x <= H - 1) & (y >= 0.0) & (y <= W - 1)
+    #     border_ok = (
+    #         (x - edge_thresh >= 0.0)
+    #         & (x + edge_thresh <= H - 1)
+    #         & (y - edge_thresh >= 0.0)
+    #         & (y + edge_thresh <= W - 1)
+    #     )
+    #     if input_mask is not None:
+    #         if DT is not None:
+    #             ii = np.clip(np.round(x).astype(int), 0, H - 1)
+    #             jj = np.clip(np.round(y).astype(int), 0, W - 1)
+    #             mask_ok = DT[ii, jj] >= edge_thresh
+    #         else:
+    #             m = np.asarray(input_mask).astype(bool)
+    #             mask_ok = m[
+    #                 np.clip(np.round(x).astype(int), 0, H - 1),
+    #                 np.clip(np.round(y).astype(int), 0, W - 1),
+    #             ]
+    #     else:
+    #         mask_ok = np.ones_like(in_bounds, dtype=bool)
+
+    #     int_center = np.empty(x.shape[0], dtype=float)
+    #     for i in range(x.shape[0]):
+    #         int_center[i] = mean_disk(x[i], y[i])
+
+    #     keep = in_bounds & border_ok & mask_ok
+    #     if intensity_min is not None:
+    #         keep &= int_center >= float(intensity_min)
+    #     if contrast_min is not None:
+    #         bg_mean = np.empty(x.shape[0], dtype=float)
+    #         for i in range(x.shape[0]):
+    #             bg_mean[i], _ = mean_std_annulus(x[i], y[i])
+    #         keep &= (int_center - bg_mean) >= float(contrast_min)
+
+    #     if np.any(keep):
+    #         maxima_candidates = maxima_candidates[keep]
+    #     else:
+    #         raise ValueError("Zero maxima candidates kept")
+
+    #     # find the maxima closest to the origin:
+    #     maxima_candidates_x = maxima_candidates[:]['x']
+    #     maxima_candidates_y = maxima_candidates[:]['y']
+    #     maxima_candidates_intensity = maxima_candidates[:]['intensity']
+
+    #     # the unique ids array is an array of the original index, candidacy, a (of a * u), and b (of b * v), and c (of c * w)
+    #     unique_ids = np.zeros([5, len(maxima_candidates)])
+    #     unique_ids[0,:] = np.arange(0,len(maxima_candidates))
+    #     unique_ids[-1,:] = -1*np.arange(1,1+len(maxima_candidates))
+
+    #     if plot_atoms:
+    #         fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
+    #         if ax.images:
+    #             ax.images[-1].set_zorder(0)
+    #         xs = maxima_candidates_x
+    #         ys = maxima_candidates_y
+    #         rgb = site_colors(int(self._numbers[0]))
+    #         ax.scatter(
+    #             ys,
+    #             xs,
+    #             s=18,
+    #             facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+    #             edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+    #             linewidths=0.75,
+    #             marker="o",
+    #             zorder=25,
+    #         )
+    #         ax.set_xlim(0, W)
+    #         ax.set_ylim(H, 0)
+
+    #     radial_dist = ((maxima_candidates_x - origin[0])**2 + (maxima_candidates_y - origin[1])**2)**(0.5)
+    #     origin_candidate_index = np.argmin(radial_dist) # use the first minima, if there are multiple
+    #     unique_ids[1,origin_candidate_index] = 1
+    #     unique_ids[4,origin_candidate_index] = 0
+
+    #     atoms_found_this_iteration = np.zeros(len(maxima_candidates))
+    #     atoms_found_prev_iteration = np.zeros(len(maxima_candidates))
+    #     atoms_found_previous_iterations = np.zeros(len(maxima_candidates), dtype = bool)
+    #     atoms_found_prev_iteration[origin_candidate_index] = 1
+    #     found_atoms_in_prev_iteration = True
+    #     iteration_while = 0
+    #     while found_atoms_in_prev_iteration is True:
+    #         for atom_index in range(len(maxima_candidates)):
+    #             if atoms_found_prev_iteration[atom_index] > 0:
+    #                 for pm in pm_arr:
+    #                     for uvw_index, lat_vec in enumerate(uvw_arr):
+    #                         position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
+    #                         position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
+    #                         radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+    #                         radial_dist[atom_index] = uvw_norm * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
+    #                         if (radial_dist < (uvw_norm * (tolerance_uvw - 1))).any():
+    #                             successful_candidate_index = np.argmin(radial_dist)
+    #                             if unique_ids[1, successful_candidate_index] == 0:
+    #                                 atoms_found_this_iteration[successful_candidate_index] += 1
+    #                                 unique_ids[1, successful_candidate_index] = 1
+    #                                 unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uvw_index == 0) + pm*int(uvw_index == 2)
+    #                                 unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uvw_index == 1) + w_sign*pm*int(uvw_index == 2)
+    #                                 unique_ids[4, successful_candidate_index] = 0
+    #         # check if any atom was somehow still found twice:
+    #         assert np.max(atoms_found_this_iteration) < 2
+    #         # check if any found atoms have the same uv index
+    #         if check_uv_duplication:
+    #             uv_pairs = unique_ids[1:5,:].T
+    #             unique_pairs, inverse, counts = np.unique(uv_pairs, axis=0, return_inverse=True, return_counts=True)
+    #             duplicate_groups = [np.where(inverse == k)[0] for k, c in enumerate(counts) if c > 1]
+    #             mask_atoms_found = atoms_found_this_iteration.astype(bool)
+    #             if len(duplicate_groups) != 0:
+    #                 for duplicate_group in duplicate_groups:
+    #                     duplicate_group = np.asarray(duplicate_group)
+    #                     duplicate_atoms_index_found_previous_iterations = duplicate_group[atoms_found_previous_iterations[duplicate_group]]
+    #                     if duplicate_atoms_index_found_previous_iterations.size > 1:
+    #                         if origin_candidate_index not in duplicate_group:
+    #                             raise ValueError("The duplicate atoms finding code is somehow bugged")
+    #                         else:
+    #                             kept_index = origin_candidate_index
+    #                     elif duplicate_atoms_index_found_previous_iterations.size == 1:
+    #                         kept_index = duplicate_atoms_index_found_previous_iterations
+    #                     else:
+    #                         kept_index = duplicate_group[mask_atoms_found[duplicate_group]][0]
+    #                     wipe_indicies = duplicate_group[duplicate_group != kept_index]
+    #                     unique_ids[1, wipe_indicies] = 2 # this signals to not accept for this maxima anymore (and flags this as a dulpicate)
+    #                     unique_ids[2:4,wipe_indicies] = 0
+    #                     unique_ids[4,wipe_indicies] = -1*(wipe_indicies+1)
+    #                     atoms_found_previous_iterations[wipe_indicies] = False
+    #                     mask_atoms_found[wipe_indicies] = False
+    #                     atoms_found_this_iteration[wipe_indicies] = 0
+    #         if np.sum(atoms_found_this_iteration) == 0:
+    #             found_atoms_in_prev_iteration = False
+    #             print('stopping search')
+            
+
+    #         atoms_found_previous_iterations |= atoms_found_this_iteration.astype(bool)
+
+    #         atoms_found_prev_iteration = atoms_found_this_iteration.copy()
+    #         atoms_found_this_iteration = np.zeros(len(maxima_candidates))
+    #         iteration_while += 1
+
+
+    #     if check_for_dislocations:
+    #         for atom_index in range(len(maxima_candidates)):
+    #             if unique_ids[1,atom_index] == 1:
+    #                 for pm in pm_arr:
+    #                     for uvw_index, lat_vec in enumerate(uvw_arr):
+    #                         position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
+    #                         position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
+    #                         radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
+    #                         radial_dist[atom_index] = uvw_norm * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
+    #                         if (radial_dist < (uvw_norm * (tolerance_uvw - 1))).any():
+    #                             successful_candidate_index = np.argmin(radial_dist)
+    #                             if unique_ids[1, successful_candidate_index] == 2:
+    #                                 atoms_found_this_iteration[successful_candidate_index] += 1
+    #                                 unique_ids[1, successful_candidate_index] = 3 # for being found in dislocation search
+    #                                 unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uvw_index == 0) + pm*int(uvw_index == 2)
+    #                                 unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uvw_index == 1) - pm*int(uvw_index == 2)
+    #                                 unique_ids[4, successful_candidate_index] = 0
+    #         maxima_dislocation_x = maxima_candidates_x[unique_ids[1,:] == 3]
+    #         maxima_dislocation_y = maxima_candidates_y[unique_ids[1,:] == 3]
+    #         maxima_dislocation_u = unique_ids[2,unique_ids[1,:] == 3]
+    #         maxima_dislocation_v = unique_ids[3,unique_ids[1,:] == 3]
+    #         maxima_dislocation_intensity = maxima_candidates_intensity[unique_ids[1,:] == 3]
+
+    #         self.atoms_dislocation = Vector.from_shape(
+    #             shape=(self._num_sites),
+    #             fields=("x", "y", "a", "b", "int_peak"),
+    #             units=("px", "px", "ind", "ind", "counts"),
+    #         )
+
+    #         arr = np.vstack(
+    #             (maxima_dislocation_x, maxima_dislocation_y, maxima_dislocation_u, maxima_dislocation_v, maxima_dislocation_intensity)
+    #         ).T
+    #         self.atoms_dislocation.set_data(arr, 0)
+
+
+
+    #     maxima_accepted_x = maxima_candidates_x[unique_ids[1,:] == 1]
+    #     maxima_accepted_y = maxima_candidates_y[unique_ids[1,:] == 1]
+
+    #     maxima_accepted_u = unique_ids[2, unique_ids[1,:] == 1]
+    #     maxima_accepted_v = unique_ids[3, unique_ids[1,:] == 1]
+
+    #     maxima_accepted_intensity = maxima_candidates_intensity[unique_ids[1,:] == 1]
+
+    #     self.atoms = Vector.from_shape(
+    #         shape=(self._num_sites),
+    #         fields=("x", "y", "a", "b", "int_peak"),
+    #         units=("px", "px", "ind", "ind", "counts"),
+    #     )
+
+    #     if not merge_dislocation or not check_for_dislocations:
+    #         arr = np.vstack(
+    #             (maxima_accepted_x, maxima_accepted_y, maxima_accepted_u, maxima_accepted_v, maxima_accepted_intensity)
+    #         ).T
+    #         self.atoms.set_data(arr, 0)
+
+    #     if merge_dislocation and check_for_dislocations:
+
+    #         maxima_merge_x = maxima_candidates_x[np.isin(unique_ids[1, :], [1, 3])]
+    #         maxima_merge_y = maxima_candidates_y[np.isin(unique_ids[1, :], [1, 3])]
+
+    #         maxima_merge_u = unique_ids[2, np.isin(unique_ids[1, :], [1, 3])]
+    #         maxima_merge_v = unique_ids[3, np.isin(unique_ids[1, :], [1, 3])]
+
+    #         maxima_merge_intensity = maxima_candidates_intensity[np.isin(unique_ids[1, :], [1, 3])]
+    #         arr = np.vstack(
+    #             (maxima_merge_x, maxima_merge_y, maxima_merge_u, maxima_merge_v, maxima_merge_intensity)
+    #         ).T
+    #         self.atoms.set_data(arr, 0)
+
+
+    #     if plot_atoms:
+    #         fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
+    #         if ax.images:
+    #             ax.images[-1].set_zorder(0)
+    #         xs = maxima_accepted_x
+    #         ys = maxima_accepted_y
+    #         rgb = site_colors(int(self._numbers[0]))
+    #         ax.scatter(
+    #             ys,
+    #             xs,
+    #             s=18,
+    #             facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+    #             edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+    #             linewidths=0.75,
+    #             marker="o",
+    #             zorder=25,
+    #         )
+    #         ax.set_xlim(0, W)
+    #         ax.set_ylim(H, 0)
+
+    #     return self
