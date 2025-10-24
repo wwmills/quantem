@@ -2411,6 +2411,8 @@ class Lattice(AutoSerialize):
         self,
         neighborhood_units = 2,
     ):
+        
+        self.neighborhood_units = neighborhood_units
         for a0 in range(self._num_sites):
             atoms_arr = self.atoms.get_data(a0)
             a_x = atoms_arr[:,0]
@@ -2436,6 +2438,8 @@ class Lattice(AutoSerialize):
         self,
         neighborhood_units = 2,
     ):
+        
+        self.neighborhood_units = neighborhood_units
         for a0 in range(1):
             atoms_arr = self.atoms.get_data(a0)
             a_x = atoms_arr[:,0]
@@ -2463,6 +2467,7 @@ class Lattice(AutoSerialize):
             neighborhood_units = 2,
         ):
 
+        self.neighborhood_units = neighborhood_units
         a_x_b = self.atoms.get_data(1)[:,0]
         a_x_a = self.atoms.get_data(0)[:,0]
         atom_neighbor_list_b = []
@@ -2504,6 +2509,8 @@ class Lattice(AutoSerialize):
         return self
 
 
+
+
     def plot_neighbors(
         self,
         centers = None,
@@ -2532,6 +2539,7 @@ class Lattice(AutoSerialize):
         neighborhood_units = 2,
         return_delta = False,
     ):
+        self.neighborhood_units = neighborhood_units
         self.neighborhood(neighborhood_units = neighborhood_units)
         for a0 in range(self._num_sites):
             a_x = self.atoms[0]["x"]
@@ -2547,6 +2555,42 @@ class Lattice(AutoSerialize):
             return delta_intensity, self.num_neighbors
         else:
             return self
+
+
+    def neighborhood_b_circular_distance(
+            self,
+            circular_radius_cutoff = None,
+    ):
+        
+
+        a_x_b = self.atoms.get_data(1)[:,0]
+        a_y_b = self.atoms.get_data(1)[:,1]
+        a_x_a = self.atoms.get_data(0)[:,0]
+        a_y_a = self.atoms.get_data(0)[:,1]
+
+
+
+        if circular_radius_cutoff == None:
+            lattice_spacing = self.uv_norm * np.linalg.norm(self._positions_frac[1]) * 0.9
+            circular_radius_cutoff = lattice_spacing * self.neighborhood_units
+
+        for atom_b_index in range(a_x_b.shape[0]):
+            b_neighbor_x = a_x_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)]
+            b_neighbor_y = a_y_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)]
+            a_neighbor_x = a_x_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
+            a_neighbor_y = a_y_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
+            b_x = a_x_b[atom_b_index]
+            b_y = a_y_b[atom_b_index]
+            radial_dist_b = np.sqrt((b_neighbor_x - b_x)**2 +(b_neighbor_y - b_y)**2)
+            radial_dist_a = np.sqrt((a_neighbor_x - b_x)**2 +(a_neighbor_y - b_y)**2)
+            mask = radial_dist_b < circular_radius_cutoff
+            self.atom_neighbor_layer_arr_b[atom_b_index] = self.atom_neighbor_layer_arr_b[atom_b_index][mask]
+            mask = radial_dist_a < circular_radius_cutoff
+            self.atom_neighbor_layer_arr_a[atom_b_index] = self.atom_neighbor_layer_arr_a[atom_b_index][mask]
+
+        return self
+
+
 
 
     def gauss_2D_rot(
@@ -3068,6 +3112,10 @@ class Lattice(AutoSerialize):
 
 
         self.atoms.set_data(updated, 1)
+
+
+
+
 
 
 
