@@ -691,7 +691,7 @@ class Lattice(AutoSerialize):
 
                 r2 = (II - x0) ** 2 + (JJ - y0) ** 2
                 mask = r2 <= (r_fit * r_fit) # why not just square this with **? Or square root instead of r2
-                if not np.any(mask): # this doesn't do anything...
+                if not np.any(mask):
                     continue
 
                 vals = patch[mask].astype(float).ravel()
@@ -2550,6 +2550,7 @@ class Lattice(AutoSerialize):
 
 
     def gauss_2D_rot(
+            self,
             x,
             y,
             xc,
@@ -2575,26 +2576,498 @@ class Lattice(AutoSerialize):
         return gaussian_2d
 
 
-    # def local_fitting_subtraction(
-    #         self,
-    # ):
-    #     a_x_b = self.atoms.get_data(1)[:,0]
-    #     a_y_b = self.atoms.get_data(1)[:,1]
+    def local_fitting_subtraction(
+        self,
+        fit_radius=None,
+        max_nfev: int = 200,
+        max_move_px: float | None = None,
+        plot_atoms: bool = False,
+    ):
 
-    #     a_x_a = self.atoms.get_data(0)[:,0]
-    #     a_y_a = self.atoms.get_data(0)[:,1]
+        im = np.asarray(self._image.array, dtype=float)
+        H, W = self._image.shape
+        r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+        A = np.column_stack((u, v))
 
-    #     for atom_b_index in range(a_x_b):
-    #         b_neighbor_x = a_x_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)]
-    #         b_neighbor_y = a_y_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)]
+        def _auto_radius_px() -> float:
+            S = np.asarray(getattr(self, "_positions_frac", [[0.0, 0.0]]), dtype=float)
+            if S.shape[0] >= 2:
+                d = S[:, None, :] - S[None, :, :]
+                d = d - np.round(d)
+                same = (np.abs(d[..., 0]) < 1e-12) & (np.abs(d[..., 1]) < 1e-12)
+                dpix = d @ A.T
+                dist = np.linalg.norm(dpix, axis=2)
+                dist[same] = np.inf
+                nn = float(np.min(dist))
+            else:
+                nn = float(np.min(np.linalg.norm(np.stack((u, v, u + v, u - v)), axis=1)))
+            if not np.isfinite(nn) or nn <= 0:
+                nn = max(1.0, 0.25 * (np.linalg.norm(u) + np.linalg.norm(v)))
+            return 0.5 * nn
 
-    #         a_neighbor_x = a_x_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
-    #         a_neighbor_y = a_y_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
+        r_fit = float(fit_radius) if fit_radius is not None else _auto_radius_px()
+        R = int(np.ceil(r_fit))
+        max_move = float(max_move_px) if max_move_px is not None else r_fit
 
-    #         for a_neighbor in range(a_neighbor_x.shape[0]):
+        # Ensure extra fields exist
+        needed = [f for f in ("sigma", "int_bg") if f not in self.atoms.fields]
+        if needed:
+            self.atoms.add_fields(needed)
+
+        # Single lookup of column indices for writing
+        idx_x = self.atoms.fields.index("x")
+        idx_y = self.atoms.fields.index("y")
+        idx_amp = self.atoms.fields.index("int_peak")
+        idx_sigma = self.atoms.fields.index("sigma")
+        idx_bg = self.atoms.fields.index("int_bg")
+
+        a_x_b = self.atoms.get_data(1)[:,0]
+        a_y_b = self.atoms.get_data(1)[:,1]
+        a_s_b = self.atoms[1]['sigma']
+        a_ip_b = self.atoms[1]['int_peak']
+
+        a_x_a = self.atoms.get_data(0)[:,0]
+        a_y_a = self.atoms.get_data(0)[:,1]
+        a_s_a = self.atoms[0]['sigma']
+        a_ip_a = self.atoms[0]['int_peak']
+
+        H, W = self._image.shape
+        window_pix = 10
+
+        row = self.atoms.get_data(1)
+        updated = row.copy()
+
+        for atom_b_index in range(a_x_b.shape[0]):
+            b_neighbor_x = a_x_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)]
+            b_neighbor_y = a_y_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)]
+            b_neighbor_s = a_s_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)]
+            b_neighbor_ip = a_ip_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)]
+
+            a_neighbor_x = a_x_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
+            a_neighbor_y = a_y_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
+            a_neighbor_s = a_s_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
+            a_neighbor_ip = a_ip_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
+
+            window_fit_x_max = np.ceil(np.max(np.concatenate([a_neighbor_x, b_neighbor_x])) + window_pix).astype(int)
+            window_fit_x_min =np.floor(np.min(np.concatenate([a_neighbor_x, b_neighbor_x])) - window_pix).astype(int)
+            window_fit_y_max = np.ceil(np.max(np.concatenate([a_neighbor_y, b_neighbor_y])) + window_pix).astype(int)
+            window_fit_y_min = np.floor(np.min(np.concatenate([a_neighbor_y, b_neighbor_y])) - window_pix).astype(int)
+
+            window_fit_x_max = min(window_fit_x_max, H)
+            window_fit_x_min = max(window_fit_x_min, 0)
+            window_fit_y_max = min(window_fit_y_max, W)
+            window_fit_y_min = max(window_fit_y_min, 0)
+
+            x = np.arange(window_fit_x_min, window_fit_x_max)
+            y = np.arange(window_fit_y_min, window_fit_y_max)
+            xx, yy = np.meshgrid(x, y, indexing = 'ij')
+            sub_window = self._image.array[window_fit_x_min:window_fit_x_max,window_fit_y_min:window_fit_y_max].copy()
+            if plot_atoms:
+                sub_window_before = sub_window.copy()
+
+            for a_neighbor_index in range(a_neighbor_x.shape[0]):
+                sub_window -= self.gauss_2D_rot(
+                    xx,
+                    yy,
+                    a_neighbor_x[a_neighbor_index],
+                    a_neighbor_y[a_neighbor_index],
+                    a_neighbor_s[a_neighbor_index],
+                    a_neighbor_s[a_neighbor_index],
+                    a_neighbor_ip[a_neighbor_index],
+                    0,
+                    0,
+                    )
+            for b_neighbor_index in range(b_neighbor_x.shape[0]):
+                if self.atom_neighbor_layer_arr_b[atom_b_index][b_neighbor_index] != atom_b_index:
+                    sub_window -= self.gauss_2D_rot(
+                        xx,
+                        yy,
+                        b_neighbor_x[b_neighbor_index],
+                        b_neighbor_y[b_neighbor_index],
+                        b_neighbor_s[b_neighbor_index],
+                        b_neighbor_s[b_neighbor_index],
+                        b_neighbor_ip[b_neighbor_index],
+                        0,
+                        0,
+                        )
+                # since refine atoms already exists, going to start this without doing any additional refinement of the A site gaussians.
+                # so calculate the gaussians, subtratct them, and decide what to do about background
+
+            x0, y0 = float(a_x_b[atom_b_index]), float(a_y_b[atom_b_index])
+
+            ix0, iy0 = int(np.floor(x0)), int(np.floor(y0))
+            i0, i1 = max(0, ix0 - R), min(H - 1, ix0 + R)
+            j0, j1 = max(0, iy0 - R), min(W - 1, iy0 + R)
+            if i1 <= i0 or j1 <= j0:
+                continue
+
+            patch = im[i0 : i1 + 1, j0 : j1 + 1]
+
+            # broadcast coordinate grids to patch shape
+            ii = np.arange(i0, i1 + 1)[:, None]
+            jj = np.arange(j0, j1 + 1)[None, :]
+            II = np.broadcast_to(ii, patch.shape)
+            JJ = np.broadcast_to(jj, patch.shape)
+
+            r2 = (II - x0) ** 2 + (JJ - y0) ** 2
+            mask = r2 <= (r_fit * r_fit) # why not just square this with **? Or square root instead of r2
+            if not np.any(mask):
+                continue
+
+            vals = patch[mask].astype(float).ravel()
+            pmin, pmax = float(vals.min()), float(vals.max())
+            bg0 = float(np.median(patch[~mask])) if np.any(~mask) else float(np.median(patch))
+            amp0 = max(float(im[np.clip(ix0, 0, H - 1), np.clip(iy0, 0, W - 1)] - bg0), 1e-6)
+            sig0 = max(r_fit * 0.5, 0.5)
+
+            x_coords = II[mask].astype(float).ravel()
+            y_coords = JJ[mask].astype(float).ravel()
+
+            def residual(theta):
+                x_c, y_c, amp, sig, bg = theta
+                sig2 = max(sig, 1e-6) ** 2
+                rr = (x_coords - x_c) ** 2 + (y_coords - y_c) ** 2
+                model = amp * np.exp(-0.5 * rr / sig2) + bg
+                return model - vals
+
+            # movement-limited bounds + image bounds
+            x_lb = max(x0 - max_move, 0.0)
+            x_ub = min(x0 + max_move, H - 1.0)
+            y_lb = max(y0 - max_move, 0.0)
+            y_ub = min(y0 + max_move, W - 1.0)
+
+            lb = [x_lb, y_lb, 0.0, 0.25, pmin - (pmax - pmin)]
+            ub = [
+                x_ub,
+                y_ub,
+                max(pmax - pmin, amp0 * 4.0),
+                max(2.0 * r_fit, 1.0),
+                pmax + (pmax - pmin),
+            ]
+            theta0 = [x0, y0, amp0, sig0, bg0]
+
+            res = least_squares(
+                residual,
+                theta0,
+                bounds=(lb, ub),
+                method="trf",
+                loss="soft_l1",
+                max_nfev=int(max_nfev),
+                xtol=1e-6,
+                ftol=1e-6,
+                gtol=1e-6,
+            )
+
+            x_c, y_c, amp, sig, bg = res.x
+            updated[atom_b_index, idx_x] = x_c
+            updated[atom_b_index, idx_y] = y_c
+            updated[atom_b_index, idx_amp] = amp
+            updated[atom_b_index, idx_sigma] = sig
+            updated[atom_b_index, idx_bg] = bg
+            if plot_atoms:
+                if atom_b_index < 2:
+                    plt.figure()
+                    plt.subplot(121)
+                    plt.imshow(sub_window_before)
+                    plt.axis('off')
+                    plt.subplot(122)
+                    plt.imshow(sub_window)
+                    plt.axis('off')
+
+        # plot the difference in values
+        # intensity, xc, yc, sigmas
+        delta_int = a_ip_b - updated[:,idx_amp]
+        delta_xc = a_x_b - updated[:,idx_x]
+        delta_yc = a_y_b - updated[:,idx_y]
+        delta_sig = a_s_b - updated[:,idx_sigma]
+
+        # plt.figure(figsize = (10,10))
+        # plt.subplot(221)
+        # plt.imshow(self._image.array, cmap = 'gray')
+        # plt.scatter(updated[:,idx_y], updated[:,idx_x], c = delta_xc, s = 40, alpha = 0.5, cmap = 'magma_r')
+        # plt.title('Delta X Center')
+        # plt.axis('off')
+        # plt.subplot(222)
+        # plt.imshow(self._image.array, cmap = 'gray')
+        # plt.scatter(updated[:,idx_y], updated[:,idx_x], c = delta_yc, s = 40, alpha = 0.5, cmap = 'magma_r')
+        # plt.title('Delta Y Center')
+        # plt.axis('off')
+        # plt.subplot(223)
+        # plt.imshow(self._image.array, cmap = 'gray')
+        # plt.scatter(updated[:,idx_y], updated[:,idx_x], c = delta_int, s = 40, alpha = 0.5, cmap = 'magma_r')
+        # plt.title('Delta Intensity')
+        # plt.axis('off')
+        # plt.subplot(224)
+        # plt.imshow(self._image.array, cmap = 'gray')
+        # plt.scatter(updated[:,idx_y], updated[:,idx_x], c = delta_sig, s = 40, alpha = 0.5, cmap = 'magma_r')
+        # plt.title('Delta Sigma')
+        # plt.axis('off')
+        # plt.tight_layout()
 
 
+        s_plot = 40
+        alpha_plot = 0.7
+        cmap_plot = 'magma'
 
+        fig = plt.figure(figsize=(10, 10))
+
+        ax1 = plt.subplot(221)
+        ax1.imshow(self._image.array, cmap='gray')
+        sc1 = ax1.scatter(updated[:, idx_y], updated[:, idx_x], c=delta_xc,
+                        s=s_plot, alpha=alpha_plot, cmap=cmap_plot)
+        ax1.set_title('Delta X Center')
+        ax1.axis('off')
+        fig.colorbar(sc1, ax=ax1, fraction=0.046, pad=0.04)
+
+        ax2 = plt.subplot(222)
+        ax2.imshow(self._image.array, cmap='gray')
+        sc2 = ax2.scatter(updated[:, idx_y], updated[:, idx_x], c=delta_yc,
+                        s=s_plot, alpha=alpha_plot, cmap=cmap_plot)
+        ax2.set_title('Delta Y Center')
+        ax2.axis('off')
+        fig.colorbar(sc2, ax=ax2, fraction=0.046, pad=0.04)
+
+        ax3 = plt.subplot(223)
+        ax3.imshow(self._image.array, cmap='gray')
+        sc3 = ax3.scatter(updated[:, idx_y], updated[:, idx_x], c=delta_int,
+                        s=s_plot, alpha=alpha_plot, cmap=cmap_plot)
+        ax3.set_title('Delta Intensity')
+        ax3.axis('off')
+        fig.colorbar(sc3, ax=ax3, fraction=0.046, pad=0.04)
+
+        ax4 = plt.subplot(224)
+        ax4.imshow(self._image.array, cmap='gray')
+        sc4 = ax4.scatter(updated[:, idx_y], updated[:, idx_x], c=delta_sig,
+                        s=s_plot, alpha=alpha_plot, cmap=cmap_plot)
+        ax4.set_title('Delta Sigma')
+        ax4.axis('off')
+        fig.colorbar(sc4, ax=ax4, fraction=0.046, pad=0.04)
+
+        plt.tight_layout()
+
+        self.atoms.set_data(updated, 1)
+        return self
+
+    def local_fitting_subtraction_1(
+        self,
+        atom_b_index,
+        fit_radius=None,
+        max_nfev: int = 200,
+        max_move_px: float | None = None,
+        plot_atoms: bool = False,
+    ):
+
+        im = np.asarray(self._image.array, dtype=float)
+        H, W = self._image.shape
+        r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+        A = np.column_stack((u, v))
+
+        def _auto_radius_px() -> float:
+            S = np.asarray(getattr(self, "_positions_frac", [[0.0, 0.0]]), dtype=float)
+            if S.shape[0] >= 2:
+                d = S[:, None, :] - S[None, :, :]
+                d = d - np.round(d)
+                same = (np.abs(d[..., 0]) < 1e-12) & (np.abs(d[..., 1]) < 1e-12)
+                dpix = d @ A.T
+                dist = np.linalg.norm(dpix, axis=2)
+                dist[same] = np.inf
+                nn = float(np.min(dist))
+            else:
+                nn = float(np.min(np.linalg.norm(np.stack((u, v, u + v, u - v)), axis=1)))
+            if not np.isfinite(nn) or nn <= 0:
+                nn = max(1.0, 0.25 * (np.linalg.norm(u) + np.linalg.norm(v)))
+            return 0.5 * nn
+
+        r_fit = float(fit_radius) if fit_radius is not None else _auto_radius_px()
+        R = int(np.ceil(r_fit))
+        max_move = float(max_move_px) if max_move_px is not None else r_fit
+
+        # Ensure extra fields exist
+        needed = [f for f in ("sigma", "int_bg") if f not in self.atoms.fields]
+        if needed:
+            self.atoms.add_fields(needed)
+
+        a_x_b = self.atoms.get_data(1)[:,0]
+        a_y_b = self.atoms.get_data(1)[:,1]
+        a_s_b = self.atoms[1]['sigma']
+        a_ip_b = self.atoms[1]['int_peak']
+        a_ib_b = self.atoms[1]['int_bg']
+
+        a_x_a = self.atoms.get_data(0)[:,0]
+        a_y_a = self.atoms.get_data(0)[:,1]
+        a_s_a = self.atoms[0]['sigma']
+        a_ip_a = self.atoms[0]['int_peak']
+        a_ib_a = self.atoms[0]['int_bg']
+
+        H, W = self._image.shape
+        window_pix = 10
+
+        b_neighbor_x = a_x_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)]
+        b_neighbor_y = a_y_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)]
+        b_neighbor_s = a_s_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)]
+        b_neighbor_ip = a_ip_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)]
+
+        a_neighbor_x = a_x_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
+        a_neighbor_y = a_y_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
+        a_neighbor_s = a_s_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
+        a_neighbor_ip = a_ip_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
+
+        window_fit_x_max = np.ceil(np.max(np.concatenate([a_neighbor_x, b_neighbor_x])) + window_pix).astype(int)
+        window_fit_x_min = np.floor(np.min(np.concatenate([a_neighbor_x, b_neighbor_x])) - window_pix).astype(int)
+        window_fit_y_max = np.ceil(np.max(np.concatenate([a_neighbor_y, b_neighbor_y])) + window_pix).astype(int)
+        window_fit_y_min = np.floor(np.min(np.concatenate([a_neighbor_y, b_neighbor_y])) - window_pix).astype(int)
+
+        window_fit_x_max = min(window_fit_x_max, H)
+        window_fit_x_min = max(window_fit_x_min, 0)
+        window_fit_y_max = min(window_fit_y_max, W)
+        window_fit_y_min = max(window_fit_y_min, 0)
+
+        x = np.arange(window_fit_x_min, window_fit_x_max)
+        y = np.arange(window_fit_y_min, window_fit_y_max)
+        xx, yy = np.meshgrid(x, y, indexing = 'ij')
+        sub_window = self._image.array[window_fit_x_min:window_fit_x_max,window_fit_y_min:window_fit_y_max].copy()
+        if plot_atoms:
+            sub_window_before = sub_window.copy()
+        for a_neighbor_index in range(a_neighbor_x.shape[0]):
+            sub_window -= self.gauss_2D_rot(
+                xx,
+                yy,
+                a_neighbor_x[a_neighbor_index],
+                a_neighbor_y[a_neighbor_index],
+                a_neighbor_s[a_neighbor_index],
+                a_neighbor_s[a_neighbor_index],
+                a_neighbor_ip[a_neighbor_index],
+                0,
+                0,
+                )
+        for b_neighbor_index in range(b_neighbor_x.shape[0]):
+            if self.atom_neighbor_layer_arr_b[atom_b_index][b_neighbor_index] != atom_b_index:
+                sub_window -= self.gauss_2D_rot(
+                    xx,
+                    yy,
+                    b_neighbor_x[b_neighbor_index],
+                    b_neighbor_y[b_neighbor_index],
+                    b_neighbor_s[b_neighbor_index],
+                    b_neighbor_s[b_neighbor_index],
+                    b_neighbor_ip[b_neighbor_index],
+                    0,
+                    0,
+                    )
+                # since refine atoms already exists, going to start this without doing any additional refinement of the A site gaussians.
+                # so calculate the gaussians, subtratct them, and decide what to do about background
+
+        x0, y0 = float(a_x_b[atom_b_index]), float(a_y_b[atom_b_index])
+
+        ix0, iy0 = int(np.floor(x0)), int(np.floor(y0))
+        i0, i1 = max(0, ix0 - R), min(H - 1, ix0 + R)
+        j0, j1 = max(0, iy0 - R), min(W - 1, iy0 + R)
+        if i1 <= i0 or j1 <= j0: # this doesn't do anything
+            return a_x_b[atom_b_index], a_y_b[atom_b_index], a_ip_b[atom_b_index], a_s_b[atom_b_index], a_ib_b[atom_b_index]
+
+
+        patch = im[i0 : i1 + 1, j0 : j1 + 1]
+
+        # broadcast coordinate grids to patch shape
+        ii = np.arange(i0, i1 + 1)[:, None]
+        jj = np.arange(j0, j1 + 1)[None, :]
+        II = np.broadcast_to(ii, patch.shape)
+        JJ = np.broadcast_to(jj, patch.shape)
+
+        r2 = (II - x0) ** 2 + (JJ - y0) ** 2
+        mask = r2 <= (r_fit * r_fit) # why not just square this with **? Or square root instead of r2
+        if not np.any(mask):
+            return a_x_b[atom_b_index], a_y_b[atom_b_index], a_ip_b[atom_b_index], a_s_b[atom_b_index], a_ib_b[atom_b_index]
+
+        vals = patch[mask].astype(float).ravel()
+        pmin, pmax = float(vals.min()), float(vals.max())
+        bg0 = float(np.median(patch[~mask])) if np.any(~mask) else float(np.median(patch))
+        amp0 = max(float(im[np.clip(ix0, 0, H - 1), np.clip(iy0, 0, W - 1)] - bg0), 1e-6)
+        sig0 = max(r_fit * 0.5, 0.5)
+
+        x_coords = II[mask].astype(float).ravel()
+        y_coords = JJ[mask].astype(float).ravel()
+
+        def residual(theta):
+            x_c, y_c, amp, sig, bg = theta
+            sig2 = max(sig, 1e-6) ** 2
+            rr = (x_coords - x_c) ** 2 + (y_coords - y_c) ** 2
+            model = amp * np.exp(-0.5 * rr / sig2) + bg
+            return model - vals
+
+        # movement-limited bounds + image bounds
+        x_lb = max(x0 - max_move, 0.0)
+        x_ub = min(x0 + max_move, H - 1.0)
+        y_lb = max(y0 - max_move, 0.0)
+        y_ub = min(y0 + max_move, W - 1.0)
+
+        lb = [x_lb, y_lb, 0.0, 0.25, pmin - (pmax - pmin)]
+        ub = [
+            x_ub,
+            y_ub,
+            max(pmax - pmin, amp0 * 4.0),
+            max(2.0 * r_fit, 1.0),
+            pmax + (pmax - pmin),
+        ]
+        theta0 = [x0, y0, amp0, sig0, bg0]
+
+        res = least_squares(
+            residual,
+            theta0,
+            bounds=(lb, ub),
+            method="trf",
+            loss="soft_l1",
+            max_nfev=int(max_nfev),
+            xtol=1e-6,
+            ftol=1e-6,
+            gtol=1e-6,
+        )
+
+        if plot_atoms:
+            plt.figure()
+            plt.subplot(121)
+            plt.imshow(sub_window_before)
+            plt.axis('off')
+            plt.subplot(122)
+            plt.imshow(sub_window)
+            plt.axis('off')
+
+        x_c, y_c, amp, sig, bg = res.x
+        return x_c, y_c, amp, sig, bg
+
+
+    def local_fitting_subtraction_loop(
+            self,
+            fit_radius,
+            max_move_px,
+            max_nfev,
+    ):
+        
+
+        # Single lookup of column indices for writing
+        idx_x = self.atoms.fields.index("x")
+        idx_y = self.atoms.fields.index("y")
+        idx_amp = self.atoms.fields.index("int_peak")
+        idx_sigma = self.atoms.fields.index("sigma")
+        idx_bg = self.atoms.fields.index("int_bg")
+
+        row = self.atoms.get_data(1)
+        updated = row.copy()
+
+        for atom_b_index in range(row.shape[0]):
+            x_c, y_c, amp, sig, bg = self.local_fitting_subtraction_1(
+                atom_b_index,
+                fit_radius,
+                max_move_px,
+                max_nfev,
+                )
+            updated[atom_b_index, idx_x] = x_c
+            updated[atom_b_index, idx_y] = y_c
+            updated[atom_b_index, idx_amp] = amp
+            updated[atom_b_index, idx_sigma] = sig
+            updated[atom_b_index, idx_bg] = bg
+
+
+        self.atoms.set_data(updated, 1)
 
 
 
