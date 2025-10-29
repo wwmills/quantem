@@ -2509,6 +2509,56 @@ class Lattice(AutoSerialize):
         return self
 
 
+    # for this, the number of A site neighbors will be good probably
+    def find_neighbors_in_tolerance(
+            self,
+            tolerance = None,
+    ):
+        if not hasattr(self, 'uv_norm'):
+            self.uv_norm = np.mean(np.linalg.norm(self._lat[1:], axis = 1))
+        if tolerance is None:
+            tolerance = self.uv_norm * 1.1
+        num_sites = len(self._positions_frac)
+        a_x = self.atoms.get_data(0)[:,0]
+        a_y = self.atoms.get_data(0)[:,1]
+        count_a_neighbors = np.zeros([num_sites, 2*a_x.shape[0]])
+        for site_index in range(num_sites):
+            a_x_n = self.atoms.get_data(site_index)[:,0]
+            a_y_n = self.atoms.get_data(site_index)[:,1]
+            for atom_index in range(a_x_n.shape[0]):
+                a_x_i = a_x_n[atom_index]
+                a_y_i = a_y_n[atom_index]
+                a_x_ai = a_x - a_x_i
+                a_y_ai = a_y - a_y_i
+                radial_dist = np.sqrt(a_x_ai**2 + a_y_ai**2)
+                if site_index == 0:
+                    radial_dist[atom_index] = tolerance * 2 # make sure that self is outside of range
+                count_a_neighbors[site_index, atom_index] = np.sum(radial_dist < tolerance)
+        self.count_a_neighbors = count_a_neighbors
+        return self
+
+
+    def remove_atoms_with_too_few_neighbors(
+            self,
+            min_neighbors = None,
+            return_removed = False,
+    ):
+        if min_neighbors is None:
+            min_neighbors = 2
+
+        num_sites = len(self._positions_frac)
+        removed = []
+        for site_index in range(num_sites):
+            site_data = self.atoms.get_data(site_index)
+            keep_mask = self.count_a_neighbors[site_index, :site_data.shape[0]] >= min_neighbors
+            print(keep_mask[keep_mask == 0])
+            updated = site_data[keep_mask]
+            removed.append(site_data[~keep_mask])
+            self.atoms.set_data(updated, site_index)
+        if return_removed:
+            return removed
+        return self
+        
 
 
     def plot_neighbors(
@@ -2561,14 +2611,11 @@ class Lattice(AutoSerialize):
             self,
             circular_radius_cutoff = None,
     ):
-        
 
         a_x_b = self.atoms.get_data(1)[:,0]
         a_y_b = self.atoms.get_data(1)[:,1]
         a_x_a = self.atoms.get_data(0)[:,0]
         a_y_a = self.atoms.get_data(0)[:,1]
-
-
 
         if circular_radius_cutoff == None:
             lattice_spacing = self.uv_norm * np.linalg.norm(self._positions_frac[1]) * 0.9
