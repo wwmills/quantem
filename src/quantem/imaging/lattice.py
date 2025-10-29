@@ -4376,6 +4376,247 @@ def site_colors(number: int) -> tuple[float, float, float]:
 
 
 
+class SimData(AutoSerialize):
+    """
+    Generating atomic resolution data for ML identification of sites.
+    """
+
+    _token = object()
+
+    def __init__(
+        self,
+        atom_coordinates: Dataset2d,
+        _token: object | None = None,
+    ):
+        if _token is not self._token:
+            raise RuntimeError("Use SimData.from_data() to instantiate this class.")
+        self._atom_coordinates: Dataset2d = atom_coordinates
+
+    # --- Constructors ---
+    @classmethod
+    def from_coordinates(
+        cls,
+        atom_coordinates: Union[list[NDArray], NDArray],
+        H : int | None = None,
+        W : int | None = None,
+    ) -> "SimData":
+        if isinstance(atom_coordinates, list[NDArray]):
+            num_sites = len(atom_coordinates)
+            for site_index in range(num_sites):
+                atom_coordinates[site_index] = ensure_valid_array(atom_coordinates[site_index], ndim = 2)
+        if isinstance(atom_coordinates, NDArray):
+            atom_coordinates = ensure_valid_array(atom_coordinates, ndim = 2)
+        return cls(atom_coordinates = atom_coordinates, _token = cls._token)
+
+    # --- Properties ---
+    @property
+    def atom_coordinates(self) -> Union[list[NDArray], NDArray]:
+        return self._atom_coordinates
+
+    # @atom_coordinates.setter
+    # def atom_coordinates(self, value: Union[list[NDArray], NDArray]):
+    #     if isinstance(value, Dataset2d):
+    #         self._image = value
+    #     else:
+    #         arr = ensure_valid_array(value, ndim=2)
+    #         if hasattr(Dataset2d, "from_array") and callable(getattr(Dataset2d, "from_array")):
+    #             self._image = Dataset2d.from_array(arr)  # type: ignore[attr-defined]
+    #         else:
+    #             self._image = Dataset2d(arr)  # type: ignore[call-arg]
+
+    def generate_mask_2D(array, p_s=60.0, sparsity=0.20):
+        import numpy as np
+
+        arrayShape = array.shape
+        x = np.fft.fftfreq(arrayShape[0])
+        y = np.fft.fftfreq(arrayShape[1])
+
+        X, Y = np.meshgrid(y, x, indexing = 'ij')
+        kr = np.sqrt(X**2 + Y**2)
+
+        f_in = np.ones(arrayShape).flatten()
+
+        # Create shape
+        A = np.exp(-p_s * kr) # Generate amplitude
+        phase = np.random.randn(arrayShape[0], arrayShape[1]) # Generate phase
+        F = A * np.exp(2 * np.pi * 1j * phase) # Combine amplitude and phase
+        f = np.fft.ifftn(F) # Inverse FFT
+        f_shape = np.absolute(f)
+
+        # Impose sparsity (% of non-zero voxels)
+        f_shape = np.argsort(f_shape, axis=None) # Sort the shape image
+        f_shape = f_shape.flatten()
+        # Number of zero voxels
+        N_zero = int(np.round((array.size * (1 - sparsity))))
+        f_shape[N_zero:] = f_shape[N_zero]
+        f_in[f_shape] = 0
+
+        f_in = f_in / np.amax(f_in) # Normalize image
+        np.copyto(array, f_in.reshape(arrayShape)) # Update array
+
+
+    # a way to call the lattice class within this class
+    def generate_coordinates(
+            self,
+            H,
+            W,
+            u = np.array([16,0]),
+            v = None,
+            theta_v = np.pi/3, 
+            p_s = 400,
+            sparsity = 0.9,
+            plot_atoms = False,
+            min_neighbors = 3,
+    ):
+        im = np.ones([H, W]) # dummy image array
+        im = Dataset2d.from_array(im)
+        lattice = Lattice.from_data(
+            image=im,
+            normalize_min = False,
+            )
+        mask_ = np.zeros([H,W])
+        self.generate_mask_2D(mask_, p_s = p_s, sparsity = sparsity)
+
+        theta = np.random.rand(1) * np.pi * 2
+        rotation_matrix = np.array([[np.cos(theta), -np.sin(theta)],[np.sin(theta), np.cos(theta)]])
+
+        u = np.array([16,0])
+        u = u@rotation_matrix.T
+        theta = np.pi/3
+        rotation_matrix = np.array([[np.cos(theta), -np.sin(theta)],[np.sin(theta), np.cos(theta)]])
+        v = u@rotation_matrix.T
+        origin = np.array([0,0])
+
+        lattice.define_lattice(
+        origin,
+        u,
+        v,
+        plot_lattice=False,
+        input_mask=mask_,
+        refine_lattice=False,
+        )
+        positions_frac = [np.array([0,0]), np.array([1/3,1/3]), np.array([-1/3,-1/3])]#,  np.array([0,0.5])]
+        lattice.add_atoms(
+            positions_frac,
+            numbers=None,
+            intensity_min=None,
+            intensity_radius=None,
+            plot_atoms=False,
+            edge_min_dist_px = 1,
+            mask=mask_,
+            contrast_min=None,
+            annulus_radii=None,
+        )
+
+        a_x_a = lattice.atoms.get_data(0)[:,0]
+        a_y_a = lattice.atoms.get_data(0)[:,1]
+        a_x_b = lattice.atoms.get_data(1)[:,0]
+        a_y_b = lattice.atoms.get_data(1)[:,1]
+        a_x_c = lattice.atoms.get_data(2)[:,0]
+        a_y_c = lattice.atoms.get_data(2)[:,1]
+
+        if plot_atoms:
+            fig, ax = plt.subplots(1, 3, figsize=(10, 5))  # 1 row, 2 columns
+
+            # --- Before filtering ---
+            label_list = ['a', 'b']
+            a_x_a = lattice.atoms.get_data(0)[:, 0]
+            a_y_a = lattice.atoms.get_data(0)[:, 1]
+            a_x_b = lattice.atoms.get_data(1)[:, 0]
+            a_y_b = lattice.atoms.get_data(1)[:, 1]
+            a_x_c = lattice.atoms.get_data(2)[:, 0]
+            a_y_c = lattice.atoms.get_data(2)[:, 1]
+
+            ax[0].scatter(a_y_a, -a_x_a, color='red', s=10, alpha=0.5, label = 'a')
+            ax[0].scatter(a_y_b, -a_x_b, s=10, alpha=0.5, label = 'b')
+            ax[0].scatter(a_y_c, -a_x_c, color='green', s=10, alpha=0.5, label = 'c')
+            ax[0].legend()
+            ax[0].set_title("Before filtering")
+            ax[0].set_box_aspect(1)
+
+        # --- Apply tolerance ---
+        # should this be run more than once?
+        lattice.find_neighbors_in_tolerance()
+        removed_atoms = lattice.remove_atoms_with_too_few_neighbors(min_neighbors = 3, return_removed = True)
+
+        a_x_a = lattice.atoms.get_data(0)[:, 0]
+        a_y_a = lattice.atoms.get_data(0)[:, 1]
+        a_x_b = lattice.atoms.get_data(1)[:, 0]
+        a_y_b = lattice.atoms.get_data(1)[:, 1]
+        a_x_c = lattice.atoms.get_data(2)[:, 0]
+        a_y_c = lattice.atoms.get_data(2)[:, 1]
+
+            # --- After removing atoms ---
+            ax[1].scatter(a_y_a, -a_x_a,  color='red', s=10, alpha=0.5, label = 'a')
+            ax[1].scatter(a_y_b, -a_x_b, s=10, alpha=0.5, label = 'b')
+            ax[1].scatter(a_y_c, -a_x_c, color='green', s=10, alpha=0.5, label = 'c')
+            color_list = ['#fc03db' ,'#fc7f03', '#03ecfc']
+            for site_index in range(3):
+                if removed_atoms[site_index] is not None:
+                    a_x_n = removed_atoms[site_index][:,0]
+                    a_y_n = removed_atoms[site_index][:,1]
+                    ax[1].scatter(a_y_n, -a_x_n, s = 20, alpha = 0.5, color = color_list[site_index], label = str(site_index))
+            ax[1].legend()
+            ax[1].set_title("After filtering")
+            ax[1].set_box_aspect(1)
+
+            ax[2].scatter(a_y_a, -a_x_a, color='red', s=10, alpha=0.5, label = 'a')
+            ax[2].scatter(a_y_b, -a_x_b, s=10, alpha=0.5, label = 'b')
+            ax[2].scatter(a_y_c, -a_x_c, color='green', s=10, alpha=0.5, label = 'c')
+            ax[2].legend()
+            ax[2].set_title("After filtering")
+            ax[2].set_box_aspect(1)
+
+
+            plt.tight_layout()
+            plt.show()
+
+    def add_sites_to_image(
+            self,
+            H = None,
+            W = None,
+    ):
+        
+        # Automatically set the number of pixels needed
+        # sometimes this may be overkill if one coordinate is slightly over the edge of one atom
+        if H is None and W is not None: 
+            H = W
+        if W is None and H is not None: 
+            W = H
+        if H is None:
+            default_size_arr_pow = np.arange(0,15)
+            default_size_arr_px = 2**default_size_arr_pow
+            # find x max
+            num_sites = len(self._atom_coordinates)
+            max_x = -1
+            for site_index in range(num_sites):
+                max_x = max(max_x, np.max(self._atom_coordinates[site_index][:,0]))
+            argmin_num_px = np.argmin(np.abs(default_size_arr_px - max_x))
+            px_count_t = default_size_arr_px[argmin_num_px]
+            if px_count_t - max_x < 0:
+                argmin_num_px += 1
+            H = default_size_arr_px[argmin_num_px]
+        if W is None:
+            default_size_arr_pow = np.arange(0,15)
+            default_size_arr_px = 2**default_size_arr_pow
+            # find x max
+            num_sites = len(self._atom_coordinates)
+            max_y = -1
+            for site_index in range(num_sites):
+                max_y = max(max_y, np.max(self._atom_coordinates[site_index][:,1]))
+            argmin_num_px = np.argmin(np.abs(default_size_arr_px - max_y))
+            px_count_t = default_size_arr_px[argmin_num_px]
+            if px_count_t - max_y < 0:
+                argmin_num_px += 1
+            W = default_size_arr_px[argmin_num_px]
+
+        
+        mask_ = np.zeros([H,W])
+        generate_mask_2D(mask_, p_s = 400, sparsity = 0.9)
+
+
+
+    
 
 ####
 
