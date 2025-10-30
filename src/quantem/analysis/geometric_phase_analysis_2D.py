@@ -554,7 +554,8 @@ class geometric_phase_analysis_2D(AutoSerialize):
         gaussianMask: bool = True,
         useHamming: bool = False,
         showResult: bool = True,
-        amplitude_mask_result: bool = True,
+        amplitude_mask_result: bool = False,
+        threshold_mask: float = 0.4,
         ):
 
         for a0 in range(self.shape[0]):
@@ -570,12 +571,13 @@ class geometric_phase_analysis_2D(AutoSerialize):
             self.phase_containers = self.phase_container_containers[self.global_image_index]
             for peak_index in range(len(self.phase_containers)):
                 self.calculate_phase_map(
-                    peak_index,
-                    self.mask_size,
-                    gaussianMask,
-                    useHamming,
-                    showResult,
-                    amplitude_mask_result
+                    peakIndex=peak_index,
+                    inputMaskSize=self.mask_size,
+                    gaussianMask=gaussianMask,
+                    useHamming=useHamming,
+                    showResult=showResult,
+                    amplitude_mask_result=amplitude_mask_result,
+                    threshold_mask = threshold_mask,
                     )
         self.calculated_phase = True
         return self
@@ -587,8 +589,9 @@ class geometric_phase_analysis_2D(AutoSerialize):
         gaussianMask: bool = True,
         useHamming: bool = False,
         showResult: bool = True,
-        amplitude_mask_result: bool = True,
+        amplitude_mask_result: bool = False,
         refine: bool = False,
+        threshold_mask: float = 0.4,
         ):
         """
         Calculate the geometric phase for a single Bragg peak.
@@ -643,7 +646,15 @@ class geometric_phase_analysis_2D(AutoSerialize):
 
         if showResult:
             if amplitude_mask_result:
-                im_pha_gp = self.phase_im_lab(np.angle(G_matrix) * np.abs(G_matrix))
+                def normalize_arr(array):
+                    array-=np.min(array)
+                    array /= np.max(array)
+                    return array
+                amplitude_mask = np.abs(G_matrix)
+                amplitude_map_norm = normalize_arr(amplitude_mask)
+                amplitude_map_norm[amplitude_map_norm < threshold_mask] = 0
+                amplitude_map_norm[amplitude_map_norm > 0] = 1
+                im_pha_gp = self.phase_im_lab(np.angle(G_matrix) * amplitude_map_norm)
             else:
                 im_pha_gp = self.phase_im_lab(np.angle(G_matrix))
             imFFT = fftshift(fft2(self.images[self.global_image_index].array*shift_phase))
@@ -927,7 +938,8 @@ class geometric_phase_analysis_2D(AutoSerialize):
     def calculate_strain_map(
        self,
        num_peaks = 2,
-       amplitude_mask_result = True, 
+       amplitude_mask_result = False, 
+       threshold_mask: float = 0.4,
        show_result = True,
        use_phase_directly = True,
     ):
@@ -938,8 +950,10 @@ class geometric_phase_analysis_2D(AutoSerialize):
             self.calculate_phase_maps(
                 inputMaskSizes,
                 gaussianMask = True,
-                showResult = True,
-                amplitude_mask_result = True)
+                showResult = show_result,
+                amplitude_mask_result = amplitude_mask_result, 
+                threshold_mask = threshold_mask,
+                )
         if use_phase_directly:
             for a0 in range(self.shape[0]):
                 self.global_image_index = a0
@@ -948,13 +962,16 @@ class geometric_phase_analysis_2D(AutoSerialize):
                     num_peaks,
                     amplitude_mask_result, 
                     showResult = show_result,
+                    threshold_mask = threshold_mask,
                 )
         else:
             if not self.calculated_displacement:
                 self.calculate_displacement_maps(
                     num_peaks = num_peaks,
-                    showResult = True,
-                    amplitude_mask_result = True)
+                    showResult = show_result,
+                    amplitude_mask_result = amplitude_mask_result,
+                    threshold_mask = threshold_mask,
+                    )
             for a0 in range(self.shape[0]):
                 self.global_image_index = a0
                 self.phase_containers = self.phase_container_containers[self.global_image_index]
@@ -1136,7 +1153,8 @@ class geometric_phase_analysis_2D(AutoSerialize):
         useGaussMask,
         show_result,
         mask_size,
-        amplitude_mask_result,
+        amplitude_mask_result = False,
+        threshold_mask: float = 0.4,
     ):
         if mask_size is None and self.mask_size is not None:
             mask_size = self.mask_size
@@ -1148,7 +1166,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
         for peak_index in range(len(self.phase_containers)):
             phase = self.phase_containers[peak_index].phase_map
             peak = self.phase_containers[peak_index].phase_map
-            peakRefined, phaseRefined = self.refine_phase(phase, peak, peak_index, refMatrix, mask_size, iterations, useGaussMask, show_result, amplitude_mask_result)
+            peakRefined, phaseRefined = self.refine_phase(phase, peak, peak_index, refMatrix, mask_size, iterations, useGaussMask, show_result, amplitude_mask_result, threshold_mask=threshold_mask)
             self.phase_containers[peak_index].phase_refined = phaseRefined
             self.phase_containers[peak_index].peak_refined = peakRefined
         return self
@@ -1262,8 +1280,9 @@ class geometric_phase_analysis_2D(AutoSerialize):
         maskSize: float,
         iterations: int,
         useGaussMask: bool,
-        amplitude_mask_result,
+        amplitude_mask_result = False,
         showResult: bool = True,
+        threshold_mask: float = 0.4,
         ):
         """
         Refine the geometric phase according to the user-defined reference (ideal) region of the crystal.
@@ -1307,12 +1326,20 @@ class geometric_phase_analysis_2D(AutoSerialize):
             peakCoordinatesRefined_dtype = np.zeros(1, dtype=self.dtype)
             peakCoordinatesRefined_dtype["x"] = peakCoordinatesRefined[0]
             peakCoordinatesRefined_dtype["y"] = peakCoordinatesRefined[1]
-            self.calculate_phase_map(peak_index,gaussianMask=useGaussMask,inputMaskSize=maskSize,showResult=False, amplitude_mask_result = True, refine = True)
+            self.calculate_phase_map(peak_index,gaussianMask=useGaussMask,inputMaskSize=maskSize,showResult=False, amplitude_mask_result = False, refine = True)
             phaseMapRefined = self.phase_containers[peak_index].refined_phase_map
             amplitudeMapRefined = self.phase_containers[peak_index].refined_amplitude_map
 
         if showResult:
             if amplitude_mask_result:
+                def normalize_arr(array):
+                    array-=np.min(array)
+                    array /= np.max(array)
+                    return array
+                amplitude_map_norm = normalize_arr(amplitudeMapRefined)
+                amplitude_map_norm[amplitude_map_norm < threshold_mask] = 0
+                amplitude_map_norm[amplitude_map_norm > 0] = 1
+
                 im_pha_gp = self.phase_im_lab(phaseMapRefined*amplitudeMapRefined)
             else:
                 im_pha_gp = self.phase_im_lab(phaseMapRefined)
