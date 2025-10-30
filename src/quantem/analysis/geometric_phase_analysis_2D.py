@@ -1,20 +1,27 @@
 from typing import Literal
-
+from typing import List, Optional, Union
+from collections.abc import Sequence
 import numpy as np
 from tqdm import trange
+from numpy.typing import NDArray
+
 
 from quantem.core import config
 from quantem.core.datastructures import Dataset
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.datastructures.dataset2d import Dataset2d
+from quantem.core.datastructures.dataset3d import Dataset3d
 from scipy.fftpack import fft, fftshift, ifftshift, ifft, fft2, ifft2
 from skimage import restoration as skr
 from scipy.optimize import curve_fit
 from skimage.color import lab2rgb
 from scipy import ndimage as scnd
-import numba
 from scipy.ndimage import gaussian_filter
-
+from quantem.core.utils.compound_validators import (
+    validate_list_of_dataset2d,
+    validate_pad_value,
+)
+from quantem.core.visualization import show_2d
 if config.get("has_cupy"):
     import cupy as cp
 else:
@@ -64,45 +71,134 @@ class geometric_phase_analysis_2D(AutoSerialize):
     This can be used to retrieve atomic displacements and strain maps.
     """
 
+    _token = object()
+
+
     def __init__(
         self,
-        image: Dataset2d,
-        device: Literal["cpu", "gpu"] = "cpu",
+        images: List[Dataset2d],
+        _token: object | None = None, ####
     ):
         """
         Parameters
         ----------
         image: (nx, ny) np.ndarray
             A 2D image in real space.
-        device: string
-            The device to use, either cpu or gpu. The default is cpu
 
         """
-        # self.xp = cp if device == "gpu" else np
-        self.image = np.asarray(image)
-        self.device = device
-        [self.nx, self.ny] = self.image.shape
-        self.imFFT = fftshift(fft2(self.image))
-        self.dtype = np.dtype([("x", float), ("y", float), ("intensity", float)]) # the py4DSTEM data type for real space data, extended to 3D
+        if _token is not self._token:
+            raise RuntimeError(
+                "Use geometric_phase_analysis_2D.from_data() or .from_file() to instantiate this class."
+            )
 
-    def get_FFT(
+        self._images = images
+        self.dtype = np.dtype([("x", float), ("y", float), ("intensity", float)])
+        self._FFT = []
+        for a0 in range(len(self.images)):
+            self._FFT.append(Dataset2d.from_array(
+            fftshift(fft2(self.images[a0].array)),
+            name="fourier transform",
+            ))
+        self.global_image_index = 0
+        self.calculated_phase = False
+        self.calculated_displacement = False
+
+
+    @classmethod
+    def from_file(
+        cls,
+        file_paths: Sequence[str],
+        file_type: str | None = None,
+    ) -> "geometric_phase_analysis_2D":
+        image_list = [Dataset2d.from_file(fp, file_type=file_type) for fp in file_paths]
+        return cls.from_data(
+            image_list,
+        )
+
+    @classmethod
+    def from_data(
+        cls,
+        images: Union[List[Dataset2d], List[NDArray], Dataset3d, NDArray],
+    ) -> "geometric_phase_analysis_2D":
+        if isinstance(images, np.ndarray):
+            images = [images]
+        validated_images = validate_list_of_dataset2d(images)
+        return cls(
+            images=validated_images,
+            _token=cls._token,
+        )
+
+    # --- Properties ---
+    @property
+    def images(self) -> List[Dataset2d]:
+        return self._images
+
+    @images.setter
+    def images(self, value: Union[List[Dataset2d], List[NDArray], Dataset3d, NDArray]):
+        self._images = validate_list_of_dataset2d(value)
+        self.pad_value = self.pad_value
+
+    @property
+    def pad_value(self) -> List[float]:
+        return self._pad_value
+
+    @pad_value.setter
+    def pad_value(self, value: Union[float, str, List[float]]):
+        self._pad_value = validate_pad_value(value, self.images)
+
+    @property
+    def pad_fraction(self) -> float:
+        return self._pad_fraction
+
+    @pad_fraction.setter
+    def pad_fraction(self, value: float):
+        self._pad_fraction = float(value)
+
+    @property
+    def FFT(self) -> List[Dataset2d]:
+        return self._FFT
+
+    @FFT.setter
+    def FFT(self, value: List[Dataset2d]):
+        self._FFT = value
+
+
+        
+    def preprocess(
         self,
-    ):
-        """
-        Returns the FFT of the input dataset.
+        pad_fraction: float = 0.25,
+        pad_value: Union[float, str, List[float]] = "median",
+        show_images: bool = False,
+        **kwargs,
+        ):
+        self.pad_fraction = pad_fraction
+        validated_pad_value = validate_pad_value(pad_value, self._images)
+        self._pad_value = validated_pad_value
+        # self.pad_value = pad_value
+        self.shape = (
+            len(self._images),
+            int(np.round(self.images[0].shape[0] * (1 + self.pad_fraction) / 2) * 2),
+            int(np.round(self.images[0].shape[1] * (1 + self.pad_fraction) / 2) * 2),
+        )
+        self.mask_size = None
+        self.defined_peaks = np.zeros(self.shape[0], dtype = bool) # set to true when the peaks have been set
+        if show_images:
+            self.plot_original_image(
+                title=[f"Image {i}: initial" for i in range(self.shape[0])],
+                **kwargs,
+            )
+        return self
 
-        Returns
-        -------
-        self.imFFT: (nx, ny) np.ndarray, complex
-            The FFT of the input data.
-        """
-        return self.imFFT
-    
-
+    def plot_original_image(self, **kwargs):
+        fig, ax = show_2d(
+            list(self.images[a0].array for a0 in range(len(self.images))),
+            **kwargs,
+        )
 
     def fourier_filter(
         self, 
-        data: np.ndarray, 
+        data: np.ndarray,
+        image_index: int = 0,
         threshold: int = 1,
         show_plot: bool = False,
     ):
@@ -123,29 +219,44 @@ class geometric_phase_analysis_2D(AutoSerialize):
         self.fourier_mask * data: (nx, ny) np.ndarray
             The input data multiplied by a binary mask.
         """
-        if data.shape != self.image.shape:
+        if data.shape != self.images[image_index].shape:
             print("Input shape does not match that of original image")
             return 0
-        xx,yy = np.meshgrid(np.arange(self.nx),np.arange(self.ny), indexing = 'ij')
-        dkx = 1/(self.nx); dky = 1/(self.ny)
+        nx, ny = self.images[image_index].shape
+        xx,yy = np.meshgrid(np.arange(nx),np.arange(ny), indexing = 'ij')
+        dkx = 1/(nx); dky = 1/(ny)
 
-        center = np.array(self.imFFT.shape)/2
+        center = np.array(self.images[image_index].shape)/2
         mask_size = 10
         gaussCoords = ((xx - center[0])**2 + (yy - center[1])**2) / mask_size**2
         del xx, yy
         mask = np.exp( -0.5 * gaussCoords, dtype=np.float32 )
         del gaussCoords
-        self.fourier_mask = np.abs((ifft2(self.imFFT*mask)))*100
+        self.fourier_mask = np.abs((ifft2(self._FFT*mask)))*100
         self.fourier_mask[self.fourier_mask<threshold] = 0
         self.fourier_mask[self.fourier_mask>0] = 1
         if show_plot:
-            plt.figure(figsize = (5,10))
-            plt.subplot(121)
-            plt.imshow(self.fourier_mask, origin = 'upper'); plt.axis('off')
-            plt.subplot(122)
-            plt.imshow(self.fourier_mask * data, origin = 'upper'); plt.axis('off')        
-        return self.fourier_mask * data
+            show_2d(
+                [self.fourier_mask,
+                self.fourier_mask * data,
+                ],
+                title =
+                ["Mask",
+                "Masked Data"],
+            )
+        shape_mask: tuple[int, int] = (nx, ny)
+        self.masked_data = Dataset2d.from_shape(shape_mask)
+        self.masked_data = self.fourier_mask * data
+        return self
 
+    def plot_masked_images(self, **kwargs):
+        """
+        Plot the current transformed images, with knot overlays.
+        """
+        fig, ax = show_2d(
+            self.masked_data.array,
+            **kwargs,
+        )
 
     def phase_im_lab(
         self,
@@ -199,7 +310,8 @@ class geometric_phase_analysis_2D(AutoSerialize):
 
     def precise_peak_location(
         self,
-        peakCoordinates: np.dtype([("x", float), ("y", float), ("intensity", float)]), 
+        peakCoordinates: np.dtype([("x", float), ("y", float), ("intensity", float)]),
+        image_index: int = 0, 
         subImageHalfLength: int = 20,
         ):
         """
@@ -220,7 +332,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
 
         decimal_x = peakCoordinates['x'] - int(peakCoordinates['x'])
         decimal_y = peakCoordinates['y'] - int(peakCoordinates['y'])
-        subIm = np.abs(self.imFFT)[int(peakCoordinates['x']-subImageHalfLength):int(peakCoordinates['x']+subImageHalfLength), 
+        subIm = np.abs(self._FFT[image_index])[int(peakCoordinates['x']-subImageHalfLength):int(peakCoordinates['x']+subImageHalfLength), 
                                                     int(peakCoordinates['y']-subImageHalfLength):int(peakCoordinates['y']+subImageHalfLength)]
         GaussianFit = self.fit_diffraction_center(subIm)
         peakCoordinatesPrecise = np.zeros(1, dtype=self.dtype)
@@ -318,13 +430,165 @@ class geometric_phase_analysis_2D(AutoSerialize):
             
         return popt
 
-    def calculate_phase_map(
+    def define_diffraction_peaks(
         self,
-        peakCoordinates: np.dtype([("x", float), ("y", float), ("intensity", float)]), 
-        inputMaskSize: float, 
+        diffraction_peaks_dict = None,
+        num_peaks_search = 20,
+        num_peaks_use = 2,
+        center_ignore_buffer = 15,
+        minSpacingPeaks = 5,
+    ):
+        self.phase_container_containers = []
+        if diffraction_peaks_dict is None:
+            for a0 in range(self.shape[0]):
+                self.global_image_index = a0
+                self.nx, self.ny = self.images[self.global_image_index].shape
+                self.auto_peak_finder(num_peaks_search = num_peaks_search, num_peaks_use = num_peaks_use, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
+
+        else:
+            for a0 in range(self.shape[0]):
+                self.defined_peaks[a0] = diffraction_peaks_dict[a0] is not None
+                self.global_image_index = a0
+                self.nx, self.ny = self.images[self.global_image_index].shape
+                if diffraction_peaks_dict[a0] is not None:
+                    self.create_peak_objects(diffraction_peaks_dict[a0])
+                else:
+                    self.auto_peak_finder(num_peaks_search = num_peaks_search, num_peaks_use = num_peaks_use, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
+        return self
+
+    def auto_peak_finder(
+        self,
+        num_peaks_search = 20,
+        num_peaks_use = 2,
+        center_ignore_buffer = 15,
+        minSpacingPeaks = 5,
+    ):
+        diffraction_peaks_list = self.locate_diffraction_spots(num_peaks_search, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
+        # print(np.array([diffraction_peaks_list[1:3]]))
+        # print(diffraction_peaks_list[:5])
+        # print("peak 1",diffraction_peaks_list[1])
+        if num_peaks_use == 2:
+            peakA, peakB = self.locate_first_order_peaks(diffraction_peaks_list)
+            # diffraction_peaks_list_clipped = np.array([[diffraction_peaks_list[i]] for i in range(1,(num_peaks_use+1))])
+            diffraction_peaks_list = np.array([peakA, peakB])
+            # print("Peak A",peakA)
+            # print("full list",diffraction_peaks_list)
+            # print("full list shape",diffraction_peaks_list.shape)
+            # print("clipped list",diffraction_peaks_list_clipped)
+            # print("clipped list shape",diffraction_peaks_list_clipped.shape)
+            self.create_peak_objects(diffraction_peaks_list)
+        else:
+            diffraction_peaks_list_clipped = np.array([[diffraction_peaks_list[i]] for i in range(1,(num_peaks_use+1))])
+            self.create_peak_objects(diffraction_peaks_list_clipped)
+        return self
+
+    def create_peak_objects(
+        self,
+        diffraction_peaks_list,
+    ):
+        num_peaks = diffraction_peaks_list.shape[0]
+        self.phase_containers =[]
+        for peak_ind in range(num_peaks):
+            self.phase_containers.append(
+                self.phase_container(
+                    diffraction_peaks_list[peak_ind]
+                )
+            )
+        self.phase_container_containers.append(self.phase_containers)
+
+    class phase_container:
+        def __init__(
+            self,
+            peak_coordinates,
+        ):
+            self._peak_coordinates = peak_coordinates
+            self.phase_map_: NDArray | None = None
+            self.refined_phase_map_: NDArray | None = None
+            self.amplitude_map_: NDArray | None = None
+            self.refined_amplitude_map_: NDArray | None = None
+            self.displacementX_: NDArray | None = None
+            self.displacementY_: NDArray | None = None
+
+        @property
+        def peak_coordinates(self):
+            return self._peak_coordinates
+        @peak_coordinates.setter
+        def peak_coordinates(self, value: NDArray):
+            self._peak_coordinates = value
+        @property
+        def phase_map(self):
+            return self.phase_map_
+        @phase_map.setter
+        def phase_map(self, value: NDArray):
+            self.phase_map_ = value
+        @property
+        def refined_phase_map(self):
+            return self.refined_phase_map_
+        @refined_phase_map.setter
+        def refined_phase_map(self, value: NDArray):
+            self.refined_phase_map_ = value
+        @property
+        def amplitude_map(self):
+            return self.amplitude_map_
+        @amplitude_map.setter
+        def amplitude_map(self, value: NDArray):
+            self.amplitude_map_ = value
+        @property
+        def refined_amplitude_map(self):
+            return self.refined_amplitude_map_
+        @refined_amplitude_map.setter
+        def refined_amplitude_map(self, value: NDArray):
+            self.refined_amplitude_map_ = value
+        @property
+        def displacement_maps(self):
+            return self.displacementX, self.displacementY
+        @displacement_maps.setter
+        def displacement_maps(self, value: list[NDArray]):
+            self.displacementX = value[0]
+            self.displacementY = value[1]
+        
+
+    def calculate_phase_maps(
+        self,
+        inputMaskSize: Union[float, NDArray[float]], 
         gaussianMask: bool = True,
         useHamming: bool = False,
         showResult: bool = True,
+        amplitude_mask_result: bool = True,
+        ):
+
+        for a0 in range(self.shape[0]):
+            if np.isscalar(inputMaskSize):
+                self.mask_size = inputMaskSize
+            elif inputMaskSize.shape[0] != self.shape[0]:
+                raise RuntimeError(
+                    f"The list of mask sizes must be a scalar or have length equal to {self.shape[0]}"
+                )
+            else:
+                self.mask_size = inputMaskSize[a0]
+            self.global_image_index = a0
+            self.phase_containers = self.phase_container_containers[self.global_image_index]
+            for peak_index in range(len(self.phase_containers)):
+                self.calculate_phase_map(
+                    peak_index,
+                    self.mask_size,
+                    gaussianMask,
+                    useHamming,
+                    showResult,
+                    amplitude_mask_result
+                    )
+        self.calculated_phase = True
+        return self
+
+    def calculate_phase_map(
+        self,
+        peakIndex: int, 
+        inputMaskSize: float,
+        gaussianMask: bool = True,
+        useHamming: bool = False,
+        showResult: bool = True,
+        amplitude_mask_result: bool = True,
+        refine: bool = False,
         ):
         """
         Calculate the geometric phase for a single Bragg peak.
@@ -347,6 +611,8 @@ class geometric_phase_analysis_2D(AutoSerialize):
         G_matrix: (nx, ny) np.ndarray
             A 2D array of the geometric phase corresponding to the input peak.
         """
+        peakCoordinates = self.phase_containers[peakIndex].peak_coordinates
+        # print(peakCoordinates)
         peakCoordinates_xy = self.get_xy_2(peakCoordinates)
 
         # Construct Fourier Coordinates
@@ -354,7 +620,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
         dkx = 1/(self.nx); dky = 1/(self.ny)
 
         # Shift Bragg Peak to Center
-        center = np.array(self.image.shape)/2
+        center = np.array(self.images[self.global_image_index].shape)/2
         shift = np.array( center - peakCoordinates_xy)
         shift = shift * [dkx, dky]
         shift_phase = np.exp(1j*2*np.pi*(shift[0]*xx+shift[1]*yy))
@@ -364,25 +630,34 @@ class geometric_phase_analysis_2D(AutoSerialize):
             gg = (((xx - center[0])**2) + ((yy - center[1])**2))/inputMaskSize
             mask = np.exp((-0.5)*gg)
         else:             # Create a Hard Circle Mask
-            circ_rad = np.amin(inputMaskSize*np.asarray(self.image.shape))
-            mask = (self.make_circle(self.image.shape,self.nx/2,self.ny/2,circ_rad)).astype(bool)
+            circ_rad = np.amin(inputMaskSize*np.asarray(self.images[self.global_image_index].shape))
+            mask = (self.make_circle(self.images[self.global_image_index].shape,self.nx/2,self.ny/2,circ_rad)).astype(bool)
         
         if useHamming:
             ham_x = np.hamming(self.nx)[:, None]
             ham_y = np.hamming(self.ny)[None, :]
             ham = np.sqrt(ham_x * ham_y)            
-            G_matrix = ifft2(ifftshift(mask*fftshift(fft2(self.image*ham*shift_phase))))    # With hamming in 2D. Original methods would take the phase immediately, but the amplitude is also useful.
+            G_matrix = ifft2(ifftshift(mask*fftshift(fft2(self.images[self.global_image_index].array*ham*shift_phase))))    # With hamming in 2D. Original methods would take the phase immediately, but the amplitude is also useful.
         else:
-            G_matrix = ifft2(ifftshift(mask*fftshift(fft2(self.image*shift_phase))))    # Without hamming
+            G_matrix = ifft2(ifftshift(mask*fftshift(fft2(self.images[self.global_image_index].array*shift_phase))))    # Without hamming
 
         if showResult:
-            im_pha_gp = self.phase_im_lab(np.angle(G_matrix))
-            imFFT = fftshift(fft2(self.image*shift_phase))
+            if amplitude_mask_result:
+                im_pha_gp = self.phase_im_lab(np.angle(G_matrix) * np.abs(G_matrix))
+            else:
+                im_pha_gp = self.phase_im_lab(np.angle(G_matrix))
+            imFFT = fftshift(fft2(self.images[self.global_image_index].array*shift_phase))
             (_,axs) = plt.subplots(1,2,figsize=(15,30))
             axs[0].imshow(im_pha_gp, origin = 'upper')#; axs[0].axis('off')
             axs[1].imshow(np.log(np.abs(imFFT)+1),cmap='gray', origin = 'upper'); plt.imshow(mask,alpha=0.4, origin = 'upper'); axs[1].axis('off')
 
-        return G_matrix
+        if refine:
+            self.phase_containers[peakIndex].refined_phase_map = np.angle(G_matrix)
+            self.phase_containers[peakIndex].refined_amplitude_map = np.abs(G_matrix)
+        else:
+            self.phase_containers[peakIndex].phase_map = np.angle(G_matrix)
+            self.phase_containers[peakIndex].amplitude_map = np.abs(G_matrix)
+        return self
 
     def make_circle(
         self,
@@ -417,48 +692,6 @@ class geometric_phase_analysis_2D(AutoSerialize):
         sub = ((((yV - center_y) ** 2) + ((xV - center_x) ** 2)) ** 0.5) < radius
         circle = np.asarray(sub,dtype=np.float64)
         return circle
-
-    def calculate_displacement_map(
-        self,
-        peakCoordinatesA: np.dtype([("x", float), ("y", float), ("intensity", float)]), 
-        peakCoordinatesB: np.dtype([("x", float), ("y", float), ("intensity", float)]), 
-        phaseA: np.ndarray, 
-        phaseB: np.ndarray, 
-        showResult: bool = False,
-        ):
-        """
-        Use the phase maps and peak coordinates to retrieve the x and y displacement maps.
-        
-        Parameters
-        ----------
-        peakCoordinatesA: np.dtype([("x", float), ("y", float), ("intensity", float)])
-            The absolute pixel coordinates of the first selected peak.
-        peakCoordinatesB: np.dtype([("x", float), ("y", float), ("intensity", float)])
-            The absolute pixel coordinates of the second selected peak.
-        phaseA: (nx, ny) np.ndarray
-            The geometric phase corresponding to the first selected peak.
-        phaseB: (nx, ny) np.ndarray
-            The geometric phase corresponding to the second selected peak.
-        showResult: bool
-            Show the real space displacement. Defaults to False.
-            
-        Returns
-        -------
-        displacementX: (nx, ny) np.ndarray
-            A 2D array that maps the X (row offset) displacement within the lattice.
-        displacementY: (nx, ny) np.ndarray
-            A 2D array that maps the Y (column offset) displacement within the lattice.
-        """
-        center_coords = np.asarray(self.image.shape)//2
-        peakCoordinatesA_G = self.circ_to_G(self.get_xy_2(peakCoordinatesA))
-        peakCoordinatesB_G = self.circ_to_G(self.get_xy_2(peakCoordinatesB))
-        peakMatrix = self.get_a_matrix(peakCoordinatesA_G, peakCoordinatesB_G)
-        displacementX, displacementY = self.get_u_matrices(phaseA, phaseB, peakMatrix)
-        if showResult == True:
-            (fig, axs) = plt.subplots(1,2,figsize = (15,10))
-            axs[0].imshow(displacementX, origin = 'upper'); axs[0].set_title('Displacement Along X Direction (rows)'); axs[0].axis('off')
-            axs[1].imshow(displacementY, origin = 'upper'); axs[1].set_title('Displacement Along Y Direction (columns)'); axs[1].axis('off')
-        return displacementX, displacementY
 
     def get_a_matrix(
         self,
@@ -603,10 +836,135 @@ class geometric_phase_analysis_2D(AutoSerialize):
         xyCoords = np.array([coords_arr['x'], coords_arr['y']])
         return xyCoords
 
-    def calculate_strain_map(
+    def calculate_displacement_maps(
         self,
-        displacementX: np.ndarray, 
-        displacementY: np.ndarray,
+        num_peaks: int = 2,
+        showResult: bool = False,
+        amplitude_mask_result: bool = False,
+        threshold_mask: float = 0.4,
+        ):
+        
+        #         peakCoordinatesA: np.dtype([("x", float), ("y", float), ("intensity", float)]), 
+        # peakCoordinatesB: np.dtype([("x", float), ("y", float), ("intensity", float)]), 
+        # phaseA: np.ndarray, 
+        # phaseB: np.ndarray, 
+        """
+        Use the phase maps and peak coordinates to retrieve the x and y displacement maps.
+        
+        Parameters
+        ----------
+        peakCoordinatesA: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            The absolute pixel coordinates of the first selected peak.
+        peakCoordinatesB: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            The absolute pixel coordinates of the second selected peak.
+        phaseA: (nx, ny) np.ndarray
+            The geometric phase corresponding to the first selected peak.
+        phaseB: (nx, ny) np.ndarray
+            The geometric phase corresponding to the second selected peak.
+        showResult: bool
+            Show the real space displacement. Defaults to False.
+            
+        Returns
+        -------
+        displacementX: (nx, ny) np.ndarray
+            A 2D array that maps the X (row offset) displacement within the lattice.
+        displacementY: (nx, ny) np.ndarray
+            A 2D array that maps the Y (column offset) displacement within the lattice.
+        """
+        
+        peak_coords = []
+        phases = []
+        amplitudes = []
+
+        for i in range(num_peaks):
+            pc = self.phase_containers[i]
+            peak_coords.append(self.circ_to_G(self.get_xy_2(pc.peak_coordinates)))
+            phases.append(pc.phase_map)
+            if amplitude_mask_result:
+                amplitudes.append(pc.amplitude_map)
+            else:
+                amplitudes.append(np.ones_like(pc.phase_map))
+
+        A = np.array([[p[0], p[1]] for p in peak_coords])
+
+        phases = np.stack(phases, axis=0)
+        amplitudes = np.stack(amplitudes, axis=0)
+
+        if amplitude_mask_result:
+            amp_mins = np.min(amplitudes, axis=(1, 2), keepdims=True)
+            amp_maxs = np.max(amplitudes, axis=(1, 2), keepdims=True)
+            amplitude_map_norm = (amplitudes - amp_mins) / (amp_maxs - amp_mins)
+            amplitude_map_norm = (amplitude_map_norm >= threshold_mask).astype(amplitudes.dtype)
+            weighted_phases = phases * amplitude_map_norm
+        else:
+            weighted_phases = phases
+
+        n, nx, ny = weighted_phases.shape
+        Phi = weighted_phases.reshape(n, -1)
+
+        W = 1/np.array([np.linalg.norm(p) for p in peak_coords]) 
+        W = np.diag(W)
+
+        AtW = A.T @ W
+        A_pinv = np.linalg.inv(AtW @ A) @ AtW
+
+        U = A_pinv @ Phi
+
+        displacementX = U[0].reshape(nx, ny)
+        displacementY = U[1].reshape(nx, ny)
+
+        if showResult == True:
+            show_2d(
+                [displacementX, displacementY],
+                title = ["Displacement Along X Direction (rows)","Displacement Along Y Direction (columns)"]
+            )
+        # if num_peaks == 2:
+        self.phase_containers[0].displacement_maps = displacementX, displacementY
+        self.displacement_map_index = 0
+        self.calculated_displacement = True
+        return self
+
+    def calculate_strain_map(
+       self,
+       num_peaks = 2,
+       amplitude_mask_result = True, 
+       show_result = True,
+       use_phase_directly = True,
+    ):
+        if not self.calculated_phase:
+            inputMaskSizes = np.zeros(self.shape[0])
+            for a0 in range(self.shape[0]):
+                inputMaskSizes[a0] = np.mean(self.images[a0].shape)/10
+            self.calculate_phase_maps(
+                inputMaskSizes,
+                gaussianMask = True,
+                showResult = True,
+                amplitude_mask_result = True)
+        if use_phase_directly:
+            for a0 in range(self.shape[0]):
+                self.global_image_index = a0
+                self.phase_containers = self.phase_container_containers[self.global_image_index]
+                self.calculate_strain_map_phase(
+                    num_peaks,
+                    amplitude_mask_result, 
+                    showResult = show_result,
+                )
+        else:
+            if not self.calculated_displacement:
+                self.calculate_displacement_maps(
+                    num_peaks = num_peaks,
+                    showResult = True,
+                    amplitude_mask_result = True)
+            for a0 in range(self.shape[0]):
+                self.global_image_index = a0
+                self.phase_containers = self.phase_container_containers[self.global_image_index]
+                self.calculate_strain_map_displacement(
+                    showResult = show_result,
+                )
+        return self
+
+    def calculate_strain_map_displacement(
+        self,
         showResult: bool = True,
         ):
         """
@@ -626,6 +984,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
         e_mat: (2, 2, nx, ny) np.ndarray
             The 2x2 tensor of strain maps.
         """
+        displacementX, displacementY = self.phase_containers[self.displacement_map_index].displacement_maps
         e_xx,e_xy = self.phase_diff(displacementX)
         e_yx,e_yy = self.phase_diff(displacementY)
         e_mat = np.array([
@@ -637,53 +996,91 @@ class geometric_phase_analysis_2D(AutoSerialize):
         e_th_xy, e_dg_xy = self.get_rot_and_diag_strain(e_mat)
         if showResult == True:
             (fig,axs) = plt.subplots(2,2, figsize = (20,25))
-            axs = axs.flatten()
-            axs[0].imshow(self.image, cmap = 'gray', origin = 'upper'); axs[0].axis('off')
-            axs[1].imshow(e_xx, cmap = 'BrBG', origin = 'upper'); axs[1].set_title('$Strain_{xx}$', fontsize = 20); axs[1].axis('off')
-            axs[2].imshow(e_yy, cmap = 'BrBG', origin = 'upper'); axs[2].set_title('$Strain_{yy}$', fontsize = 20); axs[2].axis('off')
-            axs[3].imshow(e_dg_xy, cmap = 'BrBG', origin = 'upper'); axs[3].set_title('$Strain_{xy}$', fontsize = 20); axs[3].axis('off')
-        fig.tight_layout()
+            show_2d(
+                [self.images[self.global_image_index].array,
+                e_xx,
+                ],
+                figax = (fig, axs[:1]),
+                title = ["", "$Strain_{xx}$"],
+                cmap = ["gray", "BrBG"]
+            )
+            show_2d(
+                [e_yy,
+                e_dg_xy,
+                ],
+                figax = (fig, axs[1:]),
+                title = ["$Strain_{yy}$", "$Strain_{xy}$"],
+                cmap = "BrBG"
+            )
+            fig.tight_layout()
+
         return e_mat
 
     def calculate_strain_map_phase(
         self,
-        peakCoordinatesA,
-        peakCoordinatesB,
-        phaseA,
-        phaseB,
-        showResult = True
+        num_peaks,
+        amplitude_mask_result = False,
+        threshold_mask = 0.4,
+        showResult = True,
     ):
+        peak_coords = []
+        nx_, ny_ = self.phase_containers[0].phase_map.shape # get the rows and columns of the phase map, which does not have padding here
 
-        center_coords = np.asarray(self.image.shape)//2
-        peakCoordinatesA_G = self.circ_to_G(self.get_xy_2(peakCoordinatesA))
-        peakCoordinatesB_G = self.circ_to_G(self.get_xy_2(peakCoordinatesB))
-        peakMatrix = self.get_a_matrix(peakCoordinatesA_G, peakCoordinatesB_G)
+        phase_derivatives = np.zeros([num_peaks, 2, nx_, ny_])
 
-        phase_derivative = np.zeros([2,2,self.nx, self.ny])
+        print("phase containers", len(self.phase_containers))
+            # print("test", i)
+        for i in range(num_peaks):
+            pc = self.phase_containers[i]
+            peak_coords.append(self.circ_to_G(self.get_xy_2(pc.peak_coordinates)))
+            exp_matrix1 = np.exp(-1j*pc.phase_map)
+            exp_matrix2 = np.exp(1j*pc.phase_map)
+            if amplitude_mask_result:
+                def normalize_arr(array):
+                    array-=np.min(array)
+                    array /= np.max(array)
+                    return array
+                amplitude_map_norm = normalize_arr(pc.amplitude_map)
+                amplitude_map_norm[amplitude_map_norm < threshold_mask] = 0
+                amplitude_map_norm[amplitude_map_norm > 0] = 1
+                phase_derivatives[i, 0] = np.imag(np.multiply(exp_matrix1,np.gradient(exp_matrix2, axis=0))) * amplitude_map_norm # phaseA_dx 
+                phase_derivatives[i, 1] = np.imag(np.multiply(exp_matrix1,np.gradient(exp_matrix2, axis=1))) * amplitude_map_norm # phaseA_dy
+            else:
+                phase_derivatives[i, 0] = np.imag(np.multiply(exp_matrix1,np.gradient(exp_matrix2, axis=0))) # phaseA_dx 
+                phase_derivatives[i, 1] = np.imag(np.multiply(exp_matrix1,np.gradient(exp_matrix2, axis=1))) # phaseA_dy
 
-        expA_matrix1 = np.exp(-1j*phaseA)
-        expA_matrix2 = np.exp(1j*phaseA)
-        phase_derivative[0, 0] = np.imag(np.multiply(expA_matrix1,np.gradient(expA_matrix2, axis=0))) # phaseA_dx 
-        phase_derivative[0, 1] = np.imag(np.multiply(expA_matrix1,np.gradient(expA_matrix2, axis=1))) # phaseA_dy
+        A = np.array([[p[0], p[1]] for p in peak_coords])
 
-        expB_matrix1 = np.exp(-1j*phaseB)
-        expB_matrix2 = np.exp(1j*phaseB)
-        phase_derivative[1, 0] = np.imag(np.multiply(expB_matrix1,np.gradient(expB_matrix2, axis=0))) # phaseB_dx
-        phase_derivative[1, 1] = np.imag(np.multiply(expB_matrix1,np.gradient(expB_matrix2, axis=1))) # phaseB_dy
+        W = 1/np.array([np.linalg.norm(p) for p in peak_coords]) 
+        W = np.diag(W)
 
-        e_mat = -1/(2*np.pi) * np.einsum('ij,jkab->ikab', peakMatrix, phase_derivative)
+        AtW = A.T @ W
+        A_pinv = np.linalg.inv(AtW @ A) @ AtW
+
+        # e_mat = A_pinv @ phase_derivatives
+        e_mat = -1/(2*np.pi) * np.einsum('ij,jkab->ikab', A_pinv, phase_derivatives)
 
         e_xx, e_yy = self.get_axial_strain(e_mat)
         e_th_xy, e_dg_xy = self.get_rot_and_diag_strain(e_mat)
         if showResult == True:
             (fig,axs) = plt.subplots(2,2, figsize = (20,25))
-            axs = axs.flatten()
-            axs[0].imshow(self.image, cmap = 'gray', origin = 'upper'); axs[0].axis('off')
-            axs[1].imshow(e_xx, cmap = 'BrBG', origin = 'upper'); axs[1].set_title('$Strain_{xx}$', fontsize = 20); axs[1].axis('off')
-            axs[2].imshow(e_yy, cmap = 'BrBG', origin = 'upper'); axs[2].set_title('$Strain_{yy}$', fontsize = 20); axs[2].axis('off')
-            axs[3].imshow(e_dg_xy, cmap = 'BrBG', origin = 'upper'); axs[3].set_title('$Strain_{xy}$', fontsize = 20); axs[3].axis('off')
-        fig.tight_layout()
-
+            show_2d(
+                [self.images[self.global_image_index].array,
+                e_xx,
+                ],
+                figax = (fig, axs[:1]),
+                title = ["", "$Strain_{xx}$"],
+                cmap = ["gray", "BrBG"]
+            )
+            show_2d(
+                [e_yy,
+                e_dg_xy,
+                ],
+                figax = (fig, axs[1:]),
+                title = ["$Strain_{yy}$", "$Strain_{xy}$"],
+                cmap = "BrBG"
+            )
+            fig.tight_layout()
         return e_mat
 
     def get_rot_and_diag_strain(
@@ -731,6 +1128,32 @@ class geometric_phase_analysis_2D(AutoSerialize):
        """
         return e_mat[0,0], e_mat[1,1]
 
+    def refine_phases(
+        self,
+        reference_center,
+        reference_radius,
+        iterations,
+        useGaussMask,
+        show_result,
+        mask_size,
+        amplitude_mask_result,
+    ):
+        if mask_size is None and self.mask_size is not None:
+            mask_size = self.mask_size
+        elif mask_size is None and self.mask_size is None:
+            raise RuntimeError(
+                "No mask size set"
+            )
+        refMatrix = self.set_reference_matrix_s(reference_center, reference_radius)
+        for peak_index in range(len(self.phase_containers)):
+            phase = self.phase_containers[peak_index].phase_map
+            peak = self.phase_containers[peak_index].phase_map
+            peakRefined, phaseRefined = self.refine_phase(phase, peak, peak_index, refMatrix, mask_size, iterations, useGaussMask, show_result, amplitude_mask_result)
+            self.phase_containers[peak_index].phase_refined = phaseRefined
+            self.phase_containers[peak_index].peak_refined = peakRefined
+        return self
+
+
     def define_reference(
         self,
         x1: int,
@@ -762,7 +1185,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
         D = (x1, y1)
         
         plt.figure(figsize=(15,15))
-        plt.imshow(self.image_normalizer(self.image)+0.33*ref_reg, origin = 'upper')
+        plt.imshow(self.image_normalizer(self.images[self.global_image_index].array)+0.33*ref_reg, origin = 'upper')
         plt.annotate(A, (A[0]/self.nx, (1 - A[1]/self.ny)), textcoords='axes fraction', size=15,color='w')
         plt.annotate(B, (B[0]/self.nx, (1 - B[1]/self.ny)), textcoords='axes fraction', size=15,color='w')
         plt.annotate(C, (C[0]/self.nx, (1 - C[1]/self.ny)), textcoords='axes fraction', size=15,color='w')
@@ -834,10 +1257,12 @@ class geometric_phase_analysis_2D(AutoSerialize):
         self,
         phaseMap: np.ndarray,
         peakCoordinates: np.dtype([("x", float), ("y", float), ("intensity", float)]),
+        peak_index,
         referenceMatrix: np.ndarray,
         maskSize: float,
         iterations: int,
         useGaussMask: bool,
+        amplitude_mask_result,
         showResult: bool = True,
         ):
         """
@@ -882,13 +1307,23 @@ class geometric_phase_analysis_2D(AutoSerialize):
             peakCoordinatesRefined_dtype = np.zeros(1, dtype=self.dtype)
             peakCoordinatesRefined_dtype["x"] = peakCoordinatesRefined[0]
             peakCoordinatesRefined_dtype["y"] = peakCoordinatesRefined[1]
-            phaseMapRefined = np.angle(self.calculate_phase_map(peakCoordinatesRefined_dtype,gaussianMask=useGaussMask,inputMaskSize=maskSize,showResult=False))
-        
+            self.calculate_phase_map(peak_index,gaussianMask=useGaussMask,inputMaskSize=maskSize,showResult=False, amplitude_mask_result = True, refine = True)
+            phaseMapRefined = self.phase_containers[peak_index].refined_phase_map
+            amplitudeMapRefined = self.phase_containers[peak_index].refined_amplitude_map
+
         if showResult:
-            im_pha_gp = self.phase_im_lab(phaseMapRefined)
-            (_,axs) = plt.subplots(1,2,figsize=(15,30))
-            axs[0].imshow(self.image,cmap='gray', origin = 'upper'); axs[0].axis('off')
-            axs[1].imshow(im_pha_gp, origin = 'upper'); axs[1].axis('off')
+            if amplitude_mask_result:
+                im_pha_gp = self.phase_im_lab(phaseMapRefined*amplitudeMapRefined)
+            else:
+                im_pha_gp = self.phase_im_lab(phaseMapRefined)
+            if showResult == True:
+                show_2d(
+                    [self.images[self.global_image_index].array,
+                    im_pha_gp,
+                    ],
+                    title = ["", "$Strain_{xx}$"],
+                    cmap = ["gray", "BrBG"]
+                )
 
         peakCoordinatesRefined_dtype = np.zeros(1, dtype=self.dtype)
         peakCoordinatesRefined_dtype['x'] = peakCoordinatesRefined[0]
@@ -991,6 +1426,8 @@ class geometric_phase_analysis_2D(AutoSerialize):
     def locate_diffraction_spots(
         self,
         maxNumPeaks_in: int,
+        minSpacingPeaks: int = 0,
+        center_ignore_buffer: int | None = None,
         ):
         """
         Calls the maxima finder.
@@ -1004,8 +1441,19 @@ class geometric_phase_analysis_2D(AutoSerialize):
         peakList: (maxNumPeaks_in) np.ndarray, np.dtype([("x", float), ("y", float), ("intensity", float)])
             An array of peak coordinates with a custom datatype.
         """
-        peakList = self.get_maxima_2D(np.abs(self.imFFT), maxNumPeaks = maxNumPeaks_in, _ar_FT = self.imFFT)
-        return peakList
+        peakList = self.get_maxima_2D(np.abs(self._FFT[self.global_image_index].array), maxNumPeaks = maxNumPeaks_in, minSpacing = minSpacingPeaks)
+        if center_ignore_buffer != None:
+            x_dist_to_center = peakList['x'] - self.nx/2
+            y_dist_to_center = peakList['y'] - self.ny/2
+            rad_dist_to_center = np.sqrt(x_dist_to_center**2 + y_dist_to_center**2)
+            peakList = peakList[rad_dist_to_center>center_ignore_buffer]
+            zero_peak = np.zeros(1, np.dtype([("x", float), ("y", float), ("intensity", float)]))
+            zero_peak['x'] = self.nx/2
+            zero_peak['y'] = self.ny/2
+            peakList = np.append(zero_peak, peakList)
+            return peakList
+        else:
+            return peakList
 
     # Functions from py4DSTEM for peak finding.
     def get_maxima_2D(
