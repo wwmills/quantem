@@ -1762,6 +1762,14 @@ class Lattice(AutoSerialize):
             atoms_found_prev_iteration = atoms_found_this_iteration.copy()
             atoms_found_this_iteration = np.zeros(len(maxima_candidates))
             iteration_while += 1
+        if check_for_dislocations:
+            atom_arr = check_dislocations()
+            self.atoms_dislocation = Vector.from_shape(
+                    shape=(self._num_sites),
+                    fields=("x", "y", "a", "b", "int_peak"),
+                    units=("px", "px", "ind", "ind", "counts"),
+                )
+            self.atoms_dislocation.set_data(atom_arr, 0)
 
         # add interactive bit here
 
@@ -1838,25 +1846,25 @@ class Lattice(AutoSerialize):
             atoms_found_this_iteration = np.zeros(len(maxima_candidates))
             iteration_while += 1
 
-        if plot_atoms:
-            fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
-            if ax.images:
-                ax.images[-1].set_zorder(0)
-            xs = maxima_accepted_x
-            ys = maxima_accepted_y
-            rgb = site_colors(int(self._numbers[0]))
-            ax.scatter(
-                ys,
-                xs,
-                s=18,
-                facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
-                edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
-                linewidths=0.75,
-                marker="o",
-                zorder=25,
-            )
-            ax.set_xlim(0, W)
-            ax.set_ylim(H, 0)
+        # if plot_atoms:
+        #     fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
+        #     if ax.images:
+        #         ax.images[-1].set_zorder(0)
+        #     xs = maxima_accepted_x
+        #     ys = maxima_accepted_y
+        #     rgb = site_colors(int(self._numbers[0]))
+        #     ax.scatter(
+        #         ys,
+        #         xs,
+        #         s=18,
+        #         facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+        #         edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+        #         linewidths=0.75,
+        #         marker="o",
+        #         zorder=25,
+        #     )
+        #     ax.set_xlim(0, W)
+        #     ax.set_ylim(H, 0)
 
 
         for a0 in range(self._num_sites -1):
@@ -1938,6 +1946,57 @@ class Lattice(AutoSerialize):
         mask = (x >= 0) & (x < nx) & (y >= 0) & (y < ny)
         return t[mask], profile[mask], x[mask], y[mask]
 
+    # overloading this handle
+    def line_profile(
+        image,
+        p1=None,
+        p2=None,
+        origin=None,
+        direction=None,
+        num_samples=None,
+        order=1,
+        mode='nearest'
+    ):
+
+        nx, ny = image.shape
+
+        if p1 is not None and p2 is not None:
+            p1, p2 = np.array(p1, dtype=float), np.array(p2, dtype=float)
+            v = p2 - p1
+            length = np.linalg.norm(v)
+            v /= length
+            if num_samples is None:
+                num_samples = int(length)
+            t = np.linspace(0, length, num_samples)
+            x = p1[0] + v[0] * t
+            y = p1[1] + v[1] * t
+
+        elif origin is not None and direction is not None:
+            x0, y0 = origin
+            v = np.array(direction, dtype=float)
+            v /= np.linalg.norm(v)
+
+            if num_samples is None:
+                num_samples = int(np.hypot(nx, ny))
+
+            corners = np.array([[0,0],[nx,0],[0,ny],[nx,ny]])
+            t_values = [(np.dot(corner - origin, v)) for corner in corners]
+            t_min, t_max = min(t_values), max(t_values)
+            t = np.linspace(t_min, t_max, num_samples)
+            x = x0 + v[0] * t
+            y = y0 + v[1] * t
+        else:
+            raise ValueError("Specify either (p1, p2) or (origin, direction).")
+
+        # Interpolate
+        profile = map_coordinates(image, [x, y], order=order, mode=mode)
+
+        # Mask for valid coordinates
+        mask = (x >= 0) & (x < nx) & (y >= 0) & (y < ny)
+
+        return t[mask], profile[mask], x[mask], y[mask]
+
+
     def find_b_sites(
             self,
             max_perpendicular_distance = 5,
@@ -1998,6 +2057,97 @@ class Lattice(AutoSerialize):
                         plt.show()
         return self
 
+    def find_parallel_sites(
+            self,
+            t,
+            profile,
+            x_coords,
+            y_coords,
+            direction,
+            origin = None,
+            max_perpendicular_distance = 10,
+            gaussian_smooth_data = None,
+            return_fit = False,
+            plot_profile = True,
+    ):
+
+        atoms_arr = self.atoms.get_data(0)
+        a_intensity = self.atoms[0]['int_peak']
+        bg_intensity = self.atoms[0]['int_bg']
+        sigma_arr = self.atoms[0]['sigma']
+        if origin is None:
+            t_near_zero = np.argmin(np.abs(t))
+            x_origin = x_coords[t_near_zero]
+            y_origin = y_coords[t_near_zero]
+        else:
+            x_origin = origin[0]
+            y_origin = origin[1]
+        mask, near_peaks, t_values_s, distances = self.select_peaks_near_line(x_origin, y_origin, direction = direction, max_perpendicular_distance = max_perpendicular_distance)
+        
+        t_profile = np.asarray(profile)
+        t_values = np.asarray(t)
+        distances = np.asarray(distances)
+
+        A = a_intensity[mask]
+        B = bg_intensity[mask]
+        sigma_perp = sigma_arr[mask]
+        sigma_parallel = sigma_arr[mask]
+        A_eff = A * np.exp(-0.5 * (distances / sigma_perp) ** 2)
+        # plt.figure()
+        # plt.plot(np.arange(0, A_eff.shape[0]),A, label = 'A')
+        # plt.plot(np.arange(0, A_eff.shape[0]),A_eff, label = 'A_eff')
+        # plt.plot(np.arange(0, A_eff.shape[0]),sigma_perp, label = 'Sigma Perp')
+        # plt.plot(np.arange(0, A_eff.shape[0]),distances, label = 'Perp Distances')
+        # plt.legend()
+        gaussian_sum = np.zeros_like(t_values, dtype=float)
+        s_index = 0
+        for t_i, A_i in zip(t_values_s, A_eff):
+            gaussian_sum += A_i * np.exp(-0.5 * ((t_values - t_i) / sigma_parallel[s_index]) ** 2)
+            s_index += 1
+        # gaussian_sum += np.mean(B)
+
+        from scipy.interpolate import interp1d
+        bg_interp_func = interp1d(
+            t_values_s,
+            B,
+            kind='linear',
+            bounds_error=False, 
+            fill_value=(B[0], B[-1])
+        )
+
+        B_interp = bg_interp_func(t_values)
+        gaussian_sum += B_interp
+
+        nx, ny = self.image.array.shape
+
+        if plot_profile is True:
+            plt.figure(figsize=(10,4))
+            plt.subplot(1,2,1)
+            plt.imshow(self.image.array, cmap='gray', origin='upper')
+            plt.plot(y_coords, x_coords, 'r-', lw=1)
+            # plt.plot(x_coords, y_coords, 'r-', lw=1)
+            plt.title("Line through image")
+            # plt.ylim([x_coords[0],x_coords[-1]])
+            # plt.xlim([y_coords[-1],y_coords[0]])
+            plt.xlim([0,nx-1])
+            plt.ylim([ny-1, 0])
+
+            plt.subplot(1,2,2)
+            if gaussian_smooth_data is not None:
+                plt.plot(t_values, gaussian_filter(t_profile, gaussian_smooth_data))
+            else:
+                plt.plot(t_values, t_profile)
+            plt.plot(t_values, gaussian_sum, alpha = 0.5)
+            plt.title("Line profile")
+            plt.xlabel("Distance along line (pixels)")
+            plt.ylabel("Intensity")
+            plt.tight_layout()
+            plt.show()
+        if return_fit:
+            return gaussian_sum
+
+        return self
+
     def unit_vector(
         self,
         v,
@@ -2050,6 +2200,40 @@ class Lattice(AutoSerialize):
         distances = distances_all[mask]
 
         return mask, near_peaks, t_values, distances
+
+    def select_peaks_near_line(
+            self,
+            x_c,
+            y_c,
+            direction,
+            max_perpendicular_distance,
+    ):
+        atoms_arr = self.atoms.get_data(0)
+        a_xy = atoms_arr[:,0:2]
+        selected_atoms_arr = np.zeros(a_xy.shape[0])
+        v = self.unit_vector(direction)
+        # v = self.unit_vector(direction)
+
+        # v = self.unit_vector(direction[::-1])
+
+        center_atom_to_rest = a_xy - np.array([x_c, y_c])
+
+        t_values_all = np.dot(center_atom_to_rest, v)
+
+        rest_proj = np.outer(t_values_all, v)
+        perp = center_atom_to_rest - rest_proj
+        distances_all = np.linalg.norm(perp, axis=1)
+
+        # Select peaks within threshold
+        mask = distances_all <= max_perpendicular_distance
+        # print(mask[mask == True])
+
+        near_peaks = a_xy[mask]
+        t_values = t_values_all[mask]
+        distances = distances_all[mask]
+
+        return mask, near_peaks, t_values, distances
+
 
 
     def gaussian(
@@ -2551,7 +2735,6 @@ class Lattice(AutoSerialize):
         for site_index in range(num_sites):
             site_data = self.atoms.get_data(site_index)
             keep_mask = self.count_a_neighbors[site_index, :site_data.shape[0]] >= min_neighbors
-            print(keep_mask[keep_mask == 0])
             updated = site_data[keep_mask]
             removed.append(site_data[~keep_mask])
             self.atoms.set_data(updated, site_index)
@@ -2590,7 +2773,7 @@ class Lattice(AutoSerialize):
         return_delta = False,
     ):
         self.neighborhood_units = neighborhood_units
-        self.neighborhood(neighborhood_units = neighborhood_units)
+        self.neighborhood_a(neighborhood_units = neighborhood_units)
         for a0 in range(self._num_sites):
             a_x = self.atoms[0]["x"]
             a_y = self.atoms[0]["y"]
@@ -4374,249 +4557,6 @@ def site_colors(number: int) -> tuple[float, float, float]:
     idx = int(number) % len(palette)
     return palette[idx]
 
-
-
-class SimData(AutoSerialize):
-    """
-    Generating atomic resolution data for ML identification of sites.
-    """
-
-    _token = object()
-
-    def __init__(
-        self,
-        atom_coordinates: Dataset2d,
-        _token: object | None = None,
-    ):
-        if _token is not self._token:
-            raise RuntimeError("Use SimData.from_data() to instantiate this class.")
-        self._atom_coordinates: Dataset2d = atom_coordinates
-
-    # --- Constructors ---
-    @classmethod
-    def from_coordinates(
-        cls,
-        atom_coordinates: Union[list[NDArray], NDArray],
-        H : int | None = None,
-        W : int | None = None,
-    ) -> "SimData":
-        if isinstance(atom_coordinates, list[NDArray]):
-            num_sites = len(atom_coordinates)
-            for site_index in range(num_sites):
-                atom_coordinates[site_index] = ensure_valid_array(atom_coordinates[site_index], ndim = 2)
-        if isinstance(atom_coordinates, NDArray):
-            atom_coordinates = ensure_valid_array(atom_coordinates, ndim = 2)
-        return cls(atom_coordinates = atom_coordinates, _token = cls._token)
-
-    # --- Properties ---
-    @property
-    def atom_coordinates(self) -> Union[list[NDArray], NDArray]:
-        return self._atom_coordinates
-
-    # @atom_coordinates.setter
-    # def atom_coordinates(self, value: Union[list[NDArray], NDArray]):
-    #     if isinstance(value, Dataset2d):
-    #         self._image = value
-    #     else:
-    #         arr = ensure_valid_array(value, ndim=2)
-    #         if hasattr(Dataset2d, "from_array") and callable(getattr(Dataset2d, "from_array")):
-    #             self._image = Dataset2d.from_array(arr)  # type: ignore[attr-defined]
-    #         else:
-    #             self._image = Dataset2d(arr)  # type: ignore[call-arg]
-
-    def generate_mask_2D(array, p_s=60.0, sparsity=0.20):
-        import numpy as np
-
-        arrayShape = array.shape
-        x = np.fft.fftfreq(arrayShape[0])
-        y = np.fft.fftfreq(arrayShape[1])
-
-        X, Y = np.meshgrid(y, x, indexing = 'ij')
-        kr = np.sqrt(X**2 + Y**2)
-
-        f_in = np.ones(arrayShape).flatten()
-
-        # Create shape
-        A = np.exp(-p_s * kr) # Generate amplitude
-        phase = np.random.randn(arrayShape[0], arrayShape[1]) # Generate phase
-        F = A * np.exp(2 * np.pi * 1j * phase) # Combine amplitude and phase
-        f = np.fft.ifftn(F) # Inverse FFT
-        f_shape = np.absolute(f)
-
-        # Impose sparsity (% of non-zero voxels)
-        f_shape = np.argsort(f_shape, axis=None) # Sort the shape image
-        f_shape = f_shape.flatten()
-        # Number of zero voxels
-        N_zero = int(np.round((array.size * (1 - sparsity))))
-        f_shape[N_zero:] = f_shape[N_zero]
-        f_in[f_shape] = 0
-
-        f_in = f_in / np.amax(f_in) # Normalize image
-        np.copyto(array, f_in.reshape(arrayShape)) # Update array
-
-
-    # a way to call the lattice class within this class
-    def generate_coordinates(
-            self,
-            H,
-            W,
-            u = np.array([16,0]),
-            v = None,
-            theta_v = np.pi/3, 
-            p_s = 400,
-            sparsity = 0.9,
-            plot_atoms = False,
-            min_neighbors = 3,
-    ):
-        im = np.ones([H, W]) # dummy image array
-        im = Dataset2d.from_array(im)
-        lattice = Lattice.from_data(
-            image=im,
-            normalize_min = False,
-            )
-        mask_ = np.zeros([H,W])
-        self.generate_mask_2D(mask_, p_s = p_s, sparsity = sparsity)
-
-        theta = np.random.rand(1) * np.pi * 2
-        rotation_matrix = np.array([[np.cos(theta), -np.sin(theta)],[np.sin(theta), np.cos(theta)]])
-
-        u = np.array([16,0])
-        u = u@rotation_matrix.T
-        theta = np.pi/3
-        rotation_matrix = np.array([[np.cos(theta), -np.sin(theta)],[np.sin(theta), np.cos(theta)]])
-        v = u@rotation_matrix.T
-        origin = np.array([0,0])
-
-        lattice.define_lattice(
-        origin,
-        u,
-        v,
-        plot_lattice=False,
-        input_mask=mask_,
-        refine_lattice=False,
-        )
-        positions_frac = [np.array([0,0]), np.array([1/3,1/3]), np.array([-1/3,-1/3])]#,  np.array([0,0.5])]
-        lattice.add_atoms(
-            positions_frac,
-            numbers=None,
-            intensity_min=None,
-            intensity_radius=None,
-            plot_atoms=False,
-            edge_min_dist_px = 1,
-            mask=mask_,
-            contrast_min=None,
-            annulus_radii=None,
-        )
-
-        a_x_a = lattice.atoms.get_data(0)[:,0]
-        a_y_a = lattice.atoms.get_data(0)[:,1]
-        a_x_b = lattice.atoms.get_data(1)[:,0]
-        a_y_b = lattice.atoms.get_data(1)[:,1]
-        a_x_c = lattice.atoms.get_data(2)[:,0]
-        a_y_c = lattice.atoms.get_data(2)[:,1]
-
-        if plot_atoms:
-            fig, ax = plt.subplots(1, 3, figsize=(10, 5))  # 1 row, 2 columns
-
-            # --- Before filtering ---
-            label_list = ['a', 'b']
-            a_x_a = lattice.atoms.get_data(0)[:, 0]
-            a_y_a = lattice.atoms.get_data(0)[:, 1]
-            a_x_b = lattice.atoms.get_data(1)[:, 0]
-            a_y_b = lattice.atoms.get_data(1)[:, 1]
-            a_x_c = lattice.atoms.get_data(2)[:, 0]
-            a_y_c = lattice.atoms.get_data(2)[:, 1]
-
-            ax[0].scatter(a_y_a, -a_x_a, color='red', s=10, alpha=0.5, label = 'a')
-            ax[0].scatter(a_y_b, -a_x_b, s=10, alpha=0.5, label = 'b')
-            ax[0].scatter(a_y_c, -a_x_c, color='green', s=10, alpha=0.5, label = 'c')
-            ax[0].legend()
-            ax[0].set_title("Before filtering")
-            ax[0].set_box_aspect(1)
-
-        # --- Apply tolerance ---
-        # should this be run more than once?
-        lattice.find_neighbors_in_tolerance()
-        removed_atoms = lattice.remove_atoms_with_too_few_neighbors(min_neighbors = 3, return_removed = True)
-
-        a_x_a = lattice.atoms.get_data(0)[:, 0]
-        a_y_a = lattice.atoms.get_data(0)[:, 1]
-        a_x_b = lattice.atoms.get_data(1)[:, 0]
-        a_y_b = lattice.atoms.get_data(1)[:, 1]
-        a_x_c = lattice.atoms.get_data(2)[:, 0]
-        a_y_c = lattice.atoms.get_data(2)[:, 1]
-
-            # --- After removing atoms ---
-            ax[1].scatter(a_y_a, -a_x_a,  color='red', s=10, alpha=0.5, label = 'a')
-            ax[1].scatter(a_y_b, -a_x_b, s=10, alpha=0.5, label = 'b')
-            ax[1].scatter(a_y_c, -a_x_c, color='green', s=10, alpha=0.5, label = 'c')
-            color_list = ['#fc03db' ,'#fc7f03', '#03ecfc']
-            for site_index in range(3):
-                if removed_atoms[site_index] is not None:
-                    a_x_n = removed_atoms[site_index][:,0]
-                    a_y_n = removed_atoms[site_index][:,1]
-                    ax[1].scatter(a_y_n, -a_x_n, s = 20, alpha = 0.5, color = color_list[site_index], label = str(site_index))
-            ax[1].legend()
-            ax[1].set_title("After filtering")
-            ax[1].set_box_aspect(1)
-
-            ax[2].scatter(a_y_a, -a_x_a, color='red', s=10, alpha=0.5, label = 'a')
-            ax[2].scatter(a_y_b, -a_x_b, s=10, alpha=0.5, label = 'b')
-            ax[2].scatter(a_y_c, -a_x_c, color='green', s=10, alpha=0.5, label = 'c')
-            ax[2].legend()
-            ax[2].set_title("After filtering")
-            ax[2].set_box_aspect(1)
-
-
-            plt.tight_layout()
-            plt.show()
-
-    def add_sites_to_image(
-            self,
-            H = None,
-            W = None,
-    ):
-        
-        # Automatically set the number of pixels needed
-        # sometimes this may be overkill if one coordinate is slightly over the edge of one atom
-        if H is None and W is not None: 
-            H = W
-        if W is None and H is not None: 
-            W = H
-        if H is None:
-            default_size_arr_pow = np.arange(0,15)
-            default_size_arr_px = 2**default_size_arr_pow
-            # find x max
-            num_sites = len(self._atom_coordinates)
-            max_x = -1
-            for site_index in range(num_sites):
-                max_x = max(max_x, np.max(self._atom_coordinates[site_index][:,0]))
-            argmin_num_px = np.argmin(np.abs(default_size_arr_px - max_x))
-            px_count_t = default_size_arr_px[argmin_num_px]
-            if px_count_t - max_x < 0:
-                argmin_num_px += 1
-            H = default_size_arr_px[argmin_num_px]
-        if W is None:
-            default_size_arr_pow = np.arange(0,15)
-            default_size_arr_px = 2**default_size_arr_pow
-            # find x max
-            num_sites = len(self._atom_coordinates)
-            max_y = -1
-            for site_index in range(num_sites):
-                max_y = max(max_y, np.max(self._atom_coordinates[site_index][:,1]))
-            argmin_num_px = np.argmin(np.abs(default_size_arr_px - max_y))
-            px_count_t = default_size_arr_px[argmin_num_px]
-            if px_count_t - max_y < 0:
-                argmin_num_px += 1
-            W = default_size_arr_px[argmin_num_px]
-
-        
-        mask_ = np.zeros([H,W])
-        generate_mask_2D(mask_, p_s = 400, sparsity = 0.9)
-
-
-
-    
 
 ####
 
