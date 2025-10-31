@@ -14,11 +14,7 @@ from scipy.ndimage import map_coordinates
 from quantem.core import config
 
 import matplotlib.pyplot as plt
-if config.get("has_cupy"):
-    import cupy as cp
-else:
-    import numpy as cp
-
+from scipy.interpolate import interp1d
 from scipy.ndimage import gaussian_filter
 
 class Lattice(AutoSerialize):
@@ -2093,20 +2089,13 @@ class Lattice(AutoSerialize):
         sigma_perp = sigma_arr[mask]
         sigma_parallel = sigma_arr[mask]
         A_eff = A * np.exp(-0.5 * (distances / sigma_perp) ** 2)
-        # plt.figure()
-        # plt.plot(np.arange(0, A_eff.shape[0]),A, label = 'A')
-        # plt.plot(np.arange(0, A_eff.shape[0]),A_eff, label = 'A_eff')
-        # plt.plot(np.arange(0, A_eff.shape[0]),sigma_perp, label = 'Sigma Perp')
-        # plt.plot(np.arange(0, A_eff.shape[0]),distances, label = 'Perp Distances')
-        # plt.legend()
+
         gaussian_sum = np.zeros_like(t_values, dtype=float)
         s_index = 0
         for t_i, A_i in zip(t_values_s, A_eff):
             gaussian_sum += A_i * np.exp(-0.5 * ((t_values - t_i) / sigma_parallel[s_index]) ** 2)
             s_index += 1
-        # gaussian_sum += np.mean(B)
 
-        from scipy.interpolate import interp1d
         bg_interp_func = interp1d(
             t_values_s,
             B,
@@ -2125,10 +2114,8 @@ class Lattice(AutoSerialize):
             plt.subplot(1,2,1)
             plt.imshow(self.image.array, cmap='gray', origin='upper')
             plt.plot(y_coords, x_coords, 'r-', lw=1)
-            # plt.plot(x_coords, y_coords, 'r-', lw=1)
+            plt.quiver(y_coords[0], x_coords[0], direction[1], direction[0], angles = 'xy', scale_units = 'xy',  scale = 1, color = 'red', zorder = 10)
             plt.title("Line through image")
-            # plt.ylim([x_coords[0],x_coords[-1]])
-            # plt.xlim([y_coords[-1],y_coords[0]])
             plt.xlim([0,nx-1])
             plt.ylim([ny-1, 0])
 
