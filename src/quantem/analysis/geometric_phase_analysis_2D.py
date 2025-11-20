@@ -29,6 +29,8 @@ else:
     
 import matplotlib.pyplot as plt
 
+import copy
+
 def create_lattice(
     n_rows: int,
     n_cols: int,
@@ -94,11 +96,6 @@ class geometric_phase_analysis_2D(AutoSerialize):
         self._images = images
         self.dtype = np.dtype([("x", float), ("y", float), ("intensity", float)])
         self._FFT = []
-        for a0 in range(len(self.images)):
-            self._FFT.append(Dataset2d.from_array(
-            fftshift(fft2(self.images[a0].array)),
-            name="fourier transform",
-            ))
         self.global_image_index = 0
         self.calculated_phase = False
         self.calculated_displacement = False
@@ -166,9 +163,10 @@ class geometric_phase_analysis_2D(AutoSerialize):
         
     def preprocess(
         self,
-        pad_fraction: float = 0.25,
+        pad_fraction: float = 0.125,
         pad_value: Union[float, str, List[float]] = "median",
         show_images: bool = False,
+        edgeblendPixels = 32,
         **kwargs,
         ):
         self.pad_fraction = pad_fraction
@@ -187,6 +185,36 @@ class geometric_phase_analysis_2D(AutoSerialize):
                 title=[f"Image {i}: initial" for i in range(self.shape[0])],
                 **kwargs,
             )
+
+        self.shape_init = []
+        for a0 in range(len(self._images)):
+            image = self.images[a0].array 
+            median_val = np.median(image)
+            shape_init = image.shape
+            self.shape_init.append(image.shape)
+
+            pad_widths = ((int(np.round(shape_init[0] * pad_fraction / 2) * 2), int(np.round(shape_init[0] * pad_fraction / 2) * 2)),
+                        (int(np.round(shape_init[1] * pad_fraction / 2) * 2), int(np.round(shape_init[1] * pad_fraction / 2) * 2)))
+
+            xP = np.arange(0,shape_init[0]) + 1
+            yP = np.arange(0,shape_init[1]) + 1
+            xP, yP = np.meshgrid(xP, yP, indexing = 'ij')
+            edgeBlend = np.cos((np.pi/2) *
+                            (np.maximum(1 - (1+shape_init[0]) / (2*max(edgeblendPixels,1))
+                                + np.abs(xP - (1+shape_init[0])/2) / max(edgeblendPixels,1), 0)))**2 * \
+                                np.cos((np.pi/2) *  (np.maximum(1 - (1+shape_init[1]) / (2*max(edgeblendPixels,1))
+                                + np.abs(yP - (1+shape_init[1])/2) / max(edgeblendPixels,1), 0)))**2
+
+            self.images[a0].array = np.pad(
+                image * edgeBlend + (1-edgeBlend) * median_val,
+                pad_widths, mode = pad_value)
+
+
+        for a0 in range(len(self.images)):
+            self._FFT.append(Dataset2d.from_array(
+            fftshift(fft2(self.images[a0].array)),
+            name="fourier transform",
+            ))
         return self
 
     def plot_original_image(self, **kwargs):
@@ -313,6 +341,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
         peakCoordinates: np.dtype([("x", float), ("y", float), ("intensity", float)]),
         image_index: int = 0, 
         subImageHalfLength: int = 20,
+        show_result = False
         ):
         """
         Zero in on peak location by fitting with a Gaussian.
@@ -332,9 +361,9 @@ class geometric_phase_analysis_2D(AutoSerialize):
 
         decimal_x = peakCoordinates['x'] - int(peakCoordinates['x'])
         decimal_y = peakCoordinates['y'] - int(peakCoordinates['y'])
-        subIm = np.abs(self._FFT[image_index])[int(peakCoordinates['x']-subImageHalfLength):int(peakCoordinates['x']+subImageHalfLength), 
+        subIm = np.abs(self._FFT[image_index].array)[int(peakCoordinates['x']-subImageHalfLength):int(peakCoordinates['x']+subImageHalfLength), 
                                                     int(peakCoordinates['y']-subImageHalfLength):int(peakCoordinates['y']+subImageHalfLength)]
-        GaussianFit = self.fit_diffraction_center(subIm)
+        GaussianFit = self.fit_diffraction_center(subIm, plot_results=show_result)
         peakCoordinatesPrecise = np.zeros(1, dtype=self.dtype)
         peakCoordinatesPrecise['x'] = peakCoordinates['x'] + GaussianFit[2] - subImageHalfLength - decimal_x
         peakCoordinatesPrecise['y'] = peakCoordinates['y'] + GaussianFit[3] - subImageHalfLength - decimal_y
@@ -424,8 +453,8 @@ class geometric_phase_analysis_2D(AutoSerialize):
         if plot_results:
             data_fitted = self.gauss2D(xdata,*popt)
             plt.figure()
-            plt.imshow(subIm,cmap='gray')
-            plt.title('Abs of FFT Subwindow and Gaussian Fit')
+            plt.imshow(np.log(subIm),cmap='gray')
+            plt.title('Log Abs of FFT Sub Window and Gaussian Fit')
             plt.contour(xdata[:,:,1],xdata[:,:,0],data_fitted.reshape(subIm.shape[0],subIm.shape[1])) # like scatter, contour follows these rules: "len(X) == N is the number of columns in Z and len(Y) == M is the number of rows in Z."
             
         return popt
@@ -437,13 +466,29 @@ class geometric_phase_analysis_2D(AutoSerialize):
         num_peaks_use = 2,
         center_ignore_buffer = 15,
         minSpacingPeaks = 5,
+        outer_ignore_buffer = None,
+        sub_image_half_length = 20,
+        show_result = True,
     ):
+        if diffraction_peaks_dict is not None:
+            diffraction_peaks_dict = copy.deepcopy(diffraction_peaks_dict)
+        if diffraction_peaks_dict is not None and self.pad_fraction != 0:
+            shape_init = self.shape_init[self.global_image_index]
+            shape_padded = self.images[self.global_image_index].array.shape
+            print('shape init',shape_init)
+            print('shape padded', shape_padded)
+            print(diffraction_peaks_dict)
+            for diffraction_peak in diffraction_peaks_dict:
+                diffraction_peak['x'] = (diffraction_peak['x'] - shape_init[0]/2) * shape_padded[0]/shape_init[0] + shape_padded[0]/2
+                diffraction_peak['y'] = (diffraction_peak['y'] - shape_init[1]/2) * shape_padded[1]/shape_init[1] + shape_padded[1]/2
+            print(diffraction_peaks_dict)
+
         self.phase_container_containers = []
         if diffraction_peaks_dict is None:
             for a0 in range(self.shape[0]):
                 self.global_image_index = a0
                 self.nx, self.ny = self.images[self.global_image_index].shape
-                self.auto_peak_finder(num_peaks_search = num_peaks_search, num_peaks_use = num_peaks_use, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
+                self.auto_peak_finder(num_peaks_search = num_peaks_search, num_peaks_use = num_peaks_use, center_ignore_buffer = center_ignore_buffer, outer_ignore_buffer = outer_ignore_buffer, minSpacingPeaks = minSpacingPeaks, show_result = show_result)
 
         else:
             for a0 in range(self.shape[0]):
@@ -451,9 +496,11 @@ class geometric_phase_analysis_2D(AutoSerialize):
                 self.global_image_index = a0
                 self.nx, self.ny = self.images[self.global_image_index].shape
                 if diffraction_peaks_dict[a0] is not None:
+                    for peak_index in range(diffraction_peaks_dict[a0].shape[0]):
+                        diffraction_peaks_dict[a0][peak_index] = self.precise_peak_location(diffraction_peaks_dict[a0][peak_index], a0, sub_image_half_length, show_result = show_result)
                     self.create_peak_objects(diffraction_peaks_dict[a0])
                 else:
-                    self.auto_peak_finder(num_peaks_search = num_peaks_search, num_peaks_use = num_peaks_use, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
+                    self.auto_peak_finder(num_peaks_search = num_peaks_search, num_peaks_use = num_peaks_use, center_ignore_buffer = center_ignore_buffer, outer_ignore_buffer = outer_ignore_buffer, minSpacingPeaks = minSpacingPeaks, show_result = show_result)
         return self
 
     def auto_peak_finder(
@@ -461,21 +508,14 @@ class geometric_phase_analysis_2D(AutoSerialize):
         num_peaks_search = 20,
         num_peaks_use = 2,
         center_ignore_buffer = 15,
+        outer_ignore_buffer = None,
         minSpacingPeaks = 5,
+        show_result = False,
     ):
-        diffraction_peaks_list = self.locate_diffraction_spots(num_peaks_search, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
-        # print(np.array([diffraction_peaks_list[1:3]]))
-        # print(diffraction_peaks_list[:5])
-        # print("peak 1",diffraction_peaks_list[1])
+        diffraction_peaks_list = self.locate_diffraction_spots(num_peaks_search, center_ignore_buffer = center_ignore_buffer, outer_ignore_buffer= outer_ignore_buffer, minSpacingPeaks = minSpacingPeaks, show_result = show_result)
         if num_peaks_use == 2:
             peakA, peakB = self.locate_first_order_peaks(diffraction_peaks_list)
-            # diffraction_peaks_list_clipped = np.array([[diffraction_peaks_list[i]] for i in range(1,(num_peaks_use+1))])
             diffraction_peaks_list = np.array([peakA, peakB])
-            # print("Peak A",peakA)
-            # print("full list",diffraction_peaks_list)
-            # print("full list shape",diffraction_peaks_list.shape)
-            # print("clipped list",diffraction_peaks_list_clipped)
-            # print("clipped list shape",diffraction_peaks_list_clipped.shape)
             self.create_peak_objects(diffraction_peaks_list)
         else:
             diffraction_peaks_list_clipped = np.array([[diffraction_peaks_list[i]] for i in range(1,(num_peaks_use+1))])
@@ -489,6 +529,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
         num_peaks = diffraction_peaks_list.shape[0]
         self.phase_containers =[]
         for peak_ind in range(num_peaks):
+            # print(diffraction_peaks_list[peak_ind])
             self.phase_containers.append(
                 self.phase_container(
                     diffraction_peaks_list[peak_ind]
@@ -552,10 +593,16 @@ class geometric_phase_analysis_2D(AutoSerialize):
         self,
         inputMaskSize: Union[float, NDArray[float]], 
         gaussianMask: bool = True,
+        distanceMask: bool = False,
         useHamming: bool = False,
-        showResult: bool = True,
+        show_result: bool = True,
+        display_window_width: int | None = None,
         amplitude_mask_result: bool = False,
         threshold_mask: float = 0.4,
+        showAmplitude = False,
+        center_ignore_buffer = None,
+        outer_ignore_buffer = None,
+        minSpacingPeaks = None,
         ):
 
         for a0 in range(self.shape[0]):
@@ -574,10 +621,16 @@ class geometric_phase_analysis_2D(AutoSerialize):
                     peakIndex=peak_index,
                     inputMaskSize=self.mask_size,
                     gaussianMask=gaussianMask,
+                    distanceMask = distanceMask,
                     useHamming=useHamming,
-                    showResult=showResult,
+                    show_result=show_result,
+                    display_window_width = display_window_width,
                     amplitude_mask_result=amplitude_mask_result,
                     threshold_mask = threshold_mask,
+                    showAmplitude = showAmplitude,
+                    center_ignore_buffer = center_ignore_buffer,
+                    outer_ignore_buffer = outer_ignore_buffer,
+                    minSpacingPeaks = minSpacingPeaks,
                     )
         self.calculated_phase = True
         return self
@@ -587,11 +640,17 @@ class geometric_phase_analysis_2D(AutoSerialize):
         peakIndex: int, 
         inputMaskSize: float,
         gaussianMask: bool = True,
+        distanceMask: bool = False,
         useHamming: bool = False,
-        showResult: bool = True,
+        show_result: bool = True,
+        display_window_width: int | None = None,
         amplitude_mask_result: bool = False,
         refine: bool = False,
         threshold_mask: float = 0.4,
+        showAmplitude = False,
+        center_ignore_buffer = None,
+        outer_ignore_buffer = None,
+        minSpacingPeaks = None,
         ):
         """
         Calculate the geometric phase for a single Bragg peak.
@@ -606,7 +665,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
             Control for whether to use a Gaussian mask or circular binary mask. Defaults to True (Gaussian).
         useHamming: bool
             Control whether to use a Hamming window in k-space. Defaults to False.
-        showResult: bool
+        show_result: bool
             Show the real space geometric phase alongside the shifted Fourier transform and the Gaussian mask. Defaults to True.
             
         Returns
@@ -618,6 +677,30 @@ class geometric_phase_analysis_2D(AutoSerialize):
         # print(peakCoordinates)
         peakCoordinates_xy = self.get_xy_2(peakCoordinates)
 
+        # initialize display cropping
+        shape = (self.nx, self.ny)
+        if display_window_width is not None:
+            d_lower_x = int(np.floor(self.nx/2 - display_window_width/2))
+            d_upper_x = int(display_window_width + d_lower_x)
+            d_lower_y = int(np.floor(self.ny/2 - display_window_width/2))
+            d_upper_y = int(display_window_width + d_lower_y)
+
+        else:
+            d_lower_x = 0
+            d_upper_x = self.nx
+            d_lower_y = 0
+            d_upper_y = self.ny
+
+        # get r_all
+        # peak_all = np.zeros([len(self.phase_containers)-1, 2])
+        # peak_index_arr = 0
+        # for peak_index_other in range(len(self.phase_containers)):
+        #     if peak_index_other != peakIndex:
+        #         peakCoordinates = self.phase_containers[peak_index_other].peak_coordinates
+        #         peakCoordinates_xy_other = self.get_xy_2(peakCoordinates)
+        #         peak_all[peak_index_arr] = peakCoordinates_xy_other
+        #         peak_index_arr += 1
+
         # Construct Fourier Coordinates
         xx,yy = np.meshgrid(np.arange(self.nx),np.arange(self.ny), indexing = 'ij')
         dkx = 1/(self.nx); dky = 1/(self.ny)
@@ -628,10 +711,36 @@ class geometric_phase_analysis_2D(AutoSerialize):
         shift = shift * [dkx, dky]
         shift_phase = np.exp(1j*2*np.pi*(shift[0]*xx+shift[1]*yy))
 
-        if gaussianMask: # Create Mask with Gaussian Kernel
+
+        if gaussianMask and not distanceMask: # Create Mask with Gaussian Kernel
             xx,yy = np.mgrid[0:self.nx,0:self.ny]
-            gg = (((xx - center[0])**2) + ((yy - center[1])**2))/inputMaskSize
+            gg = (((xx - center[0])**2) + ((yy - center[1])**2))/inputMaskSize**2
             mask = np.exp((-0.5)*gg)
+        elif distanceMask and gaussianMask:
+
+            # need to search for other peaks in the vicinity of peakCoordinates_xy
+            # peaks = self.locate_diffraction_spots()
+            shift = np.round(np.array( center - peakCoordinates_xy))
+            peak_all = self.locate_diffraction_spots(5, center_ignore_buffer = center_ignore_buffer, outer_ignore_buffer= outer_ignore_buffer, minSpacingPeaks = minSpacingPeaks, shift_fft = shift)
+            # peak_all_xy = self.get_xy(peak_all)
+            peak_all_xy = np.zeros([peak_all.shape[0], 2])
+            for peak_index in range(peak_all.shape[0]):
+                # peak_all_i_xy = self.get_xy(peak_all[peak_index])
+                peak_all_i_xy = np.array([peak_all['x'][peak_index], peak_all['y'][peak_index]])
+                peak_all_xy[peak_index] = peak_all_i_xy
+            # print(peak_all_xy)
+            # fig, ax = plt.subplots(1,1, figsize = (5,5))
+
+            # peak_all_xy += shift
+            shape = (self.nx, self.ny)
+            # ax.scatter(peak_all_xy[:,1], peak_all_xy[:,0])
+            # ax.scatter(center[1], center[0])
+            mask = self._make_mask(
+                r0 = np.array([center[0],center[1]]),
+                r_all = peak_all_xy,
+                sigma = inputMaskSize,
+                shape = shape,
+                )
         else:             # Create a Hard Circle Mask
             circ_rad = np.amin(inputMaskSize*np.asarray(self.images[self.global_image_index].shape))
             mask = (self.make_circle(self.images[self.global_image_index].shape,self.nx/2,self.ny/2,circ_rad)).astype(bool)
@@ -644,24 +753,49 @@ class geometric_phase_analysis_2D(AutoSerialize):
         else:
             G_matrix = ifft2(ifftshift(mask*fftshift(fft2(self.images[self.global_image_index].array*shift_phase))))    # Without hamming
 
-        if showResult:
+        if show_result:
             if amplitude_mask_result:
-                def normalize_arr(array):
-                    array-=np.min(array)
-                    array /= np.max(array)
-                    return array
+                if isinstance(threshold_mask, float):
+                    max_thresh = threshold_mask
+                    min_thresh = 0
+                elif hasattr(threshold_mask, "__iter__"):
+                    arr = np.asarray(threshold_mask)
+                    if arr.size == 2:
+                        min_thresh, max_thresh = arr
+                    else:
+                        raise ValueError("threshold_mask must have exactly two entries")
+                else:
+                    raise ValueError("threshold_mask must be a scalar or an iterable with two entries")
                 amplitude_mask = np.abs(G_matrix)
-                amplitude_map_norm = normalize_arr(amplitude_mask)
-                amplitude_map_norm[amplitude_map_norm < threshold_mask] = 0
-                amplitude_map_norm[amplitude_map_norm > 0] = 1
-                im_pha_gp = self.phase_im_lab(np.angle(G_matrix) * amplitude_map_norm)
+                amplitude_map_norm = amplitude_mask/np.max(amplitude_mask)
+                mask_rescaled = (amplitude_map_norm - min_thresh) / (max_thresh - min_thresh)
+                mask_rescaled[mask_rescaled<0] = 0
+                mask_rescaled[mask_rescaled>1] = 1
+                
+                mask_soft = np.sin(np.pi/2 * mask_rescaled) ** 2
+                # amplitude_map_norm[amplitude_map_norm < threshold_mask] = 0
+                # amplitude_map_norm[amplitude_map_norm > 0] = 1
+                # def normalize_arr(array):
+                #     array-=np.min(array)
+                #     array /= np.max(array)
+                #     return array
+                # amplitude_mask = np.abs(G_matrix)
+                # amplitude_map_norm = normalize_arr(amplitude_mask)
+                # amplitude_map_norm[amplitude_map_norm < threshold_mask] = 0
+                # amplitude_map_norm[amplitude_map_norm > 0] = 1
+                im_pha_gp = self.phase_im_lab(np.angle(G_matrix) * mask_soft)
             else:
                 im_pha_gp = self.phase_im_lab(np.angle(G_matrix))
             imFFT = fftshift(fft2(self.images[self.global_image_index].array*shift_phase))
-            (_,axs) = plt.subplots(1,2,figsize=(15,30))
-            axs[0].imshow(im_pha_gp, origin = 'upper')#; axs[0].axis('off')
-            axs[1].imshow(np.log(np.abs(imFFT)+1),cmap='gray', origin = 'upper'); plt.imshow(mask,alpha=0.4, origin = 'upper'); axs[1].axis('off')
-
+            if showAmplitude:
+                (_,axs) = plt.subplots(1,3,figsize=(15,30))
+                axs[0].imshow(im_pha_gp, origin = 'upper'); axs[0].axis('off')
+                axs[1].imshow(np.abs(G_matrix), origin = 'upper'); axs[1].axis('off')
+                axs[2].imshow(np.log(np.abs(imFFT)+1)[d_lower_x:d_upper_x, d_lower_y:d_upper_y],cmap='gray', origin = 'upper'); plt.imshow(mask[d_lower_x:d_upper_x, d_lower_y:d_upper_y],alpha=0.4, origin = 'upper'); axs[2].axis('off')
+            else:
+                (_,axs) = plt.subplots(1,2,figsize=(15,30))
+                axs[0].imshow(im_pha_gp, origin = 'upper'); axs[0].axis('off')
+                axs[1].imshow(np.log(np.abs(imFFT)+1)[d_lower_x:d_upper_x, d_lower_y:d_upper_y],cmap='gray', origin = 'upper'); plt.imshow(mask[d_lower_x:d_upper_x, d_lower_y:d_upper_y],alpha=0.4, origin = 'upper'); axs[1].axis('off')
         if refine:
             self.phase_containers[peakIndex].refined_phase_map = np.angle(G_matrix)
             self.phase_containers[peakIndex].refined_amplitude_map = np.abs(G_matrix)
@@ -669,6 +803,58 @@ class geometric_phase_analysis_2D(AutoSerialize):
             self.phase_containers[peakIndex].phase_map = np.angle(G_matrix)
             self.phase_containers[peakIndex].amplitude_map = np.abs(G_matrix)
         return self
+
+
+    def _make_mask(
+            self,
+            r0,
+            r_all,
+            sigma,
+            shape,
+            show_mask = False,
+            center_min_dist = 2,
+    ):
+        dists = np.linalg.norm(r_all - r0, axis=1)
+        r_all = r_all[dists >= center_min_dist]
+
+        xa, ya = np.meshgrid(
+            np.arange(shape[0]),
+            np.arange(shape[1]),
+            indexing = 'ij',
+        )
+
+        mask = np.exp(
+            ((xa - r0[0])**2 + (ya - r0[1])**2)/
+            (-2*sigma**2)
+        )
+
+        # filter neighbors
+        
+        for r_index in range(r_all.shape[0]):
+            r1 = r_all[r_index,:]
+            v = r0 - r1
+            v_norm = np.linalg.norm(v)
+            v /= v_norm
+            dist = np.clip(
+                (xa - r1[0]) * v[0] + (ya - r1[1]) * v[1] - v_norm / 2  + 0.5,
+                0,
+                1,
+            )
+            mask *= dist
+                    
+            # dist = ((r1[1]- r0[1])*xa - (r1[0]- r0[0])*ya + r1[0]*r0[1]- r1[1]*r0[0]) / \
+            #     np.linalg.norm((r0-r1))
+
+        if show_mask:
+            fig, ax = plt.subplots()
+            ax.imshow(mask, cmap = 'gray')
+            ax.scatter(r_all[:,1], r_all[:,0])
+            ax.scatter(r0[1], r0[0], c = 'red')
+        return mask
+
+
+
+
 
     def get_phase_container(self, image_index = 0):
         return self.phase_container_containers[image_index]
@@ -853,7 +1039,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
     def calculate_displacement_maps(
         self,
         num_peaks: int = 2,
-        showResult: bool = False,
+        show_result: bool = False,
         amplitude_mask_result: bool = False,
         threshold_mask: float = 0.4,
         ):
@@ -875,7 +1061,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
             The geometric phase corresponding to the first selected peak.
         phaseB: (nx, ny) np.ndarray
             The geometric phase corresponding to the second selected peak.
-        showResult: bool
+        show_result: bool
             Show the real space displacement. Defaults to False.
             
         Returns
@@ -905,11 +1091,31 @@ class geometric_phase_analysis_2D(AutoSerialize):
         amplitudes = np.stack(amplitudes, axis=0)
 
         if amplitude_mask_result:
-            amp_mins = np.min(amplitudes, axis=(1, 2), keepdims=True)
-            amp_maxs = np.max(amplitudes, axis=(1, 2), keepdims=True)
-            amplitude_map_norm = (amplitudes - amp_mins) / (amp_maxs - amp_mins)
-            amplitude_map_norm = (amplitude_map_norm >= threshold_mask).astype(amplitudes.dtype)
-            weighted_phases = phases * amplitude_map_norm
+            # amp_mins = np.min(amplitudes, axis=(1, 2), keepdims=True)
+            # amp_maxs = np.max(amplitudes, axis=(1, 2), keepdims=True)
+            # amplitude_map_norm = (amplitudes - amp_mins) / (amp_maxs - amp_mins)
+            # amplitude_map_norm = (amplitude_map_norm >= threshold_mask).astype(amplitudes.dtype)
+
+
+
+            if isinstance(threshold_mask, float):
+                max_thresh = threshold_mask
+                min_thresh = 0
+            elif hasattr(threshold_mask, "__iter__"):
+                arr = np.asarray(threshold_mask)
+                if arr.size == 2:
+                    min_thresh, max_thresh = arr
+                else:
+                    raise ValueError("threshold_mask must have exactly two entries")
+            else:
+                raise ValueError("threshold_mask must be a scalar or an iterable with two entries")
+            amplitude_map_norm = amplitudes/np.max(amplitudes, axis=(1, 2), keepdims=True)
+            mask_rescaled = (amplitude_map_norm - min_thresh) / (max_thresh - min_thresh)
+            mask_rescaled[mask_rescaled<0] = 0
+            mask_rescaled[mask_rescaled>1] = 1
+            
+            mask_soft = np.sin(np.pi/2 * mask_rescaled) ** 2
+            weighted_phases = phases * mask_soft
         else:
             weighted_phases = phases
 
@@ -927,7 +1133,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
         displacementX = U[0].reshape(nx, ny)
         displacementY = U[1].reshape(nx, ny)
 
-        if showResult == True:
+        if show_result == True:
             show_2d(
                 [displacementX, displacementY],
                 title = ["Displacement Along X Direction (rows)","Displacement Along Y Direction (columns)"]
@@ -945,6 +1151,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
        threshold_mask: float = 0.4,
        show_result = True,
        use_phase_directly = True,
+       amplitude_mask_uniform = None,
     ):
         if not self.calculated_phase:
             inputMaskSizes = np.zeros(self.shape[0])
@@ -953,7 +1160,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
             self.calculate_phase_maps(
                 inputMaskSizes,
                 gaussianMask = True,
-                showResult = show_result,
+                show_result = show_result,
                 amplitude_mask_result = amplitude_mask_result, 
                 threshold_mask = threshold_mask,
                 )
@@ -964,14 +1171,15 @@ class geometric_phase_analysis_2D(AutoSerialize):
                 self.calculate_strain_map_phase(
                     num_peaks,
                     amplitude_mask_result, 
-                    showResult = show_result,
+                    show_result = show_result,
                     threshold_mask = threshold_mask,
+                    amplitude_mask_uniform = amplitude_mask_uniform,
                 )
         else:
             if not self.calculated_displacement:
                 self.calculate_displacement_maps(
                     num_peaks = num_peaks,
-                    showResult = show_result,
+                    show_result = show_result,
                     amplitude_mask_result = amplitude_mask_result,
                     threshold_mask = threshold_mask,
                     )
@@ -979,13 +1187,15 @@ class geometric_phase_analysis_2D(AutoSerialize):
                 self.global_image_index = a0
                 self.phase_containers = self.phase_container_containers[self.global_image_index]
                 self.calculate_strain_map_displacement(
-                    showResult = show_result,
+                    show_result = show_result,
+                    amplitude_mask_uniform = amplitude_mask_uniform,
                 )
         return self
 
     def calculate_strain_map_displacement(
         self,
-        showResult: bool = True,
+        show_result: bool = True,
+        amplitude_mask_uniform = None,
         ):
         """
         Using the x and y displacement maps, calculate the strain maps.
@@ -996,7 +1206,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
             A 2D array that maps the X (row offset) displacement within the lattice.
         displacementY: (nx, ny) np.ndarray
             A 2D array that maps the Y (column offset) displacement within the lattice.
-        showResult: bool
+        show_result: bool
             Show the real space strain. Defaults to True.
             
         Returns
@@ -1014,7 +1224,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
         
         e_xx, e_yy = self.get_axial_strain(e_mat)
         e_th_xy, e_dg_xy = self.get_rot_and_diag_strain(e_mat)
-        if showResult == True:
+        if show_result == True:
             (fig,axs) = plt.subplots(2,2, figsize = (20,25))
             show_2d(
                 [self.images[self.global_image_index].array,
@@ -1022,7 +1232,8 @@ class geometric_phase_analysis_2D(AutoSerialize):
                 ],
                 figax = (fig, axs[:1]),
                 title = ["", "$Strain_{xx}$"],
-                cmap = ["gray", "BrBG"]
+                cmap = ["gray", "BrBG_r"],
+                cbar = [False, True],
             )
             show_2d(
                 [e_yy,
@@ -1030,8 +1241,14 @@ class geometric_phase_analysis_2D(AutoSerialize):
                 ],
                 figax = (fig, axs[1:]),
                 title = ["$Strain_{yy}$", "$Strain_{xy}$"],
-                cmap = "BrBG"
+                cmap = "BrBG_r",
+                cbar = [True, True],
             )
+            vmin = min(e_xx.min(), e_yy.min(), e_dg_xy.min())
+            vmax = min(e_xx.max(), e_yy.max(), e_dg_xy.max())
+            axs[0,1].images[0].set_clim(vmin, vmax)
+            axs[1,0].images[0].set_clim(vmin, vmax)
+            axs[1,1].images[0].set_clim(vmin, vmax)
             fig.tight_layout()
 
         return e_mat
@@ -1040,34 +1257,100 @@ class geometric_phase_analysis_2D(AutoSerialize):
         self,
         num_peaks,
         amplitude_mask_result = False,
+        amplitude_mask_each = False,
         threshold_mask = 0.4,
-        showResult = True,
+        show_result = True,
+        amplitude_mask_uniform = None,
+        mean_center = True,
+        show_angle = True,
     ):
         peak_coords = []
         nx_, ny_ = self.phase_containers[0].phase_map.shape # get the rows and columns of the phase map, which does not have padding here
 
         phase_derivatives = np.zeros([num_peaks, 2, nx_, ny_])
 
-        print("phase containers", len(self.phase_containers))
+        # print("phase containers", len(self.phase_containers))
             # print("test", i)
+        amp_sum = np.zeros(num_peaks)
         for i in range(num_peaks):
             pc = self.phase_containers[i]
             peak_coords.append(self.circ_to_G(self.get_xy_2(pc.peak_coordinates)))
             exp_matrix1 = np.exp(-1j*pc.phase_map)
             exp_matrix2 = np.exp(1j*pc.phase_map)
             if amplitude_mask_result:
-                def normalize_arr(array):
-                    array-=np.min(array)
-                    array /= np.max(array)
-                    return array
-                amplitude_map_norm = normalize_arr(pc.amplitude_map)
-                amplitude_map_norm[amplitude_map_norm < threshold_mask] = 0
-                amplitude_map_norm[amplitude_map_norm > 0] = 1
-                phase_derivatives[i, 0] = np.imag(np.multiply(exp_matrix1,np.gradient(exp_matrix2, axis=0))) * amplitude_map_norm # phaseA_dx 
-                phase_derivatives[i, 1] = np.imag(np.multiply(exp_matrix1,np.gradient(exp_matrix2, axis=1))) * amplitude_map_norm # phaseA_dy
+                # def normalize_arr(array):
+                #     array-=np.min(array)
+                #     array /= np.max(array)
+                #     return array
+                # amplitude_map_norm = normalize_arr(pc.amplitude_map)
+                # amplitude_map_norm[amplitude_map_norm < threshold_mask] = 0
+                # amplitude_map_norm[amplitude_map_norm > 0] = 1
+
+                if isinstance(threshold_mask, float):
+                    max_thresh = threshold_mask
+                    min_thresh = 0
+                elif hasattr(threshold_mask, "__iter__"):
+                    arr = np.asarray(threshold_mask)
+                    if arr.size == 2:
+                        min_thresh, max_thresh = arr
+                    else:
+                        raise ValueError("threshold_mask must have exactly two entries")
+                else:
+                    raise ValueError("threshold_mask must be a scalar or an iterable with two entries")
+                amplitude_mask = pc.amplitude_map
+                amplitude_map_norm = amplitude_mask/np.max(amplitude_mask)
+                mask_rescaled = (amplitude_map_norm - min_thresh) / (max_thresh - min_thresh)
+                mask_rescaled[mask_rescaled<0] = 0
+                mask_rescaled[mask_rescaled>1] = 1
+                
+                mask_soft = np.sin(np.pi/2 * mask_rescaled) ** 2
+
+                amp_sum[i] = np.sum(amplitude_map_norm)
+                if amplitude_mask_each:
+                    phase_derivatives[i, 0] = np.imag(np.multiply(exp_matrix1,np.gradient(exp_matrix2, axis=0))) * mask_soft # phaseA_dx 
+                    phase_derivatives[i, 1] = np.imag(np.multiply(exp_matrix1,np.gradient(exp_matrix2, axis=1))) * mask_soft # phaseA_dy
+                else:
+                    phase_derivatives[i, 0] = np.imag(np.multiply(exp_matrix1,np.gradient(exp_matrix2, axis=0))) # phaseA_dx 
+                    phase_derivatives[i, 1] = np.imag(np.multiply(exp_matrix1,np.gradient(exp_matrix2, axis=1))) # phaseA_dy
             else:
                 phase_derivatives[i, 0] = np.imag(np.multiply(exp_matrix1,np.gradient(exp_matrix2, axis=0))) # phaseA_dx 
                 phase_derivatives[i, 1] = np.imag(np.multiply(exp_matrix1,np.gradient(exp_matrix2, axis=1))) # phaseA_dy
+
+        if amplitude_mask_uniform is not None:
+            if amplitude_mask_uniform in np.arange(0, num_peaks):
+                amplitude_mask_index = amplitude_mask_uniform
+            else:
+                amplitude_mask_index = np.argmin(amp_sum)
+            amplitude_map = self.phase_containers[amplitude_mask_index].amplitude_map
+            # def normalize_arr(array):
+            #     array-=np.min(array)
+            #     array /= np.max(array)
+            #     return array
+            # amplitude_map_norm = normalize_arr(amplitude_map)
+            # amplitude_map_norm[amplitude_map_norm < threshold_mask] = 0
+            # amplitude_map_norm[amplitude_map_norm > 0] = 1
+            if isinstance(threshold_mask, float):
+                max_thresh = threshold_mask
+                min_thresh = 0
+            elif hasattr(threshold_mask, "__iter__"):
+                arr = np.asarray(threshold_mask)
+                if arr.size == 2:
+                    min_thresh, max_thresh = arr
+                else:
+                    raise ValueError("threshold_mask must have exactly two entries")
+            else:
+                raise ValueError("threshold_mask must be a scalar or an iterable with two entries")
+            amplitude_mask = amplitude_map
+            amplitude_map_norm = amplitude_mask/np.max(amplitude_mask)
+            mask_rescaled = (amplitude_map_norm - min_thresh) / (max_thresh - min_thresh)
+            mask_rescaled[mask_rescaled<0] = 0
+            mask_rescaled[mask_rescaled>1] = 1
+            # plt.figure()
+            # plt.imshow(mask_rescaled)
+            
+            mask_soft = np.sin(np.pi/2 * mask_rescaled) ** 2
+            self.strain_mask_soft = mask_soft
+            phase_derivatives = phase_derivatives * mask_soft
 
         A = np.array([[p[0], p[1]] for p in peak_coords])
 
@@ -1079,29 +1362,685 @@ class geometric_phase_analysis_2D(AutoSerialize):
 
         # e_mat = A_pinv @ phase_derivatives
         e_mat = -1/(2*np.pi) * np.einsum('ij,jkab->ikab', A_pinv, phase_derivatives)
+        self.e_mat = e_mat
 
         e_xx, e_yy = self.get_axial_strain(e_mat)
-        e_th_xy, e_dg_xy = self.get_rot_and_diag_strain(e_mat)
-        if showResult == True:
-            (fig,axs) = plt.subplots(2,2, figsize = (20,25))
-            show_2d(
-                [self.images[self.global_image_index].array,
-                e_xx,
-                ],
-                figax = (fig, axs[:1]),
-                title = ["", "$Strain_{xx}$"],
-                cmap = ["gray", "BrBG"]
-            )
-            show_2d(
-                [e_yy,
-                e_dg_xy,
-                ],
-                figax = (fig, axs[1:]),
-                title = ["$Strain_{yy}$", "$Strain_{xy}$"],
-                cmap = "BrBG"
-            )
-            fig.tight_layout()
+        omega, e_dg_xy = self.get_rot_and_diag_strain(e_mat)
+
+        eps_uu, eps_vv, eps_uv, u, v = self.get_uv_strain(e_mat, num_peaks)
+
+        # crop_in_mask = np.zeros(eps_uu.shape)
+        # win_c = 60
+        # crop_in_mask[win_c:-win_c, win_c:-win_c] = 1
+        # crop_in_mask = gaussian_filter(crop_in_mask, 20)
+
+        # eps_uu *= crop_in_mask
+        # eps_uv *= crop_in_mask
+        # eps_vv *= crop_in_mask
+        # omega_uv *= crop_in_mask
+        if show_result == True:
+            # (fig,axs) = plt.subplots(2,2, figsize = (20,25))
+
+
+            # show_2d(
+            #     [self.images[self.global_image_index].array,
+            #     e_xx * 100,  # x100 for percent units
+            #     ],
+            #     figax = (fig, axs[:1]),
+            #     norm=[{}, {"vmin": vmin, "vmax": vmax}],
+            #     title = ["", "$Strain_{xx}$"],
+            #     cmap = ["gray", "BrBG_r"],
+            #     cbar = [False, True],
+            # )
+            # fig.axes[-1].set_ylabel("Percent strain")
+            # show_2d(
+            #     [e_yy * 100,  # x100 for percent units
+            #     e_dg_xy * 100,
+            #     ],
+            #     figax = (fig, axs[1:]),
+            #     norm=[{"vmin": vmin, "vmax": vmax}, {"vmin": vmin, "vmax": vmax}],
+            #     title = ["$Strain_{yy}$", "$Strain_{xy}$"],
+            #     cmap = "BrBG_r",
+            #     cbar = [True, True],
+            # )
+            # for cax, label in zip(fig.axes[-2:], ["Percent strain", "Percent strain"]):
+            #     cax.set_ylabel(label)
+            # axs[0,1].images[0].set_clim(vmin, vmin)
+            # axs[1,0].images[0].set_clim(vmin, vmax)
+            # axs[1,1].images[0].set_clim(vmin, vmax)
+            # fig.tight_layout()
+            # fig.canvas.draw_idle()
+
+
+            # vmin = min(e_xx.min(), e_yy.min(), e_dg_xy.min())
+            # vmax = min(e_xx.max(), e_yy.max(), e_dg_xy.max())
+
+            # (fig2, ax2) = plt.subplots(2, 2, figsize=(20, 25))
+
+            # ax2[0,0].imshow(self.images[self.global_image_index].array, cmap = 'gray')
+
+            # im01 = ax2[0,1].imshow(e_xx * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
+            # ax2[0,1].set_title("Strain_xx")
+
+            # im10 = ax2[1,0].imshow(e_yy * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
+            # ax2[1,0].set_title("Strain_yy")
+
+            # im11 = ax2[1,1].imshow(e_dg_xy * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
+            # ax2[1,1].set_title("Strain_xy")
+
+            # fig2.colorbar(im01, ax=ax2[0,1])
+            # fig2.colorbar(im10, ax=ax2[1,0])
+            # fig2.colorbar(im11, ax=ax2[1,1])
+            # fig2.tight_layout()
+            if not show_angle:
+                if mean_center:
+                    eps_uu -= np.mean(eps_uu)
+                    eps_vv -= np.mean(eps_vv)
+                    eps_uv -= np.mean(eps_uv)
+
+                vmin = min(np.min(eps_uu), np.min(eps_vv), np.min(eps_uv)) * 100
+                vmax = max(np.max(eps_uu), np.max(eps_vv), np.max(eps_uv)) * 100
+
+                
+                vmax = max(np.abs(vmin), vmax)
+                vmin = -vmax
+
+                fig2 = plt.figure(figsize=(20,20))
+
+                ax1 = plt.subplot(221)
+                im11 = ax1.imshow(self.images[self.global_image_index].array, cmap="gray")
+                ax1.set_title("")
+
+                ax2 = plt.subplot(222)
+                im12 = ax2.imshow(eps_uu * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
+                ax2.set_title("$Strain_{uu}$")
+                # fig2.colorbar(im12, ax=ax2)
+
+                ax3 = plt.subplot(223)
+                im13 = ax3.imshow(eps_vv * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
+                ax3.set_title("$Strain_{vv}$")
+                # fig2.colorbar(im13, ax=ax3)
+
+                ax4 = plt.subplot(224)
+                im14 = ax4.imshow(eps_uv * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
+                ax4.set_title("$Strain_{uv}$")
+                # fig2.colorbar(im14, ax=ax4)
+
+                def add_matching_colorbar(fig, ax, im, label, width=0.015, pad=0.01):
+                    pos = ax.get_position()
+                    cax = fig.add_axes([
+                        pos.x1 + pad,
+                        pos.y0,
+                        width,
+                        pos.height
+                    ])
+                    fig.colorbar(im, cax=cax, label = label)
+
+                add_matching_colorbar(fig2, ax2, im12, 'Percent Strain')
+                add_matching_colorbar(fig2, ax3, im13, 'Percent Strain')
+                add_matching_colorbar(fig2, ax4, im14, 'Percent Strain')
+
+
+                ax1.axis('off')
+                ax2.axis('off')
+                ax3.axis('off')
+                ax4.axis('off')
+
+                peak_coords_px = []
+                for i in range(num_peaks):
+                    pc = self.phase_containers[i]
+                    peak_coords_px.append(self.get_xy_2(pc.peak_coordinates))
+
+                peak_coords_px_arr = np.array(peak_coords_px)
+
+                inset_width = 1/3
+                inset_height = 1/3
+                inset_ax = ax1.inset_axes([1-inset_width, 1-inset_height, inset_width, inset_height])
+                nx, ny = self._FFT[self.global_image_index].array.shape
+                win_x = nx//3
+                win_y = ny//3
+                inset_ax.imshow(np.log1p(np.abs(self._FFT[self.global_image_index].array[win_x:-win_x, win_y:-win_y])), cmap="gray")
+                inset_ax.set_xticks([])
+                inset_ax.set_yticks([])
+
+                # inset_ax.set_xticks([])
+                # inset_ax.set_yticks([])
+
+                for spine in inset_ax.spines.values():
+                    spine.set_visible(True)
+                    spine.set_linewidth(1.5)
+                    spine.set_color("black")
+
+                inset_ax.scatter(
+                    peak_coords_px_arr[:,1] - win_y,
+                    peak_coords_px_arr[:,0] - win_x,
+                    s=10, 
+                    facecolors=(1,0,0,0.6),
+                    edgecolors=(1,1,1,1),
+                    linewidths = 0.5,
+                )
+                inset_origin_x = nx/2 - win_x-1
+                inset_origin_y = ny/2 - win_y+1
+                inset_ax.scatter(
+                    inset_origin_y,
+                    inset_origin_x,
+                    s=50, 
+                    facecolors=(0,0,0,0.6),
+                    # edgecolors=(1,1,1,1),
+                    linewidths = 0.5,
+                    zorder = 10,
+                )
+
+                for (x, y) in peak_coords_px_arr:
+                    inset_ax.annotate(
+                        "", 
+                        xy=(y - win_y, x - win_x),
+                        xytext=(inset_origin_y, inset_origin_x),
+                        arrowprops=dict(
+                            arrowstyle="->",
+                            color="red",
+                            lw=1.5
+                        ),
+                    )
+                labels = ["u", "v"]
+                for (x, y), label in zip(peak_coords_px_arr[:2], labels):
+                    inset_ax.text(
+                        y - win_y,
+                        x - win_x+30,
+                        label,
+                        color="white",
+                        fontsize=10,
+                        ha="left",
+                        va="bottom"
+                    )
+
+
+
+
+            if show_angle:
+                if mean_center:
+                    eps_uu -= np.mean(eps_uu)
+                    eps_vv -= np.mean(eps_vv)
+                    eps_uv -= np.mean(eps_uv)
+                    omega -= np.mean(omega)
+
+                vmin = min(np.min(eps_uu), np.min(eps_vv), np.min(eps_uv), np.min(omega)) * 100
+                vmax = max(np.max(eps_uu), np.max(eps_vv), np.max(eps_uv), np.max(omega)) * 100
+
+                vmax = max(np.abs(vmin), vmax)
+                vmin = -vmax
+
+
+                fig2 = plt.figure(figsize=(20,30))
+
+                ax1 = plt.subplot(321)
+                im11 = ax1.imshow(self.images[self.global_image_index].array, cmap="gray")
+                ax1.set_title("")
+
+                ax2 = plt.subplot(322)
+                im12 = ax2.imshow(eps_uu * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
+                ax2.set_title("$Strain_{uu}$")
+                # fig2.colorbar(im12, ax=ax2)
+
+                ax3 = plt.subplot(323)
+                im13 = ax3.imshow(eps_vv * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
+                ax3.set_title("$Strain_{vv}$")
+                # fig2.colorbar(im13, ax=ax3)
+
+                ax4 = plt.subplot(324)
+                im14 = ax4.imshow(eps_uv * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
+                ax4.set_title("$Strain_{uv}$")
+                # fig2.colorbar(im14, ax=ax4)
+
+                ax5 = plt.subplot(325)
+                im15 = ax5.imshow(omega * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
+                ax5.set_title(r"$\omega$")
+
+                def add_matching_colorbar(fig, ax, im, label, width=0.015, pad=0.01):
+                    pos = ax.get_position()
+                    cax = fig.add_axes([
+                        pos.x1 + pad,
+                        pos.y0,
+                        width,
+                        pos.height
+                    ])
+                    fig.colorbar(im, cax=cax, label = label)
+
+                add_matching_colorbar(fig2, ax2, im12, 'Percent Strain')
+                add_matching_colorbar(fig2, ax3, im13, 'Percent Strain')
+                add_matching_colorbar(fig2, ax4, im14, 'Percent Strain')
+                add_matching_colorbar(fig2, ax5, im15, 'Percent Strain')
+
+
+                ax1.axis('off')
+                ax2.axis('off')
+                ax3.axis('off')
+                ax4.axis('off')
+                ax5.axis('off')
+
+                peak_coords_px = []
+                for i in range(num_peaks):
+                    pc = self.phase_containers[i]
+                    peak_coords_px.append(self.get_xy_2(pc.peak_coordinates))
+
+                peak_coords_px_arr = np.array(peak_coords_px)
+
+                inset_width = 1/3
+                inset_height = 1/3
+                inset_ax = ax1.inset_axes([1-inset_width, 1-inset_height, inset_width, inset_height])
+                nx, ny = self._FFT[self.global_image_index].array.shape
+                win_x = nx//3
+                win_y = ny//3
+                inset_ax.imshow(np.log1p(np.abs(self._FFT[self.global_image_index].array[win_x:-win_x, win_y:-win_y])), cmap="gray")
+                inset_ax.set_xticks([])
+                inset_ax.set_yticks([])
+
+                # inset_ax.set_xticks([])
+                # inset_ax.set_yticks([])
+
+                for spine in inset_ax.spines.values():
+                    spine.set_visible(True)
+                    spine.set_linewidth(1.5)
+                    spine.set_color("black")
+
+                inset_ax.scatter(
+                    peak_coords_px_arr[:,1] - win_y,
+                    peak_coords_px_arr[:,0] - win_x,
+                    s=10, 
+                    facecolors=(1,0,0,0.6),
+                    edgecolors=(1,1,1,1),
+                    linewidths = 0.5,
+                )
+                inset_origin_x = nx/2 - win_x-1
+                inset_origin_y = ny/2 - win_y+1
+                inset_ax.scatter(
+                    inset_origin_y,
+                    inset_origin_x,
+                    s=50, 
+                    facecolors=(0,0,0,0.6),
+                    # edgecolors=(1,1,1,1),
+                    linewidths = 0.5,
+                    zorder = 10,
+                )
+
+                for (x, y) in peak_coords_px_arr:
+                    inset_ax.annotate(
+                        "", 
+                        xy=(y - win_y, x - win_x),
+                        xytext=(inset_origin_y, inset_origin_x),
+                        arrowprops=dict(
+                            arrowstyle="->",
+                            color="red",
+                            lw=1.5
+                        ),
+                    )
+                labels = ["p1", "p2"]
+                for (x, y), label in zip(peak_coords_px_arr[:2], labels):
+                    inset_ax.text(
+                        y - win_y,
+                        x - win_x+30,
+                        label,
+                        color="white",
+                        fontsize=10,
+                        ha="left",
+                        va="bottom"
+                    )
+
+
         return e_mat
+
+
+
+    def show_strain_maps(
+        self,
+        e_mat = None,
+        crop_width = None,
+        mean_center = True,
+        num_peaks = 2,
+        amplitude_mask_uniform = None,
+        v_lim = None,
+        fft_win = None,
+        u = None,
+        # dilation = False,
+        # rotation = True,
+    ):
+        if e_mat is None:
+            e_mat = self.e_mat
+        eps_uu, eps_vv, eps_uv, u, v = self.get_uv_strain(e_mat, num_peaks, u = u)
+        omega, _ = self.get_rot_and_diag_strain(e_mat)
+
+
+        if crop_width is None:
+            crop_width = (np.array(self.images[0].array.shape).astype(int) - np.array(self.shape_init[0]).astype(int)) / 2
+            print(crop_width)
+            crop_width = crop_width.astype(int)
+
+        if isinstance(crop_width, (int, float)):
+            crop_width = (int(np.round(crop_width)), int(np.round(crop_width)))
+
+        black_mask = self.strain_mask_soft[crop_width[0]:-crop_width[0], crop_width[1]:-crop_width[1]]
+
+        # phase image, after fitting carrier wave
+        # iteratively fit a plane wave to it
+        # periodic mapping?
+        # i - i_mean
+        # i_mean = <I * m>  / <m>
+        # i_mean = np.mean(eps_uu) / (np.mean(black_mask)) # here the black mask is already applied to eps_uu
+        if mean_center:
+            eps_uu -= np.mean(eps_uu) / np.mean(black_mask)
+            eps_vv -= np.mean(eps_vv) / np.mean(black_mask)
+            eps_uv -= np.mean(eps_uv) / np.mean(black_mask)
+            omega -= np.mean(omega) / np.mean(black_mask)
+
+        if v_lim is not None:
+            vmin = -np.abs(v_lim)
+            vmax = np.abs(v_lim)
+
+        if v_lim is None:
+            vmin = min(np.min(eps_uu), np.min(eps_vv), np.min(eps_uv), np.min(omega)) * 100
+            vmax = max(np.max(eps_uu), np.max(eps_vv), np.max(eps_uv), np.max(omega)) * 100
+
+            vmax = max(np.abs(vmin), vmax)
+            vmin = -vmax
+
+
+
+
+        # if amplitude_mask_uniform is not None:
+        #     if amplitude_mask_uniform in np.arange(0, num_peaks):
+        #         amplitude_mask_index = amplitude_mask_uniform
+        #     amplitude_map = self.phase_containers[amplitude_mask_index].amplitude_map
+        #     # def normalize_arr(array):
+        #     #     array-=np.min(array)
+        #     #     array /= np.max(array)
+        #     #     return array
+        #     # amplitude_map_norm = normalize_arr(amplitude_map)
+        #     # amplitude_map_norm[amplitude_map_norm < threshold_mask] = 0
+        #     # amplitude_map_norm[amplitude_map_norm > 0] = 1
+        #     if isinstance(threshold_mask, float):
+        #         max_thresh = threshold_mask
+        #         min_thresh = 0
+        #     elif hasattr(threshold_mask, "__iter__"):
+        #         arr = np.asarray(threshold_mask)
+        #         if arr.size == 2:
+        #             min_thresh, max_thresh = arr
+        #         else:
+        #             raise ValueError("threshold_mask must have exactly two entries")
+        #     else:
+        #         raise ValueError("threshold_mask must be a scalar or an iterable with two entries")
+        #     amplitude_mask = amplitude_map
+        #     amplitude_map_norm = amplitude_mask/np.max(amplitude_mask)
+        #     mask_rescaled = (amplitude_map_norm - min_thresh) / (max_thresh - min_thresh)
+        #     mask_rescaled[mask_rescaled<0] = 0
+        #     mask_rescaled[mask_rescaled>1] = 1
+
+
+        # # eps_uu[crop_width[0]:-crop_width[0], crop_width[1]:-crop_width[1]] * 100
+        # masked_data = np.ma.array(eps_uu, mask = mask < 0.5)   # mask "outside" region
+
+        # cmap = plt.cm.BrBG_r.copy()
+        # cmap.set_bad(color='black')   # masked values will be pure black
+        # plt.figure()
+        # plt.imshow(masked_data, cmap=cmap)
+
+        # plt.figure()
+        # plt.imshow(eps_uu, cmap="BrBG_r")
+        # print(mask)
+
+
+
+        fig2 = plt.figure(figsize=(20,30))
+        plt.rcParams["font.size"] = 20
+        # plt.rcParams["axes.titlesize"] = 400
+        # plt.rcParams["axes.labelsize"] = 400
+        # plt.rcParams["xtick.labelsize"] = 400
+        # plt.rcParams["ytick.labelsize"] = 400
+        # plt.rcParams["legend.fontsize"] = 400
+        # plt.rcParams["figure.titlesize"] = 400
+
+        ax1 = plt.subplot(321)
+        im11 = ax1.imshow(self.images[self.global_image_index].array[crop_width[0]:-crop_width[0], crop_width[1]:-crop_width[1]], cmap="gray")
+        ax1.set_title("")
+
+        ax2 = plt.subplot(322)
+        im12 = ax2.imshow(eps_uu[crop_width[0]:-crop_width[0], crop_width[1]:-crop_width[1]] * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
+        ax2.set_title("$Strain_{uu}$")
+        # fig2.colorbar(im12, ax=ax2)
+
+        ax3 = plt.subplot(323)
+        im13 = ax3.imshow(eps_vv[crop_width[0]:-crop_width[0], crop_width[1]:-crop_width[1]] * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
+        ax3.set_title("$Strain_{vv}$")
+        # fig2.colorbar(im13, ax=ax3)
+
+        ax4 = plt.subplot(324)
+        im14 = ax4.imshow(eps_uv[crop_width[0]:-crop_width[0], crop_width[1]:-crop_width[1]] * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
+        ax4.set_title("$Strain_{uv}$")
+        # fig2.colorbar(im14, ax=ax4)
+
+        # print('eps_uv 0:2,0:2 pixel values', (eps_uv[crop_width[0]:-crop_width[0], crop_width[1]:-crop_width[1]] * 100)[0:2,0:2])
+
+        ax5 = plt.subplot(325)
+        im15 = ax5.imshow(omega[crop_width[0]:-crop_width[0], crop_width[1]:-crop_width[1]] * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
+        ax5.set_title(r"$\omega$")
+
+        ax6 = plt.subplot(326)
+        im16 = ax6.imshow((eps_uu + eps_vv)[crop_width[0]:-crop_width[0], crop_width[1]:-crop_width[1]] * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
+        ax6.set_title("$Dilation$")
+
+        ax2.imshow(1-black_mask, cmap="gray_r", alpha=1-black_mask)
+        ax3.imshow(1-black_mask, cmap="gray_r", alpha=1-black_mask)
+        ax4.imshow(1-black_mask, cmap="gray_r", alpha=1-black_mask)
+        ax5.imshow(1-black_mask, cmap="gray_r", alpha=1-black_mask)
+        ax6.imshow(1-black_mask, cmap="gray_r", alpha=1-black_mask)
+
+        def add_matching_colorbar(fig, ax, im, label, width=0.015, pad=0.01):
+            pos = ax.get_position()
+            cax = fig.add_axes([
+                pos.x1 + pad,
+                pos.y0,
+                width,
+                pos.height
+            ])
+            fig.colorbar(im, cax=cax, label = label)
+
+        add_matching_colorbar(fig2, ax2, im12, 'Percent Strain')
+        add_matching_colorbar(fig2, ax3, im13, 'Percent Strain')
+        add_matching_colorbar(fig2, ax4, im14, 'Percent Strain')
+        add_matching_colorbar(fig2, ax5, im15, 'Percent Strain')
+        add_matching_colorbar(fig2, ax6, im16, 'Percent Strain')
+
+
+        ax1.axis('off')
+        ax2.axis('off')
+        ax3.axis('off')
+        ax4.axis('off')
+        ax5.axis('off')
+        ax6.axis('off')
+
+        peak_coords_px = []
+        for i in range(num_peaks):
+            pc = self.phase_containers[i]
+            peak_coords_px.append(self.get_xy_2(pc.peak_coordinates))
+
+        peak_coords_px_arr = np.array(peak_coords_px)
+
+        inset_width = 1/3
+        inset_height = 1/3
+        inset_ax = ax1.inset_axes([1-inset_width, 1-inset_height, inset_width, inset_height])
+        nx, ny = self._FFT[self.global_image_index].array.shape
+        if fft_win is not None:
+            if isinstance(fft_win, (int, float)):
+                fft_win = (fft_win, fft_win)
+            win_x = fft_win[0]
+            win_y = fft_win[1]
+
+        if fft_win is None:
+            win_x = nx//3
+            win_y = ny//3
+        inset_ax.imshow(np.log1p(np.abs(self._FFT[self.global_image_index].array[win_x:-win_x, win_y:-win_y])), cmap="gray")
+        inset_ax.set_xticks([])
+        inset_ax.set_yticks([])
+
+        # inset_ax.set_xticks([])
+        # inset_ax.set_yticks([])
+
+        for spine in inset_ax.spines.values():
+            spine.set_visible(True)
+            spine.set_linewidth(1.5)
+            spine.set_color("black")
+
+        inset_ax.scatter(
+            peak_coords_px_arr[:,1] - win_y,
+            peak_coords_px_arr[:,0] - win_x,
+            s=10, 
+            facecolors=(1,0,0,0.6),
+            edgecolors=(1,1,1,1),
+            linewidths = 0.5,
+        )
+        inset_origin_x = nx/2 - win_x-1
+        inset_origin_y = ny/2 - win_y+1
+        inset_ax.scatter(
+            inset_origin_y,
+            inset_origin_x,
+            s=50, 
+            facecolors=(0,0,0,0.6),
+            # edgecolors=(1,1,1,1),
+            linewidths = 0.5,
+            zorder = 10,
+        )
+
+        for (x, y) in peak_coords_px_arr:
+            inset_ax.annotate(
+                "", 
+                xy=(y - win_y, x - win_x),
+                xytext=(inset_origin_y, inset_origin_x),
+                arrowprops=dict(
+                    arrowstyle="->",
+                    color="red",
+                    lw=1.5
+                ),
+            )
+        labels = ["p1", "p2"]
+        for (x, y), label in zip(peak_coords_px_arr[:2], labels):
+            inset_ax.text(
+                y - win_y,
+                x - win_x+40,
+                label,
+                color="white",
+                fontsize=10,
+                ha="left",
+                va="bottom"
+            )
+
+
+
+        uv_arr = np.array([u,v])
+        origin_x = 7/8 * nx-crop_width[0]*2
+        origin_y= 7/8 * ny-crop_width[1]*2
+        for (x, y) in uv_arr:
+            ax1.annotate(
+                "", 
+                xy=(y*(ny-crop_width[1]*2)/10+origin_y, x*(nx-crop_width[0]*2)/10+origin_x),
+                xytext=(origin_y, origin_x),
+                arrowprops=dict(
+                    arrowstyle="->",
+                    color="red",
+                    lw=4
+                ),
+            )
+        labels = ["u", "v"]
+        for (x, y), label in zip(uv_arr, labels):
+            ax1.text(
+                y*(ny-crop_width[1]*2)/10+origin_y+20,
+                x*(nx-crop_width[0]*2)/10+origin_x+40,
+                label,
+                color="white",
+                fontsize=25,
+                ha="left",
+                va="bottom"
+            )
+        ax1.scatter(
+            origin_y,
+            origin_x,
+            s=100, 
+            facecolors=(0,0,0,0.9),
+            # edgecolors=(1,1,1,1),
+            linewidths = 0.5,
+            zorder = 10,
+        )
+
+
+        plt.rcParams["font.size"] = 12
+
+
+
+        # now show the direction of the u and v vectors
+        # inset_ax_2 = ax1.inset_axes([1-inset_width, 1-inset_height, inset_width, inset_height])
+        # nx, ny = self._FFT[self.global_image_index].array.shape
+        # if fft_win is not None:
+        #     if isinstance(fft_win, (int, float)):
+        #         fft_win = (fft_win, fft_win)
+        #     win_x = fft_win[0]
+        #     win_y = fft_win[1]
+
+        # if fft_win is None:
+        #     win_x = nx//3
+        #     win_y = ny//3
+        # inset_ax_2.imshow(np.log1p(np.abs(self._FFT[self.global_image_index].array[win_x:-win_x, win_y:-win_y])), cmap="gray")
+        # inset_ax_2.set_xticks([])
+        # inset_ax_2.set_yticks([])
+
+        # for spine in inset_ax_2.spines.values():
+        #     spine.set_visible(True)
+        #     spine.set_linewidth(1.5)
+        #     spine.set_color("black")
+
+        # inset_ax_2.scatter(
+        #     peak_coords_px_arr[:,1] - win_y,
+        #     peak_coords_px_arr[:,0] - win_x,
+        #     s=10, 
+        #     facecolors=(1,0,0,0.6),
+        #     edgecolors=(1,1,1,1),
+        #     linewidths = 0.5,
+        # )
+        # inset_origin_x = nx/2 - win_x-1
+        # inset_origin_y = ny/2 - win_y+1
+        # inset_ax_2.scatter(
+        #     inset_origin_y,
+        #     inset_origin_x,
+        #     s=50, 
+        #     facecolors=(0,0,0,0.6),
+        #     # edgecolors=(1,1,1,1),
+        #     linewidths = 0.5,
+        #     zorder = 10,
+        # )
+
+        # for (x, y) in peak_coords_px_arr:
+        #     inset_ax_2.annotate(
+        #         "", 
+        #         xy=(y - win_y, x - win_x),
+        #         xytext=(inset_origin_y, inset_origin_x),
+        #         arrowprops=dict(
+        #             arrowstyle="->",
+        #             color="red",
+        #             lw=1.5
+        #         ),
+        #     )
+        # labels = ["u", "v"]
+        # for (x, y), label in zip(peak_coords_px_arr[:2], labels):
+        #     inset_ax_2.text(
+        #         y - win_y,
+        #         x - win_x+80,
+        #         label,
+        #         color="white",
+        #         fontsize=10,
+        #         ha="left",
+        #         va="bottom"
+        #     )
+
+        return self
+
+
 
     def get_rot_and_diag_strain(
         self, 
@@ -1147,6 +2086,62 @@ class geometric_phase_analysis_2D(AutoSerialize):
             The y (column) axial strain.
        """
         return e_mat[0,0], e_mat[1,1]
+
+
+    def get_uv_strain(
+        self,
+        e_mat,
+        num_peaks,
+        u = None,
+        v = None,
+        theta = None,
+    ):
+    
+        eps_xx, eps_yy = self.get_axial_strain(e_mat)
+        _, eps_xy = self.get_rot_and_diag_strain(e_mat)
+        shape = np.array(eps_xx.shape)
+        if theta is not None:
+            R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+            u = (R @ np.array([1,0]).T).T
+            v = (R @ np.array([0,1]).T).T
+
+        elif u is None:
+            peak_coords_px = []
+            for i in range(num_peaks):
+                pc = self.phase_containers[i]
+                peak_coords_px.append(self.get_xy_2(pc.peak_coordinates))
+            peak_coords_px_arr = np.array(peak_coords_px)
+            u = peak_coords_px_arr[0] - shape/2
+            if v is None:
+                theta = np.pi/2
+                R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+                v = (R@u.T).T
+        elif u is not None:
+            theta = np.pi/2
+            R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+            v = (R@u.T).T
+        # elif u is None:
+        #     peak_coords_px = []
+        #     for i in range(num_peaks):
+        #         pc = self.phase_containers[i]
+        #         peak_coords_px.append(self.get_xy_2(pc.peak_coordinates))
+        #     peak_coords_px_arr = np.array(peak_coords_px)
+        #     u = peak_coords_px_arr[0] - shape/2
+        #     if v is None:
+        #         v = peak_coords_px_arr[1] - shape/2
+
+
+        # print(u, v)
+        # normalize
+        u /= np.linalg.norm(u)
+        v /= np.linalg.norm(v)
+        ux = u[0]; uy = u[1]
+        vx = v[0]; vy = v[1]
+        eps_uu = ux*ux*eps_xx + 2*ux*uy*eps_xy + uy*uy*eps_yy
+        eps_vv = vx*vx*eps_xx + 2*vx*vy*eps_xy + vy*vy*eps_yy
+        eps_uv = ux*vx*eps_xx + (ux*vy + uy*vx)*eps_xy + uy*vy*eps_yy
+
+        return eps_uu, eps_vv, eps_uv, u, v
 
     def refine_phases(
         self,
@@ -1284,8 +2279,8 @@ class geometric_phase_analysis_2D(AutoSerialize):
         iterations: int,
         useGaussMask: bool,
         amplitude_mask_result = False,
-        showResult: bool = True,
-        threshold_mask: float = 0.4,
+        show_result: bool = True,
+        threshold_mask: np.ndarray | float = 0.4,
         ):
         """
         Refine the geometric phase according to the user-defined reference (ideal) region of the crystal.
@@ -1304,7 +2299,7 @@ class geometric_phase_analysis_2D(AutoSerialize):
             The number of iterations of phase refinement.
         useGaussMask: bool
             Control for whether to use a Gaussian mask or circular binary mask. Defaults to True (Gaussian).
-        showResult: bool
+        show_result: bool
             Show the real space geometric phase alongside the shifted Fourier transform and the Gaussian mask. Defaults to True.
         
         Returns
@@ -1329,30 +2324,41 @@ class geometric_phase_analysis_2D(AutoSerialize):
             peakCoordinatesRefined_dtype = np.zeros(1, dtype=self.dtype)
             peakCoordinatesRefined_dtype["x"] = peakCoordinatesRefined[0]
             peakCoordinatesRefined_dtype["y"] = peakCoordinatesRefined[1]
-            self.calculate_phase_map(peak_index,gaussianMask=useGaussMask,inputMaskSize=maskSize,showResult=False, amplitude_mask_result = False, refine = True)
+            self.calculate_phase_map(peak_index,gaussianMask=useGaussMask,inputMaskSize=maskSize,show_result=False, amplitude_mask_result = False, refine = True)
             phaseMapRefined = self.phase_containers[peak_index].refined_phase_map
             amplitudeMapRefined = self.phase_containers[peak_index].refined_amplitude_map
 
-        if showResult:
+        if show_result:
             if amplitude_mask_result:
-                def normalize_arr(array):
-                    array-=np.min(array)
-                    array /= np.max(array)
-                    return array
-                amplitude_map_norm = normalize_arr(amplitudeMapRefined)
-                amplitude_map_norm[amplitude_map_norm < threshold_mask] = 0
-                amplitude_map_norm[amplitude_map_norm > 0] = 1
-
-                im_pha_gp = self.phase_im_lab(phaseMapRefined*amplitudeMapRefined)
+                if isinstance(threshold_mask, float):
+                    max_thresh = threshold_mask
+                    min_thresh = 0
+                elif hasattr(threshold_mask, "__iter__"):
+                    arr = np.asarray(threshold_mask)
+                    if arr.size == 2:
+                        min_thresh, max_thresh = arr
+                    else:
+                        raise ValueError("threshold_mask must have exactly two entries")
+                else:
+                    raise ValueError("threshold_mask must be a scalar or an iterable with two entries")
+                amplitude_map_norm = amplitudeMapRefined/np.max(amplitudeMapRefined)
+                mask_rescaled = (amplitude_map_norm - min_thresh) / (max_thresh - min_thresh)
+                mask_rescaled[mask_rescaled<0] = 0
+                mask_rescaled[mask_rescaled>1] = 1
+                
+                mask_soft = np.sin(np.pi/2 * mask_rescaled) ** 2
+                # amplitude_map_norm[amplitude_map_norm < threshold_mask] = 0
+                # amplitude_map_norm[amplitude_map_norm > 0] = 1
+                im_pha_gp = self.phase_im_lab(phaseMapRefined*mask_soft)
             else:
                 im_pha_gp = self.phase_im_lab(phaseMapRefined)
-            if showResult == True:
+            if show_result == True:
                 show_2d(
                     [self.images[self.global_image_index].array,
                     im_pha_gp,
                     ],
                     title = ["", "$Strain_{xx}$"],
-                    cmap = ["gray", "BrBG"]
+                    cmap = ["gray", "BrBG_r"]
                 )
 
         peakCoordinatesRefined_dtype = np.zeros(1, dtype=self.dtype)
@@ -1458,6 +2464,9 @@ class geometric_phase_analysis_2D(AutoSerialize):
         maxNumPeaks_in: int,
         minSpacingPeaks: int = 0,
         center_ignore_buffer: int | None = None,
+        outer_ignore_buffer: int | None = None,
+        shift_fft = np.array([0,0]),
+        show_result = False,
         ):
         """
         Calls the maxima finder.
@@ -1471,8 +2480,35 @@ class geometric_phase_analysis_2D(AutoSerialize):
         peakList: (maxNumPeaks_in) np.ndarray, np.dtype([("x", float), ("y", float), ("intensity", float)])
             An array of peak coordinates with a custom datatype.
         """
-        peakList = self.get_maxima_2D(np.abs(self._FFT[self.global_image_index].array), maxNumPeaks = maxNumPeaks_in, minSpacing = minSpacingPeaks)
-        if center_ignore_buffer != None:
+        # plt.figure(figsize = (10,10),dpi = 300)
+        # plt.subplot(121)
+        # plt.imshow(np.log(np.abs(np.roll(self._FFT[self.global_image_index].array, shift = shift_fft, axis = (0,1)))), cmap = 'gray')
+        # plt.subplot(122)
+        # win = 400
+        # plt.imshow(np.log(np.abs(np.roll(self._FFT[self.global_image_index].array, shift = shift_fft, axis = (0,1))[win:-win, win:-win])), cmap = 'gray')
+
+
+        shape = self._FFT[self.global_image_index].array.shape
+        lower_x = 0
+        lower_y = 0
+        upper_x = shape[0]
+        upper_y = shape[1]
+        if outer_ignore_buffer is not None:
+            lower_x = int(np.floor(shape[0]/2 - outer_ignore_buffer - 3))
+            upper_x = int(np.ceil(shape[0]/2 + outer_ignore_buffer + 3))
+            lower_y = int(np.floor(shape[1]/2 - outer_ignore_buffer - 3))
+            upper_y = int(np.ceil(shape[1]/2 + outer_ignore_buffer + 3))
+        peakList = self.get_maxima_2D(np.abs(np.roll(self._FFT[self.global_image_index].array, shift = shift_fft, axis = (0,1))[lower_x:upper_x+1, lower_y:upper_y+1]), maxNumPeaks = maxNumPeaks_in, minSpacing = minSpacingPeaks)
+        
+        peak_xy_all = np.zeros([peakList.shape[0], 2])
+        for peak_index in range(peakList.shape[0]):
+            peak_xy = np.array([peakList[peak_index]['x'] + lower_x, peakList[peak_index]['y'] + lower_y])
+            peak_xy_all[peak_index] = peak_xy
+        # plt.scatter(peak_xy_all[:,1]-win, peak_xy_all[:,0]-win, c = 'red', s=10, alpha = 0.5)
+        # print(peakList)
+        peakList['x'] += lower_x
+        peakList['y'] += lower_y
+        if center_ignore_buffer is not None:
             x_dist_to_center = peakList['x'] - self.nx/2
             y_dist_to_center = peakList['y'] - self.ny/2
             rad_dist_to_center = np.sqrt(x_dist_to_center**2 + y_dist_to_center**2)
@@ -1481,9 +2517,12 @@ class geometric_phase_analysis_2D(AutoSerialize):
             zero_peak['x'] = self.nx/2
             zero_peak['y'] = self.ny/2
             peakList = np.append(zero_peak, peakList)
-            return peakList
-        else:
-            return peakList
+        if outer_ignore_buffer is not None:
+            x_dist_to_center = peakList['x'] - self.nx/2
+            y_dist_to_center = peakList['y'] - self.ny/2
+            rad_dist_to_center = np.sqrt(x_dist_to_center**2 + y_dist_to_center**2)
+            peakList = peakList[rad_dist_to_center<outer_ignore_buffer]
+        return peakList
 
     # Functions from py4DSTEM for peak finding.
     def get_maxima_2D(
