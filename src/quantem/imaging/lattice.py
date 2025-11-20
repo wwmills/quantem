@@ -2741,6 +2741,21 @@ class Lattice(AutoSerialize):
         if return_removed:
             return removed
         return self
+
+    def find_atoms_with_too_few_neighbors(
+            self,
+            min_neighbors = None,
+    ):
+        if min_neighbors is None:
+            min_neighbors = 2
+
+        num_sites = len(self._positions_frac)
+        found = []
+        for site_index in range(num_sites):
+            site_data = self.atoms.get_data(site_index)
+            keep_mask = self.count_a_neighbors[site_index, :site_data.shape[0]] >= min_neighbors
+            found.append(~keep_mask)
+        return found
         
 
 
