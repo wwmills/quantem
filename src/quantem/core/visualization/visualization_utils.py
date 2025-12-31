@@ -16,8 +16,6 @@ from quantem.core import config
 from quantem.core.visualization.custom_normalizations import CustomNormalization
 import matplotlib.font_manager as fm
 
-from quantem.core import config
-
 def array_to_rgba(
     scaled_amplitude: NDArray,
     scaled_angle: Optional[NDArray] = None,
@@ -154,12 +152,6 @@ class ScalebarConfig:
     color: str = "white"
     loc: Union[str, int] = "lower right"
     font_size: float = 2
-
-
-SCALEBAR_KWARGS = [
-    "sampling",
-    "units",
-]
 
 
 SCALEBAR_KWARGS = [
@@ -338,6 +330,13 @@ def add_scalebar_to_ax(
         loc_codes = legend.Legend.codes
         loc_strings = {v: k for k, v in loc_codes.items()}
         loc = loc_strings[loc]
+
+        # >>>
+        # >>> fontprops = fm.FontProperties(size=14, family='monospace')
+        # >>> bar = AnchoredSizeBar(ax.transData, 3, '3 units', 4, pad=0.5,
+        # ...                       sep=5, borderpad=0.5, frameon=False,
+        # ...                       size_vertical=0.5, color='white',
+        # ...                       fontproperties=fontprops)
 
     fontprops = fm.FontProperties(size=font_size, family='monospace')
     bar = AnchoredSizeBar(

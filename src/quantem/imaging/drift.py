@@ -25,6 +25,8 @@ from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 from mpire import WorkerPool
 from matplotlib.ticker import FormatStrFormatter, MaxNLocator
+from mpire import WorkerPool
+from matplotlib.ticker import FormatStrFormatter, MaxNLocator
 
 class DriftCorrection(AutoSerialize):
     """
@@ -1010,6 +1012,270 @@ class DriftCorrection(AutoSerialize):
 
 
 
+    # Affine alignment
+    def align_affine_2(
+        self,
+        step: float = 0.01,
+        num_tests: int = 9,
+        refine: bool = True,
+        upsample_factor: int = 8,
+        max_image_shift: float | None = 32,
+        show_merged: bool = True,
+        show_images: bool = False,
+        show_knots: bool = True,
+        **kwargs,
+    ):
+        """
+        Estimate affine drift from the first 2 images.
+        """
+
+        if not hasattr(self, "knots"):
+            print("\033[91mNo knots found — running .preprocess() with default settings.\033[0m")
+            self.preprocess()
+
+        if num_tests % 2 == 0:
+            raise ValueError("num_tests should be odd.")
+
+        # Potential drift vectors
+        vec = np.arange(-(num_tests - 1) / 2, (num_tests + 1) / 2)
+        xx, yy = np.meshgrid(vec, vec, indexing="ij")
+        keep = xx**2 + yy**2 <= (num_tests / 2) ** 2
+        dxy = (
+            np.vstack(
+                (
+                    xx[keep],
+                    yy[keep],
+                )
+            ).T
+            * step
+        )
+
+        # Affine drift refinement
+        self.affine_cost_list = []
+        with WorkerPool(n_jobs = 2) as pool:
+            def cost_affine(dxy):
+                def interpolate_one_image(image_index):
+                    knot = self.knots[image_index].copy()
+                    u = np.arange(knot.shape[1]) - (knot.shape[1] - 1) / 2
+                    knot[0] += dxy[0] * u[:, None]
+                    knot[1] += dxy[1] * u[:, None]
+                    im0, w0 = self.interpolator[image_index].warp_image(
+                        self.images[image_index].array,
+                        knot,
+                    )
+                    return im0
+                mpire_result = pool.map(interpolate_one_image, [0,1])
+                im0, im1 = mpire_result[:self.shape[1],:], mpire_result[self.shape[1]:,:]
+                shifts, image_shift = cross_correlation_shift(
+                    im0,
+                    im1,
+                    upsample_factor=upsample_factor,
+                    fft_input=False,
+                    fft_output=False,
+                    return_shifted_image=True,
+                    max_shift=max_image_shift,
+                )
+                affine_cost = np.mean(np.abs(im0 - image_shift))
+                self.affine_cost_list.append(affine_cost)
+                return(affine_cost)
+        import time
+        tic = time.time()
+        optimization_result = minimize(
+            cost_affine,
+            x0 = [0.0,0.0],
+            method = "Powell",
+            options={
+                "maxiter": 50,
+                "maxfev": 100,
+                "xtol": 1e-3,
+                "ftol": 1e-3,
+            })
+        toc = time.time()
+        print(f"Affine elapsed time: {toc - tic:.3f} seconds")
+        if not optimization_result.success:
+            raise RuntimeError(
+                f"Affine optimization failed: {optimization_result.message}"
+            )
+        dxy = optimization_result.x
+        print("Affine dxy:",dxy)
+        # update all knots
+        for a0 in range(self.shape[0]):
+            u = np.arange(self.knots[a0].shape[1]) - (self.knots[a0].shape[1] - 1) / 2
+            self.knots[a0][0] += dxy[0] * u[:, None]
+            self.knots[a0][1] += dxy[1] * u[:, None]
+
+        # Regenerate images
+        for ind in range(self.shape[0]):
+            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
+                ind
+            ].warp_image(
+                self.images[ind].array,
+                self.knots[ind],
+            )
+
+        # Translation alignment
+        self.align_translation(
+            max_image_shift=max_image_shift,
+            show_images=False,
+            show_merged=False,
+            show_knots=False,
+        )
+
+        # Error tracking
+        self.calculate_error(1)
+        # Plots
+        kwargs.pop("title", None)
+        if show_merged:
+            self.plot_merged_images(
+                show_knots=show_knots,
+                title="Merged: affine",
+                **kwargs,
+            )
+        if show_images:
+            self.plot_transformed_images(
+                show_knots=show_knots,
+                title=[f"Image {i}: affine" for i in range(self.shape[0])],
+                **kwargs,
+            )
+
+        return self
+
+
+
+    # Affine alignment
+    def align_affine_3(
+        self,
+        step: float = 0.01,
+        num_tests: int = 9,
+        refine: bool = True,
+        upsample_factor: int = 8,
+        max_image_shift: float | None = 32,
+        show_merged: bool = True,
+        show_images: bool = False,
+        show_knots: bool = True,
+        **kwargs,
+    ):
+        """
+        Estimate affine drift from the first 2 images.
+        """
+
+        if not hasattr(self, "knots"):
+            print("\033[91mNo knots found — running .preprocess() with default settings.\033[0m")
+            self.preprocess()
+
+        if num_tests % 2 == 0:
+            raise ValueError("num_tests should be odd.")
+
+        # Potential drift vectors
+        vec = np.arange(-(num_tests - 1) / 2, (num_tests + 1) / 2)
+        xx, yy = np.meshgrid(vec, vec, indexing="ij")
+        keep = xx**2 + yy**2 <= (num_tests / 2) ** 2
+        dxy = (
+            np.vstack(
+                (
+                    xx[keep],
+                    yy[keep],
+                )
+            ).T
+            * step
+        )
+
+        # Affine drift refinement
+        self.affine_cost_list = []
+        # with WorkerPool(n_jobs = 2) as pool:
+        def cost_affine(dxy):
+            def interpolate_one_image(image_index):
+                knot = self.knots[image_index].copy()
+                u = np.arange(knot.shape[1]) - (knot.shape[1] - 1) / 2
+                knot[0] += dxy[0] * u[:, None]
+                knot[1] += dxy[1] * u[:, None]
+                im0, w0 = self.interpolator[image_index].warp_image(
+                    self.images[image_index].array,
+                    knot,
+                )
+                return im0
+            # mpire_result = pool.map(interpolate_one_image, [0,1])
+            # im0, im1 = mpire_result[:self.shape[1],:], mpire_result[self.shape[1]:,:]
+            im0 = interpolate_one_image(0)
+            im1 = interpolate_one_image(1)
+            shifts, image_shift = cross_correlation_shift(
+                im0,
+                im1,
+                upsample_factor=upsample_factor,
+                fft_input=False,
+                fft_output=False,
+                return_shifted_image=True,
+                max_shift=max_image_shift,
+            )
+            affine_cost = np.mean(np.abs(im0 - image_shift))
+            self.affine_cost_list.append(affine_cost)
+            return(affine_cost)
+        import time
+        tic = time.time()
+        optimization_result = minimize(
+            cost_affine,
+            x0 = [0.0,0.0],
+            method = "Powell",
+            options={
+                "maxiter": 50,
+                "maxfev": 100,
+                "xtol": 1e-3,
+                "ftol": 1e-3,
+            })
+        toc = time.time()
+        print(f"Affine elapsed time: {toc - tic:.3f} seconds")
+        if not optimization_result.success:
+            raise RuntimeError(
+                f"Affine optimization failed: {optimization_result.message}"
+            )
+        dxy = optimization_result.x
+        print("Affine dxy:",dxy)
+        # update all knots
+        for a0 in range(self.shape[0]):
+            u = np.arange(self.knots[a0].shape[1]) - (self.knots[a0].shape[1] - 1) / 2
+            self.knots[a0][0] += dxy[0] * u[:, None]
+            self.knots[a0][1] += dxy[1] * u[:, None]
+
+        # Regenerate images
+        for ind in range(self.shape[0]):
+            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
+                ind
+            ].warp_image(
+                self.images[ind].array,
+                self.knots[ind],
+            )
+
+        # Translation alignment
+        self.align_translation(
+            max_image_shift=max_image_shift,
+            show_images=False,
+            show_merged=False,
+            show_knots=False,
+        )
+
+        # Error tracking
+        self.calculate_error(1)
+        # Plots
+        kwargs.pop("title", None)
+        if show_merged:
+            self.plot_merged_images(
+                show_knots=show_knots,
+                title="Merged: affine",
+                **kwargs,
+            )
+        if show_images:
+            self.plot_transformed_images(
+                show_knots=show_knots,
+                title=[f"Image {i}: affine" for i in range(self.shape[0])],
+                **kwargs,
+            )
+
+        return self
+
+
+
+
+
 
     # non-rigid alignment
     def align_nonrigid_original(
@@ -1389,9 +1655,17 @@ class DriftCorrection(AutoSerialize):
                             # plt.figure()
                             # plt.plot(warped[0,:])
                             
+                            # plt.figure()
+                            # plt.imshow()
+                            if self.print_thing is True:
+                                # print(xa)
+                                # print(xf)
+                                print(ya)
+                                print(yf)
+                                self.print_thing = False
+                            # plt.figure()
+                            # plt.plot(warped[0,:])
                             residual = warped - self.images[ind].array[row_ind, :]
-                            # residual = warped - self.images_warped.array[ind][row_ind + self.buff_r, self.buff_c:-self.buff_c]
-                            # residual = warped - warped_self
                             cost_nonrigid = np.sum(residual**2)
                             self.cost_nonrigid_list.append(cost_nonrigid)
                             return cost_nonrigid
