@@ -29,6 +29,24 @@ def dft_upsample(
     else:
         xp = np
 
+    F = xp.asarray(F)
+    if F.ndim != 2:
+        raise ValueError(f"F must be 2D, got shape {F.shape}")
+
+    M, N = int(F.shape[0]), int(F.shape[1])
+    if M == 0 or N == 0:
+        raise ValueError(f"F has empty dimension: M={M}, N={N}")
+
+    if xp.any(xp.isnan(F)) or xp.any(xp.isinf(F)):
+        n_nan = int(xp.sum(xp.isnan(F)).item())
+        n_inf = int(xp.sum(xp.isinf(F)).item())
+        raise ValueError(f"Input F contains NaN/Inf (n_nan={n_nan}, n_inf={n_inf}). "
+                         "Trace this back to earlier processing (masking / divisions).")
+
+    # print(shift)
+    # print(up)
+
+
     M, N = F.shape
     du = np.ceil(1.5 * up).astype(int)
     row = np.arange(-du, du + 1)
@@ -50,6 +68,7 @@ def cross_correlation_shift(
     im,
     upsample_factor: int = 1,
     max_shift=None,
+    min_shift=None,
     return_shifted_image: bool = False,
     fft_input: bool = False,
     fft_output: bool = False,
@@ -100,6 +119,11 @@ def cross_correlation_shift(
         y = np.fft.fftfreq(cc.shape[1], 1 / cc.shape[1])
         mask = x[:, None] ** 2 + y[None, :] ** 2 >= max_shift**2
         cc_real[mask] = 0.0
+    if min_shift is not None:
+        x = np.fft.fftfreq(cc.shape[0], 1 / cc.shape[0])
+        y = np.fft.fftfreq(cc.shape[1], 1 / cc.shape[1])
+        mask = x[:, None] ** 2 + y[None, :] ** 2 <= min_shift**2
+        cc_real[mask] = -1
 
     # Coarse peak
     peak = xp.unravel_index(xp.argmax(cc_real), cc_real.shape)
@@ -113,6 +137,12 @@ def cross_correlation_shift(
     vy = cc_real[x0, y_inds]
 
     def parabolic_peak(v):
+        if 4 * v[1] - 2 * v[2] - 2 * v[0] < 1e-9:
+            # print(v)
+            # print(v[2] - v[0])
+            # print(4 * v[1] - 2 * v[2] - 2 * v[0])
+            # print((v[2] - v[0]) / (4 * v[1] - 2 * v[2] - 2 * v[0]))
+            print('nan encountered')
         return (v[2] - v[0]) / (4 * v[1] - 2 * v[2] - 2 * v[0])
 
     dx = parabolic_peak(vx)
@@ -125,7 +155,6 @@ def cross_correlation_shift(
         shifts = (x0, y0)
     else:
         # Local DFT upsampling
-
         local = dft_upsample(cc, upsample_factor, (x0, y0), device=device)
         peak = np.unravel_index(xp.argmax(local), local.shape)
 

@@ -1701,6 +1701,9 @@ class geometric_phase_analysis_2D(AutoSerialize):
         v_lim = None,
         fft_win = None,
         u = None,
+        scalebar = None,
+        scalebar_i = None,
+        return_figax = False,
         # dilation = False,
         # rotation = True,
     ):
@@ -1801,6 +1804,34 @@ class geometric_phase_analysis_2D(AutoSerialize):
         ax1 = plt.subplot(321)
         im11 = ax1.imshow(self.images[self.global_image_index].array[crop_width[0]:-crop_width[0], crop_width[1]:-crop_width[1]], cmap="gray")
         ax1.set_title("")
+
+        from quantem.core.visualization.visualization_utils import (
+            ScalebarConfig,
+            _resolve_scalebar,
+            add_arg_cbar_to_ax,
+            add_cbar_to_ax,
+            add_scalebar_to_ax,
+            array_to_rgba,
+            list_of_arrays_to_rgba,
+        )
+
+
+        if scalebar is not None:
+            scalebar_config = _resolve_scalebar(scalebar)
+            if scalebar_config is not None:
+                add_scalebar_to_ax(
+                    ax1,
+                    self.images[self.global_image_index].array.shape[1],
+                    scalebar_config.sampling,
+                    scalebar_config.length,
+                    scalebar_config.units,
+                    scalebar_config.width_px,
+                    scalebar_config.pad_px,
+                    scalebar_config.color,
+                    scalebar_config.loc,
+                    scalebar_config.font_size,
+                )
+
 
         ax2 = plt.subplot(322)
         im12 = ax2.imshow(eps_uu[crop_width[0]:-crop_width[0], crop_width[1]:-crop_width[1]] * 100, cmap="BrBG_r", vmin=vmin, vmax=vmax)
@@ -1931,6 +1962,21 @@ class geometric_phase_analysis_2D(AutoSerialize):
                 ha="left",
                 va="bottom"
             )
+        if scalebar_i is not None:
+            scalebar_config = _resolve_scalebar(scalebar_i)
+            if scalebar_config is not None:
+                add_scalebar_to_ax(
+                    inset_ax,
+                    self.images[self.global_image_index].array.shape[1],
+                    scalebar_config.sampling,
+                    scalebar_config.length,
+                    scalebar_config.units,
+                    scalebar_config.width_px,
+                    scalebar_config.pad_px,
+                    scalebar_config.color,
+                    scalebar_config.loc,
+                    scalebar_config.font_size,
+                )
 
 
 
@@ -2037,6 +2083,10 @@ class geometric_phase_analysis_2D(AutoSerialize):
         #         ha="left",
         #         va="bottom"
         #     )
+
+        if return_figax:
+            return fig2
+
 
         return self
 

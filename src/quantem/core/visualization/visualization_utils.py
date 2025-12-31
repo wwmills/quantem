@@ -15,6 +15,7 @@ from scipy.stats import binned_statistic_2d
 from quantem.core.visualization.custom_normalizations import CustomNormalization
 import matplotlib.font_manager as fm
 
+from quantem.core import config
 
 def array_to_rgba(
     scaled_amplitude: NDArray,
@@ -154,7 +155,13 @@ class ScalebarConfig:
     font_size: float = 2
 
 
-def _resolve_scalebar(cfg: Any) -> Optional[ScalebarConfig]:
+SCALEBAR_KWARGS = [
+    "sampling",
+    "units",
+]
+
+
+def _resolve_scalebar(cfg: Any, **kwargs) -> Optional[ScalebarConfig]:
     """Resolve various input types to a ScalebarConfig object.
 
     Parameters
@@ -172,7 +179,17 @@ def _resolve_scalebar(cfg: Any) -> Optional[ScalebarConfig]:
     TypeError
         If cfg is not one of the supported types.
     """
-    if cfg is None or cfg is False:
+
+
+    if cfg is None:
+        scalebar_kwargs = {k: kwargs[k] for k in SCALEBAR_KWARGS if k in kwargs}
+        if scalebar_kwargs:
+            if "sampling" in scalebar_kwargs and "units" not in scalebar_kwargs:
+                scalebar_kwargs["units"] = config.get("viz.real_space_units")
+            return ScalebarConfig(**scalebar_kwargs)
+        else:
+            return None
+    elif cfg is False:
         return None
     elif cfg is True:
         return ScalebarConfig()
@@ -182,6 +199,17 @@ def _resolve_scalebar(cfg: Any) -> Optional[ScalebarConfig]:
         return cfg
     else:
         raise TypeError("scalebar must be None, dict, bool, or ScalebarConfig")
+
+    # if cfg is None or cfg is False:
+    #     return None
+    # elif cfg is True:
+    #     return ScalebarConfig()
+    # elif isinstance(cfg, dict):
+    #     return ScalebarConfig(**cfg)
+    # elif isinstance(cfg, ScalebarConfig):
+    #     return cfg
+    # else:
+    #     raise TypeError("scalebar must be None, dict, bool, or ScalebarConfig")
 
 
 def estimate_scalebar_length(length: float, sampling: float) -> Tuple[float, float]:

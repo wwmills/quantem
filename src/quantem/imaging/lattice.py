@@ -267,6 +267,10 @@ class Lattice(AutoSerialize):
             H, W = self._image.shape  # rows (x), cols (y)
             r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)  # each (x, y) == (row, col)
 
+            # print(r0)
+            # print(u)
+            # print(v)
+
             # -------------------------------
             # Origin marker (TOP of stack)
             # -------------------------------
@@ -408,6 +412,8 @@ class Lattice(AutoSerialize):
                 ax.plot([y1, y2], [x1, x2], color=(0.0, 0.7, 1.0), lw=1, clip_on=True, zorder=10)
 
             # Lines parallel to u (vary b)
+            # print(b_min)
+            # print(b_max)
             for b in range(b_min, b_max + 1):
                 base = r0 + b * v
                 seg = clipped_segment(base, u)
@@ -1421,6 +1427,12 @@ class Lattice(AutoSerialize):
         check_uv_duplication = True,
         check_for_dislocations = False,
         merge_dislocation = False,
+        num_peaks_search = 20,
+        num_peaks_use = 2,
+        center_ignore_buffer = 15,
+        minSpacingPeaks = 5,
+        use_found_peaks_directly = False,
+        tolerance_b = None,
         **kwargs,
     ):
         self.check_for_dislocations = check_for_dislocations and check_uv_duplication
@@ -1440,6 +1452,25 @@ class Lattice(AutoSerialize):
 
         H, W = self._image.shape  # x=rows, y=cols
 
+
+
+        fig, ax = plt.subplots(figsize = (5,5), dpi = 300)
+        show_2d(
+                self._image.array,
+                figax = (fig, ax),
+                # scalebar = {
+                #     'sampling':data_1['pixelSize'][1] * 2,
+                #     'units':"nm",
+                #     'length':4,
+                #     'loc':3,
+                #     # 'font_size': scalebar_fontsize,
+                #     'width_px':20
+                # },
+                # lower_quantile = 0.23,
+                cbar = True
+            )
+
+
         if origin is None:
             max_intensity_index = np.argmax(maxima_candidates[:]['intensity'])
             origin_x = maxima_candidates[max_intensity_index]['x']
@@ -1447,10 +1478,6 @@ class Lattice(AutoSerialize):
             origin = np.array([origin_x, origin_y])
 
         if u is None or v is None:
-            num_peaks_search = 20
-            num_peaks_use = 2
-            center_ignore_buffer = 15
-            minSpacingPeaks = 5
             uv_result_inv = self.auto_peak_finder(num_peaks_search = num_peaks_search, num_peaks_use = num_peaks_use, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
 
             g_vector_1_c = np.array([uv_result_inv[0]['x'], uv_result_inv[0]['y']])
@@ -1482,8 +1509,8 @@ class Lattice(AutoSerialize):
         else:
             self._numbers = np.atleast_1d(np.array(numbers, dtype=int))
 
-        print("numbers",self._numbers)
-        print("num sites",self._num_sites)
+        # print("numbers",self._numbers)
+        # print("num sites",self._num_sites)
         
         if w is None:
             if np.abs(np.rad2deg(np.arccos(np.dot(u, v)/(np.linalg.norm(u) * np.linalg.norm(v))))) > np.deg2rad(90):
@@ -1502,6 +1529,9 @@ class Lattice(AutoSerialize):
                 np.array(v),
             )
         )
+
+        if tolerance_b is None:
+            tolerance_b = tolerance_uvw
 
         im = np.asarray(self._image.array, dtype=float)
         r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
@@ -1657,8 +1687,35 @@ class Lattice(AutoSerialize):
                 marker="o",
                 zorder=25,
             )
+            ax.scatter(origin[1], origin[0], c = 'red', marker = 'x', s = 80)
             ax.set_xlim(0, W)
             ax.set_ylim(H, 0)
+
+
+
+
+        if use_found_peaks_directly:
+            self.atoms = Vector.from_shape(
+                shape=(self._num_sites),
+                fields=("x", "y", "a", "b", "int_peak"),
+                units=("px", "px", "ind", "ind", "counts"),
+            )
+            maxima_accepted_x = maxima_candidates_x
+            maxima_accepted_y = maxima_candidates_y
+            maxima_accepted_u = np.zeros_like(maxima_accepted_x)
+            maxima_accepted_v = np.zeros_like(maxima_accepted_x)
+            maxima_accepted_intensity = maxima_candidates_intensity
+            arr = np.vstack(
+                (maxima_accepted_x, maxima_accepted_y, maxima_accepted_u, maxima_accepted_v, maxima_accepted_intensity)
+            ).T
+            self.atoms.set_data(arr, 0)
+            return self
+
+
+
+
+
+
 
         radial_dist = ((maxima_candidates_x - origin[0])**2 + (maxima_candidates_y - origin[1])**2)**(0.5)
         origin_candidate_index = np.argmin(radial_dist) # use the first minima, if there are multiple
@@ -1710,9 +1767,13 @@ class Lattice(AutoSerialize):
                             position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
                             position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
                             radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
-                            radial_dist[atom_index] = uvw_norm * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
+                            radial_dist[atom_index] = np.inf #uvw_norm * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
                             if (radial_dist < (uvw_norm * (tolerance_uvw - 1))).any():
                                 successful_candidate_index = np.argmin(radial_dist)
+                                # print('threshold',(uvw_norm * (tolerance_uvw - 1)))
+                                # print('uvw_norm',(uvw_norm))
+                                # print('tolerance_uvw',(tolerance_uvw))
+                                # print('radial distance of successful candiate',radial_dist[successful_candidate_index])
                                 if unique_ids[1, successful_candidate_index] == 0:
                                     atoms_found_this_iteration[successful_candidate_index] += 1
                                     unique_ids[1, successful_candidate_index] = 1
@@ -1751,7 +1812,7 @@ class Lattice(AutoSerialize):
                         atoms_found_this_iteration[wipe_indicies] = 0
             if np.sum(atoms_found_this_iteration) == 0:
                 found_atoms_in_prev_iteration = False
-                print('stopping search')
+                # print('stopping search')
             
             atoms_found_previous_iterations |= atoms_found_this_iteration.astype(bool)
 
@@ -1819,8 +1880,8 @@ class Lattice(AutoSerialize):
                         position_x = pos_vec[0] + maxima_candidates_x[atom_index]
                         position_y = pos_vec[1] + maxima_candidates_y[atom_index]
                         radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
-                        radial_dist[atom_index] = positions_around_A_site_norm[pos_index] * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
-                        if (radial_dist < (positions_around_A_site_norm[pos_index] * (tolerance_uvw - 1))).any():
+                        radial_dist[atom_index] = positions_around_A_site_norm[pos_index] * (tolerance_b - 1) * 2 # make sure that self is outside of range
+                        if (radial_dist < (positions_around_A_site_norm[pos_index] * (tolerance_b - 1))).any():
                             successful_candidate_index = np.argmin(radial_dist)
                             if unique_ids[1, successful_candidate_index] == 0:
                                 atoms_found_this_iteration[successful_candidate_index] += 1
@@ -1834,7 +1895,7 @@ class Lattice(AutoSerialize):
                 # uv duplication check won't work as is. since our uv coordinates will have to move to a floating point for extra sites, we will need to use a threshold
             if np.sum(atoms_found_this_iteration) == 0:
                 found_atoms_in_prev_iteration = False
-                print('stopping search')
+                # print('stopping search')
                 
             atoms_found_previous_iterations |= atoms_found_this_iteration.astype(bool)
 
@@ -1886,23 +1947,1239 @@ class Lattice(AutoSerialize):
             fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
             if ax.images:
                 ax.images[-1].set_zorder(0)
-            xs = maxima_accepted_x
-            ys = maxima_accepted_y
+            for a0 in range(self._num_sites):
+
+                atoms_arr = self.atoms.get_data(a0)
+                xs = atoms_arr[:,0]
+                ys = atoms_arr[:,1]
+                # xs = maxima_accepted_x
+                # ys = maxima_accepted_y
+                rgb = site_colors(int(self._numbers[0] + 2*a0))
+                ax.scatter(
+                    ys,
+                    xs,
+                    s=200*(a0+1),
+                    facecolor=(rgb[0], rgb[1], rgb[2], 0.85),
+                    edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+                    linewidths=0.75,
+                    marker="o",
+                    zorder=25,
+                )
+            ax.scatter(origin[1], origin[0], c = 'red', marker = 'x', s = 80)
+            ax.set_xlim(0, W)
+            ax.set_ylim(H, 0)
+
+        return self
+
+
+    def find_correct_b(
+            self,
+    ):
+        return 0
+
+
+
+
+    def auto_find_b_frac_orientation(
+        self,
+        num_b_per_uc = 1,
+        order = 1,
+        interpolate_intensity = True,
+        avg_inside_radius = False,
+        max_inside_radius = False,
+        fit_guassian = False,
+        radius = 4,
+        max_shift_gauss = 3,
+        dedup_cutoff_px = 5,
+        plot_atoms = True,
+        print_message = True,
+    ):
+
+        def generate_frac_variants(frac, tol=1e-6):
+            import itertools
+            frac = np.asarray(frac, dtype=float)
+            variants = []
+            for perm in set(itertools.permutations(frac)):
+                for signs in itertools.product([1, -1], repeat=2):
+                    v = np.array(perm) * np.array(signs)
+                    variants.append(v)
+            unique = []
+            for v in variants:
+                if not any(np.allclose(v, u, atol=tol) for u in unique):
+                    unique.append(v)
+            return np.array(unique)
+
+        candidates = generate_frac_variants(self._positions_frac[1])
+
+        
+        intensities = np.zeros([candidates.shape[0]])
+        frac_ind = 0
+        for frac in candidates:
+            self._positions_frac[1] = frac
+            self.measure_b_intensity_near_a(
+                num_b_per_uc = num_b_per_uc,
+                order = order,
+                interpolate_intensity = interpolate_intensity,
+                avg_inside_radius = avg_inside_radius,
+                max_inside_radius = max_inside_radius,
+                fit_guassian = fit_guassian,
+                radius = radius,
+                max_shift_gauss = max_shift_gauss,
+                dedup_cutoff_px = dedup_cutoff_px,
+                plot_atoms = plot_atoms,
+            )
+
+            intensities[frac_ind] = np.sum(self.bsites_assume[:,0])
+            frac_ind += 1
+
+        best_index = np.argmax(intensities)
+
+        if print_message:
+            print('Found orientation of b site. Setting position fraction to', candidates[best_index])
+        self._positions_frac[1] = candidates[best_index]
+
+        return self
+
+
+
+
+
+    def measure_b_intensity_near_a(
+            self,
+            num_b_per_uc = 1,
+            order = 1,
+            interpolate_intensity = True,
+            avg_inside_radius = False,
+            max_inside_radius = False,
+            fit_guassian = False,
+            radius = 4,
+            max_shift_gauss = 3,
+            dedup_cutoff_px = 5,
+            plot_atoms = True,
+            title = '',
+            **kwargs,
+    ):
+        # going to assume that there is a b site near the a sites.
+        # i am just going to measure the intensity of the b sites
+        # it is important to avoid double counting the sites
+        # in the case that i am writing this for, the basis consists of two atoms
+        # this means that i only have to check for the b site in one location for every a site
+        # nominally all a sites are present, but they could also not be present.
+        # in case the a sites are not present, i could try doing it from multiple directions and then keeping sites only once where at least one b site turned up.
+        from scipy.spatial import cKDTree
+        from scipy.ndimage import map_coordinates
+        from scipy.optimize import least_squares
+
+        def extract_circular_roi(image, x0, y0, radius):
+            x_min = int(np.floor(x0 - radius))
+            x_max = int(np.floor(x0 + radius + 1))
+            y_min = int(np.floor(y0 - radius))
+            y_max = int(np.floor(y0 + radius + 1))
+
+            x_min = max(0, x_min)
+            y_min = max(0, y_min)
+            x_max = min(image.shape[1], x_max)
+            y_max = min(image.shape[0], y_max)
+
+            roi = image[x_min:x_max, y_min:y_max]
+
+            x = np.arange(x_min, x_max)
+            y = np.arange(y_min, y_max)
+
+            xx, yy = np.meshgrid(x, y, indexing='ij')
+
+            rr = np.sqrt((xx - x0)**2 + (yy - y0)**2)
+
+            mask = rr <= radius
+
+            return roi, mask, xx, yy
+
+
+        def gaussian_2d(params, x, y):
+            amp, x0, y0, sigma, offset = params
+            return amp * np.exp(-((x-x0)**2 + (y-y0)**2)/(2*sigma**2)) + offset
+
+        def fit_gaussian_local(image, x_init, y_init, radius, max_shift_px):
+            roi, mask, xx, yy = extract_circular_roi(image, x_init, y_init, radius)
+
+            z = roi[mask]
+            x = xx[mask]
+            y = yy[mask]
+            amp0 = z.max() - z.min()
+            offset0 = z.min()
+            sigma0 = radius / 2
+
+            p0 = [amp0, x_init, y_init, sigma0, offset0]
+
+            bounds = (
+                [0,
+                x_init - max_shift_px,
+                y_init - max_shift_px,
+                0.5,
+                -np.inf],
+                [np.inf,
+                x_init + max_shift_px,
+                y_init + max_shift_px,
+                radius,
+                np.inf]
+            )
+
+            def residuals(p):
+                return gaussian_2d(p, x, y) - z
+
+            res = least_squares(residuals, p0, bounds=bounds)
+
+            return res.x, res.cost
+
+
+
+        atoms_arr = self.atoms.get_data(0)
+        a_x = atoms_arr[:,0]
+        a_y = atoms_arr[:,1]
+        positions_around_A_site = self.get_xy_shifts(1) # this function is just for B sites right now, so hard coding this 1 (zero indexed)
+        positions_per_uc = positions_around_A_site[:num_b_per_uc]
+        positions_around_A_site_norm = np.linalg.norm(positions_around_A_site, axis = 1)
+
+
+        n_A = a_x.shape[0]
+        n_B = num_b_per_uc
+
+        bsite_data = np.full((n_B, n_A, 3), np.nan, dtype=float)
+        H, W = self._image.shape  # x=rows, y=cols
+
+        for atom_index in range(a_x.shape[0]):
+            for pos_index, pos_vec in enumerate(positions_per_uc):
+                position_x = pos_vec[0] + a_x[atom_index]
+                position_y = pos_vec[1] + a_y[atom_index]
+
+                if not (0 <= np.round(position_x) < H and 0 <= np.round(position_y) < W):
+                    continue
+                if interpolate_intensity:
+                    intensity = map_coordinates(
+                        self._image.array,
+                        [[position_x], [position_y]],
+                        order=order,
+                        mode='nearest'
+                    )[0]
+                elif avg_inside_radius:
+                    roi, mask, _, _ = extract_circular_roi(self._image.array, position_x, position_y, radius)
+                    intensity = roi[mask].mean()
+                elif max_inside_radius:
+                    roi, mask, xx, yy = extract_circular_roi(self._image.array, position_x, position_y, radius)
+                    idx = np.argmax(roi[mask])
+                    intensity_a = roi[mask]
+                    xs_a = xx[mask]
+                    ys_a = yy[mask]
+                    intensity = intensity_a[idx]
+                    xs = xs_a[idx]
+                    ys = ys_a[idx]
+                elif fit_guassian:
+                    gauss_params, fit_cost = fit_gaussian_local(
+                        self._image.array,
+                        position_x, position_y,
+                        radius=radius,
+                        max_shift_px=max_shift_gauss
+                    )
+                    intensity_less_offset, position_x, position_y, sigma, offset = gauss_params
+                    intensity = intensity_less_offset + offset
+                else:
+                    intensity = self._image.array[np.round(position_x).astype(int), np.round(position_y).astype(int)]
+                bsite_data[pos_index, atom_index, :] = intensity, position_x, position_y
+
+
+        def deduplicate_positions(positions, cutoff_px):
+
+            tree = cKDTree(positions)
+            pairs = tree.query_pairs(cutoff_px)
+
+            parent = np.arange(len(positions))
+
+            def find(i):
+                while parent[i] != i:
+                    parent[i] = parent[parent[i]]
+                    i = parent[i]
+                return i
+
+            def union(i, j):
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[rj] = ri
+
+            for i, j in pairs:
+                union(i, j)
+
+            clusters = {}
+            for i in range(len(positions)):
+                r = find(i)
+                clusters.setdefault(r, []).append(i)
+            return np.array([
+                positions[idxs].mean(axis=0)
+                for idxs in clusters.values()
+            ])
+
+
+        bsite_flat = bsite_data.reshape(-1, 3)
+        mask = np.isfinite(bsite_flat[:, 0])
+        bsite_flat_valid = bsite_flat[mask]
+
+        positions = bsite_flat_valid[:, 1:3]    # (N, 2)
+        intensities = bsite_flat_valid[:, 0]
+
+
+        dedup_positions = deduplicate_positions(
+            positions,
+            cutoff_px=dedup_cutoff_px
+        )
+
+        tree = cKDTree(positions)
+
+        unique_data = np.zeros((len(dedup_positions), 3))
+
+        for i, pos in enumerate(dedup_positions):
+            idxs = tree.query_ball_point(pos, dedup_cutoff_px)
+            best = idxs[np.argmax(intensities[idxs])]
+
+            unique_data[i, 0] = intensities[best]
+            unique_data[i, 1:] = positions[best]
+
+        # save the result
+        self.bsites_assume = unique_data
+
+        if plot_atoms:
+            fig, ax = show_2d(self._image.array, figsize = (10,10), returnfig=True, **kwargs)
+            if ax.images:
+                ax.images[-1].set_zorder(0)
+
+            atoms_arr = self.atoms.get_data(0)
+            xs = atoms_arr[:,0]
+            ys = atoms_arr[:,1]
             rgb = site_colors(int(self._numbers[0]))
             ax.scatter(
                 ys,
                 xs,
-                s=18,
-                facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+                s=200,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.85),
                 edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
                 linewidths=0.75,
                 marker="o",
                 zorder=25,
             )
+
+            rgb = site_colors(int(self._numbers[0] + 2))
+            ax.scatter(
+                unique_data[:,2],
+                unique_data[:,1],
+                s=200,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.05),
+                edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+                linewidths=0.75,
+                marker="o",
+                zorder=25,
+            )
+            ax.set_title(title)
             ax.set_xlim(0, W)
             ax.set_ylim(H, 0)
 
         return self
+
+
+
+
+    def measure_intensity_input_image(
+            self,
+            input_image,
+            order = 1,
+            interpolate_intensity = False,
+            avg_inside_radius = False,
+            max_inside_radius = False,
+            fit_guassian = True,
+            radius = 5,
+            max_shift_gauss = 2,
+            plot_atoms = True,
+            title = '',
+            **kwargs,
+    ):
+        from scipy.spatial import cKDTree
+        from scipy.ndimage import map_coordinates
+        from scipy.optimize import least_squares
+
+        self.input_image = input_image
+
+        def extract_circular_roi(image, x0, y0, radius):
+            x_min = int(np.floor(x0 - radius))
+            x_max = int(np.floor(x0 + radius + 1))
+            y_min = int(np.floor(y0 - radius))
+            y_max = int(np.floor(y0 + radius + 1))
+
+            x_min = max(0, x_min)
+            y_min = max(0, y_min)
+            x_max = min(image.shape[1], x_max)
+            y_max = min(image.shape[0], y_max)
+
+            roi = image[x_min:x_max, y_min:y_max]
+
+            x = np.arange(x_min, x_max)
+            y = np.arange(y_min, y_max)
+
+            xx, yy = np.meshgrid(x, y, indexing='ij')
+
+            rr = np.sqrt((xx - x0)**2 + (yy - y0)**2)
+
+            mask = rr <= radius
+
+            return roi, mask, xx, yy
+
+
+        def gaussian_2d(params, x, y):
+            amp, x0, y0, sigma, offset = params
+            return amp * np.exp(-((x-x0)**2 + (y-y0)**2)/(2*sigma**2)) + offset
+
+        def fit_gaussian_local(image, x_init, y_init, radius, max_shift_px):
+            roi, mask, xx, yy = extract_circular_roi(image, x_init, y_init, radius)
+
+            z = roi[mask]
+            x = xx[mask]
+            y = yy[mask]
+            amp0 = z.max() - z.min()
+            offset0 = z.min()
+            sigma0 = radius / 2
+
+            p0 = [amp0, x_init, y_init, sigma0, offset0]
+
+            bounds = (
+                [0,
+                x_init - max_shift_px,
+                y_init - max_shift_px,
+                0.5,
+                -np.inf],
+                [np.inf,
+                x_init + max_shift_px,
+                y_init + max_shift_px,
+                radius,
+                np.inf]
+            )
+
+            def residuals(p):
+                return gaussian_2d(p, x, y) - z
+
+            res = least_squares(residuals, p0, bounds=bounds)
+
+            return res.x, res.cost
+
+
+
+        atoms_arr = self.atoms.get_data(0)
+        a_x = atoms_arr[:,0]
+        a_y = atoms_arr[:,1]
+
+        b_x = self.bsites_assume[:,1]
+        b_y = self.bsites_assume[:,2]
+        # positions_around_A_site = self.get_xy_shifts(1) # this function is just for B sites right now, so hard coding this 1 (zero indexed)
+        # positions_per_uc = positions_around_A_site[:num_b_per_uc]
+        # positions_around_A_site_norm = np.linalg.norm(positions_around_A_site, axis = 1)
+
+
+        n_A = a_x.shape[0]
+        n_B = b_x.shape[0]
+
+        H, W = self._image.shape  # x=rows, y=cols
+        a_int_input = np.zeros(n_A)
+        b_int_input = np.zeros(n_B)
+
+        for atom_index in range(a_x.shape[0]):
+            position_x = a_x[atom_index]
+            position_y = a_y[atom_index]
+
+            if not (0 <= np.round(position_x) < H and 0 <= np.round(position_y) < W):
+                continue
+            if interpolate_intensity:
+                intensity = map_coordinates(
+                    input_image,
+                    [[position_x], [position_y]],
+                    order=order,
+                    mode='nearest'
+                )[0]
+            elif avg_inside_radius:
+                roi, mask, _, _ = extract_circular_roi(input_image, position_x, position_y, radius)
+                intensity = roi[mask].mean()
+            elif max_inside_radius:
+                roi, mask, xx, yy = extract_circular_roi(input_image, position_x, position_y, radius)
+                idx = np.argmax(roi[mask])
+                intensity_a = roi[mask]
+                xs_a = xx[mask]
+                ys_a = yy[mask]
+                intensity = intensity_a[idx]
+                xs = xs_a[idx]
+                ys = ys_a[idx]
+            elif fit_guassian:
+                gauss_params, fit_cost = fit_gaussian_local(
+                    self._image.array,
+                    position_x, position_y,
+                    radius=radius,
+                    max_shift_px=max_shift_gauss
+                )
+                intensity_less_offset, position_x, position_y, sigma, offset = gauss_params
+                intensity = intensity_less_offset + offset
+            else:
+                intensity = self._image.array[np.round(position_x).astype(int), np.round(position_y).astype(int)]
+            a_int_input[atom_index] = intensity
+
+
+        for atom_index in range(b_x.shape[0]):
+            position_x = b_x[atom_index]
+            position_y = b_y[atom_index]
+
+            if not (0 <= np.round(position_x) < H and 0 <= np.round(position_y) < W):
+                continue
+            if interpolate_intensity:
+                intensity = map_coordinates(
+                    input_image,
+                    [[position_x], [position_y]],
+                    order=order,
+                    mode='nearest'
+                )[0]
+            elif avg_inside_radius:
+                roi, mask, _, _ = extract_circular_roi(input_image, position_x, position_y, radius)
+                intensity = roi[mask].mean()
+            elif max_inside_radius:
+                roi, mask, xx, yy = extract_circular_roi(input_image, position_x, position_y, radius)
+                idx = np.argmax(roi[mask])
+                intensity_a = roi[mask]
+                xs_a = xx[mask]
+                ys_a = yy[mask]
+                intensity = intensity_a[idx]
+                xs = xs_a[idx]
+                ys = ys_a[idx]
+            elif fit_guassian:
+                gauss_params, fit_cost = fit_gaussian_local(
+                    self._image.array,
+                    position_x, position_y,
+                    radius=radius,
+                    max_shift_px=max_shift_gauss
+                )
+                intensity_less_offset, position_x, position_y, sigma, offset = gauss_params
+                intensity = intensity_less_offset + offset
+            else:
+                intensity = self._image.array[np.round(position_x).astype(int), np.round(position_y).astype(int)]
+            b_int_input[atom_index] = intensity
+
+
+        if plot_atoms:
+            fig, ax = show_2d(input_image, figsize = (10,10), returnfig=True, **kwargs)
+            if ax.images:
+                ax.images[-1].set_zorder(0)
+
+            rgb = site_colors(int(self._numbers[0]))
+            ax.scatter(
+                a_y,
+                a_x,
+                s=200,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.85),
+                edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+                linewidths=0.75,
+                marker="o",
+                zorder=25,
+            )
+
+            rgb = site_colors(int(self._numbers[0] + 2))
+            ax.scatter(
+                b_y,
+                b_x,
+                s=300,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.01),
+                edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+                linewidths=0.75,
+                marker="o",
+                zorder=25,
+            )
+            ax.set_title(title)
+            ax.set_xlim(0, W)
+            ax.set_ylim(H, 0)
+
+        self.input_image_a_int = a_int_input
+        self.input_image_b_int = b_int_input
+
+        return self
+
+
+
+
+
+    def get_ab_positions(
+        self,
+    ):
+        positions_b = self.bsites_assume[:,1:]
+        a_x = self.atoms[0]["x"]
+        a_y = self.atoms[0]["y"]
+        positions_a = np.column_stack((a_x, a_y))
+        return positions_a, positions_b
+
+
+    def bsites_assume_preliminary(
+            self,
+    ):
+        # get the A sites
+        a_x = self.atoms[0]["x"]
+        a_y = self.atoms[0]["y"]
+        a_int = self.atoms[0]["int_peak"]
+
+
+        # bsite_data[pos_index, atom_index, :] = intensity, position_x, position_y
+        # self.bsites_assume = unique_data
+        b_int = self.bsites_assume[:,0]
+        b_x = self.bsites_assume[:,1]
+        b_y = self.bsites_assume[:,2]
+
+
+        plt.figure(figsize = (5,5), dpi = 300)
+        plt.plot(a_int, c = '#4281f5', label = 'A intensities')
+        plt.plot(np.sort(b_int), c = '#ef42f5', label = 'B intensities')
+        plt.legend()
+
+        a_int_normalized = a_int.copy()/np.max(a_int)
+        b_int_normalized = b_int.copy()/np.max(a_int) # normalizing by A
+
+        plt.figure(figsize = (5,5), dpi = 300)
+        plt.plot(a_int_normalized, c = '#4281f5', label = 'A intensities')
+        plt.plot(np.sort(b_int_normalized), c = '#ef42f5', label = 'B intensities')
+        plt.legend()
+
+        n_bins = 50
+        bin_edges = np.linspace(0, 1, n_bins + 1)
+        bins = (bin_edges[:-1] + bin_edges[1:])/2
+        a_hist = np.histogram(a_int_normalized, bin_edges)
+        b_hist = np.histogram(b_int_normalized, bin_edges)
+
+        # plt.figure(figsize = (5,5), dpi = 300)
+        # plt.hist(a_hist, bins)#, color = '#4281f5')
+        # plt.title('A Site Histogram')
+        # # plt.legend()
+        # plt.figure(figsize = (5,5), dpi = 300)
+        # plt.hist(b_hist, bins)#, color = '#ef42f5')
+        # plt.title('B Site Histogram')
+        # # plt.legend()
+        plt.figure(figsize = (5,5), dpi = 300)
+        plt.hist(a_int_normalized, bins)#, color = '#4281f5')
+        plt.title('A Site Histogram')
+        # plt.legend()
+        plt.figure(figsize = (5,5), dpi = 300)
+        plt.hist(b_int_normalized, bins)#, color = '#ef42f5')
+        plt.title('B Site Histogram')
+        plt.yscale('log')
+        # plt.legend()
+
+
+        plt.figure(figsize = (5,5), dpi = 300)
+        plt.scatter(a_y, a_x, c = a_int_normalized, cmap = 'viridis', label = 'A sites')
+        plt.scatter(b_y, b_x, c = b_int_normalized, cmap = 'magma', label = 'B sites')
+        plt.colorbar()
+        plt.ylim([np.max(a_y)+20,-20])
+
+        return self
+
+    # also I think it is necessary to have a function that compares the intensity of a B site to that of its neighboring A sites.
+    # ohh new idea as well. Now that I have the positions of the atoms, I can go back and measure the intensity over the original image.
+
+
+    def delta_intensities_assume(
+            self,
+            uc_val = 2,
+            delta_input_cutoff = None,
+            plot_atoms = False,
+    ):
+        
+        from scipy.spatial import cKDTree
+
+
+        neighbor_cutoff_pix = uc_val * self.uv_norm
+        # 
+        positions_b = self.bsites_assume[:,1:]
+        b_int = self.bsites_assume[:,0]
+        a_x = self.atoms[0]["x"]
+        a_y = self.atoms[0]["y"]
+        a_int = self.atoms[0]["int_peak"]
+        b_int /= np.max(a_int)
+        a_int /= np.max(a_int)
+        positions_a = np.column_stack((a_x, a_y))
+
+        positions_all = np.concatenate([positions_a, positions_b])
+        num_a = positions_a.shape[0]
+        num_b = positions_b.shape[0]
+
+        tree = cKDTree(positions_all)
+
+        delta_data = np.zeros((num_b, 5))
+
+        for i, pos in enumerate(positions_b):
+            idxs = np.asarray(tree.query_ball_point(pos, neighbor_cutoff_pix))
+            idxs_a = idxs[idxs < num_a]
+            idxs_b = idxs[idxs > num_a]
+
+            a_neighbor_intensities = a_int[idxs_a]
+            median_a_intensity = np.median(a_neighbor_intensities)
+            b_neighbor_intensities = b_int[idxs_b - num_a]
+            median_b_intensity = np.median(b_neighbor_intensities)
+            all_neighbor_intensities = np.concatenate([a_neighbor_intensities, b_neighbor_intensities])
+            median_all_intensity = np.median(all_neighbor_intensities)
+
+
+
+            delta_data[i, 0] = b_int[i] - median_a_intensity # the delta intensity
+            delta_data[i, 1] = b_int[i] - median_b_intensity # the delta intensity
+            delta_data[i, 2] = b_int[i] - median_all_intensity # the delta intensity
+            delta_data[i, 3] = idxs_a.shape[0] # number of neighbors used
+            delta_data[i, 4] = idxs_b.shape[0] # number of neighbors used
+
+        self.delta_assume = delta_data
+
+        # delta_intensities, num_neighbors = lattice.intensity_neighborhood(neighborhood_units = neighborhood_units, return_delta = True)
+
+        plt.figure(figsize = (24,7), dpi = 300)
+        # plt.rcParams['font.family'] = 'serif'
+        # params = {'mathtext.default': 'regular' }          
+        # plt.rcParams.update(params)
+        plt.subplot(141)
+        plt.scatter(self.delta_assume[:,0], self.delta_assume[:,3], alpha = 0.2)
+        plt.title('Number of A neighbors for each site')
+        plt.xlabel('$I_{site}-median(I_{A neighbors})$ \"(∆I)\"')
+        plt.ylabel('Number of neighbors in px range ' + str(np.round(neighbor_cutoff_pix)))
+
+        num_bins = 100
+        range_bins = [-0.12, 0.1]
+        hist_bins = np.linspace(range_bins[0], range_bins[1], num_bins)
+        plt.subplot(142)
+        plt.hist(self.delta_assume[:,0], bins = hist_bins)
+        plt.xlabel('$I_{site}-median(I_{A neighbors})$ \"(∆I)\"')
+        plt.ylabel('A site count')
+        plt.title('Histogram of ∆Intensity')
+        plt.grid('on')
+
+        delta_histogram, bin_edges = np.histogram(self.delta_assume[:,0], num_bins, range_bins)
+
+        def double_gaussian(x, amp1, mean1, sigma1, amp2, mean2, sigma2):
+            return (
+                amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2))
+                + amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2))
+            )
+
+
+        p0 = [100, -0.025, 0.01, 10, -0.07, 0.01]
+        p0 = np.array(p0)
+
+        def double_gaussian_penalized(x, amp1, mean1, sigma1, amp2, mean2, sigma2):
+            model = (
+                amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2)) +
+                amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2))
+            )
+
+            penalty_strength = 1e6
+            penalty = penalty_strength * np.sum((np.array(
+                [amp1, mean1, sigma1, amp2, mean2, sigma2]
+            ) - p0)**2)
+
+            return model + penalty / len(x)
+
+
+        x = np.linspace(range_bins[0], range_bins[1], num_bins)
+        y = delta_histogram
+        from scipy.optimize import curve_fit
+        try:
+            popt, _ = curve_fit(
+                double_gaussian_penalized,
+                x,
+                y,
+                p0=p0,
+                maxfev=10000
+            )
+        except (RuntimeError, ValueError):
+            popt = np.asarray(p0)
+
+        amp1, mean1, sigma1, amp2, mean2, sigma2 = popt
+
+        plt.subplot(143)
+        plt.plot(x, y, 'k.', label='Data')
+        plt.plot(x, double_gaussian(x, *popt), 'r-', label='Total fit')
+        plt.plot(x, amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2)), 'b--')
+        plt.plot(x, amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2)), 'g--')
+        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label = 'Gaussian Means')
+        plt.legend()
+        plt.ylim([0.8,250])
+        plt.xlabel('$I_{site}-median(I_{neighbors})$ \"(∆I)\"')
+        plt.ylabel('Atomic site count')
+        plt.title('Gaussian fit of ∆Intensity')
+        plt.grid('on')
+        plt.subplot(144)
+        plt.plot(x, y, 'k.', label='Data')
+        plt.plot(x, double_gaussian(x, *popt), 'r-', label='Total fit')
+        plt.plot(x, amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2)), 'b--')
+        plt.plot(x, amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2)), 'g--')
+        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label = 'Gaussian Means')
+        plt.legend()
+        plt.yscale('log')
+        plt.ylim([0.8,250])
+        plt.xlabel('$I_{site}-median(I_{neighbors})$ \"(∆I)\"')
+        plt.ylabel('Atomic site count [log scale]')
+        plt.title('Gaussian fit of ∆Intensity')
+        plt.grid('on')
+
+        # use the estimates to retrieve the sites
+        # positions_b = self.bsites_assume[:,1:]
+        # b_int = self.bsites_assume[:,0]
+        # a_x = self.atoms[0]["x"]
+        # a_y = self.atoms[0]["y"]
+        # a_int = self.atoms[0]["int_peak"]
+        # b_int /= np.max(a_int)
+        # a_int /= np.max(a_int)
+
+        if delta_input_cutoff is None:
+            positions_b_defect = positions_b[self.delta_assume[:,0] < (mean2 + sigma2*1.2),:]
+        else:
+            positions_b_defect = positions_b[self.delta_assume[:,0] < delta_input_cutoff,:]
+            
+        if plot_atoms:
+            fig, ax = plt.subplots(figsize = (5,5), dpi = 300)
+
+            import matplotlib.patches as patches    
+
+            show_2d(
+                self._image.array,
+                # lower_quantile = 0.23,
+                figax = (fig, ax),
+            )
+
+            for i in range(positions_b_defect.shape[0]):
+                circle = patches.Circle((positions_b_defect[i,1],positions_b_defect[i,0]), 10, fill=False, edgecolor='red', linewidth=2, )
+                ax.add_patch(circle)
+            
+            
+            fig.text(
+                0.5, -0.05,
+                "Number of A sites counted: " + str(num_a) + ", number of B sites counted: " + str(num_b) + ", number of defects counted: " + str(positions_b_defect.shape[0]),
+                ha="center",
+                va="top"
+            )
+
+
+        return self
+
+
+
+    def circle_defects(
+            self,
+            delta_threshold,
+            out,
+            show_histogram = False,
+            figax = None
+    ):
+        import matplotlib.patches as patches
+        
+        out.clear_output(wait=True)
+        with out:
+
+            if figax is None:
+                fig, ax = plt.subplots(figsize = (5,5), dpi = 300)
+            else:
+                fig, ax = figax
+
+            ax.clear()
+
+
+            positions_b = self.bsites_assume[:,1:]
+            positions_b_defect = positions_b[self.delta_assume[:,0] < delta_threshold,:]
+
+            show_2d(
+                self._image.array,
+                figax = (fig, ax),
+            )
+
+            for i in range(positions_b_defect.shape[0]):
+                circle = patches.Circle((positions_b_defect[i,1],positions_b_defect[i,0]), 10, fill=False, edgecolor='red', linewidth=2, )
+                ax.add_patch(circle)
+
+            if show_histogram:
+                num_bins = 100
+                range_bins = [np.min(self.delta_assume[:,0])-0.01, np.max(self.delta_assume[:,0])+0.01]
+                hist_bins = np.linspace(range_bins[0], range_bins[1], num_bins)
+                # plt.subplot(142)
+                plt.figure()
+                plt.hist(self.delta_assume[:,0], bins = hist_bins)
+                plt.xlabel('$I_{site}-median(I_{A neighbors})$ \"(∆I)\"')
+                plt.ylabel('A site count')
+                plt.title('Histogram of ∆Intensity')
+                plt.grid('on')
+
+        return self
+
+
+
+
+    # def interactive_circle_defects(self):
+
+    #     import ipywidgets as widgets
+    #     from IPython.display import display
+    #     import matplotlib.pyplot as plt
+
+    #     delta_vals = self.delta_assume[:,0]
+    #     delta_min = float(delta_vals.min())
+    #     delta_max = float(delta_vals.max())
+    #     delta0 = float(np.median(delta_vals))
+
+    #     slider = widgets.FloatSlider(
+    #         value=delta0,
+    #         min=delta_min,
+    #         max=delta_max,
+    #         step=(delta_max - delta_min) / 500,
+    #         description=r'$\Delta I$',
+    #         continuous_update=True,
+    #         readout_format='.4f'
+    #     )
+
+    #     out = widgets.Output()
+
+    #     def _update(delta_threshold):
+    #         out.clear_output(wait=True)
+    #         with out:
+    #             fig, ax = plt.subplots(figsize=(5,5), dpi=300)
+    #             self.circle_defects(
+    #                 delta_threshold=delta_threshold,
+    #                 figax=(fig, ax)
+    #             )
+    #             plt.show()
+
+    #     ui = widgets.VBox([slider])
+    #     out_plot = widgets.interactive_output(_update, {'delta_threshold': slider})
+
+    #     display(ui, out_plot)
+
+
+
+
+    def interactive_circle_defects(
+            self,
+            scalebar = None,
+            ind = None,
+            init_threshold_low = None,
+            init_threshold_high = None,
+    ):
+        import matplotlib.patches as patches
+        import ipywidgets as widgets
+        from ipywidgets import interactive_output, HBox, VBox
+
+        if init_threshold_low is None:
+            init_threshold_low = np.min(self.delta_assume[:,0])+0.01
+        if init_threshold_high is None:
+            init_threshold_high = np.median(self.delta_assume[:,0])
+        thresh_slider_l = widgets.FloatSlider(
+            value=init_threshold_low,
+            min=np.min(self.delta_assume[:,0])-0.01,
+            max = np.max(self.delta_assume[:,0])+0.01,
+            description='threshold',
+            step=0.001,
+            continuous_update=True,
+            readout_format='.4f'
+    )
+        thresh_slider_h = widgets.FloatSlider(
+            value=init_threshold_high,
+            min=np.min(self.delta_assume[:,0])-0.01,
+            max = np.max(self.delta_assume[:,0])+0.01,
+            description='threshold',
+            step=0.001,
+            continuous_update=True,
+            readout_format='.4f'
+    )
+        out = widgets.Output()
+
+        def circle_defects(
+                delta_high,
+                delta_low,
+                show_histogram = False,
+                figax = None
+        ):
+            
+            out.clear_output(wait=True)
+            with out:
+
+                if figax is None:
+                    fig, ax = plt.subplots(figsize = (5,5), dpi = 300)
+                else:
+                    fig, ax = figax
+
+                ax.clear()
+
+
+
+
+                positions_b = self.bsites_assume[:,1:]
+
+                delta = self.delta_assume[:,0] 
+                mask_mono = (delta >= delta_low) & (delta < delta_high)
+                mask_di = (delta < delta_low)
+                positions_b_mono = positions_b[mask_mono, :]
+                positions_b_di = positions_b[mask_di, :]
+
+                # positions_b_defect = positions_b[lattice.delta_assume[:,0] < delta_threshold,:]
+                a_x = self.atoms[0]["x"]
+                a_y = self.atoms[0]["y"]
+
+                num_a = a_x.shape[0]
+                num_b = positions_b.shape[0]
+
+                # a rough area estimate using the site positions:
+                min_x = min((np.min(a_x), np.min(positions_b[:,0])))
+                max_x = max((np.max(a_x), np.max(positions_b[:,0])))
+
+                min_y = min((np.min(a_y), np.min(positions_b[:,1])))
+                max_y = max((np.max(a_y), np.max(positions_b[:,1])))
+
+                x_length_pix = max_x - min_x
+                y_length_pix = max_y - min_y
+
+                pixel_size = scalebar['sampling']
+                pixel_units = scalebar['units']
+                if pixel_units == 'nm':
+                    cm_multiplier = 1e7
+
+                area_analyzed = pixel_size **2 * y_length_pix * x_length_pix / (cm_multiplier ** 2) # area in cm
+
+                monovacancy_density = positions_b_mono.shape[0] / area_analyzed
+                divacancy_density = positions_b_di.shape[0] / area_analyzed
+
+                show_2d(
+                    self._image.array,
+                    figax = (fig, ax),
+                    scalebar = scalebar,
+                )
+
+                for i in range(positions_b_mono.shape[0]):
+                    circle = patches.Circle((positions_b_mono[i,1],positions_b_mono[i,0]), 10, fill=False, edgecolor='red', linewidth=1, )
+                    ax.add_patch(circle)
+
+                for i in range(positions_b_di.shape[0]):
+                    circle = patches.Circle((positions_b_di[i,1],positions_b_di[i,0]), 10, fill=False, edgecolor='blue', linewidth=1, )
+                    ax.add_patch(circle)
+
+                rect = patches.Rectangle(
+                    (min_y - 5, min_x- 5),
+                    max_y - min_y + 10,
+                    max_x - min_x + 10,
+                    linewidth=0.5,
+                    edgecolor='#695147',
+                    facecolor='none'
+                )
+
+                ax.add_patch(rect)
+
+                fig.text(
+                    0.5, -0.01,
+                    "Number of A sites: " + str(num_a) + ", Number of B sites: " + str(num_b) +
+                    "\nNumber of mono Se vacancies: " + str(positions_b_mono.shape[0]) +", Number of di Se vacancies: " +  str(positions_b_di.shape[0]) +
+                    f"\nMonovacancy density: {monovacancy_density:.1e} cm$^{{-2}}$" + f", Divacancy density: {divacancy_density:.1e} cm$^{{-2}}$" + 
+                    f"\nArea analyzed: {area_analyzed:.1e} cm$^{{2}}$",
+                    ha="center",
+                    va="top"
+                )
+
+                if ind is not None:
+                    ax.set_title('Pair index: ' + str(ind))
+
+                if show_histogram:
+                    num_bins = 100
+                    range_bins = [np.min(self.delta_assume[:,0])-0.01, np.max(self.delta_assume[:,0])+0.01]
+                    hist_bins = np.linspace(range_bins[0], range_bins[1], num_bins)
+                    # plt.subplot(142)
+                    plt.figure()
+                    plt.hist(self.delta_assume[:,0], bins = hist_bins)
+                    plt.xlabel('$I_{site}-median(I_{A neighbors})$ \"(∆I)\"')
+                    plt.ylabel('A site count')
+                    plt.title('Histogram of ∆Intensity')
+                    plt.grid('on')
+
+        ui = VBox([HBox([thresh_slider_l, thresh_slider_h])])
+        out_plot = interactive_output(circle_defects, {'delta_low': thresh_slider_l, 'delta_high': thresh_slider_h})
+
+        display(ui, out_plot)
+        return self
+
+
+
+
+
+    def delta_intensities_input(
+            self,
+            uc_val = 2,
+    ):
+        
+        from scipy.spatial import cKDTree
+
+
+        neighbor_cutoff_pix = uc_val * self.uv_norm
+        
+
+        # self.input_image_a_int = a_int_input
+        # self.input_image_b_int = b_int_input
+        positions_b = self.bsites_assume[:,1:]
+        b_int = self.input_image_b_int
+        a_x = self.atoms[0]["x"]
+        a_y = self.atoms[0]["y"]
+        a_int = self.input_image_a_int
+        b_int /= np.max(a_int)
+        a_int /= np.max(a_int)
+        positions_a = np.column_stack((a_x, a_y))
+
+        positions_all = np.concatenate([positions_a, positions_b])
+        num_a = positions_a.shape[0]
+        num_b = positions_b.shape[0]
+
+        tree = cKDTree(positions_all)
+
+        delta_data = np.zeros((num_b, 5))
+
+        for i, pos in enumerate(positions_b):
+            idxs = np.asarray(tree.query_ball_point(pos, neighbor_cutoff_pix))
+            idxs_a = idxs[idxs < num_a]
+            idxs_b = idxs[idxs > num_a]
+
+            a_neighbor_intensities = a_int[idxs_a]
+            median_a_intensity = np.median(a_neighbor_intensities)
+            b_neighbor_intensities = b_int[idxs_b - num_a]
+            median_b_intensity = np.median(b_neighbor_intensities)
+            all_neighbor_intensities = np.concatenate([a_neighbor_intensities, b_neighbor_intensities])
+            median_all_intensity = np.median(all_neighbor_intensities)
+
+
+
+            delta_data[i, 0] = b_int[i] - median_a_intensity # the delta intensity
+            delta_data[i, 1] = b_int[i] - median_b_intensity # the delta intensity
+            delta_data[i, 2] = b_int[i] - median_all_intensity # the delta intensity
+            delta_data[i, 3] = idxs_a.shape[0] # number of neighbors used
+            delta_data[i, 4] = idxs_b.shape[0] # number of neighbors used
+
+        self.delta_input = delta_data
+
+        # delta_intensities, num_neighbors = lattice.intensity_neighborhood(neighborhood_units = neighborhood_units, return_delta = True)
+
+        plt.figure(figsize = (24,7), dpi = 300)
+        # plt.rcParams['font.family'] = 'serif'
+        # params = {'mathtext.default': 'regular' }          
+        # plt.rcParams.update(params)
+        plt.subplot(141)
+        plt.scatter(self.delta_input[:,0], self.delta_input[:,3], alpha = 0.2)
+        plt.title('Number of A neighbors for each site')
+        plt.xlabel('$I_{site}-median(I_{A neighbors})$ \"(∆I)\"')
+        plt.ylabel('Number of neighbors in px range ' + str(np.round(neighbor_cutoff_pix)))
+
+        num_bins = 100
+        range_bins = [-0.6, 0.1]
+        hist_bins = np.linspace(range_bins[0], range_bins[1], num_bins)
+        plt.subplot(142)
+        plt.hist(self.delta_input[:,0], bins = hist_bins)
+        plt.xlabel('$I_{site}-median(I_{A neighbors})$ \"(∆I)\"')
+        plt.ylabel('A site count')
+        plt.title('Histogram of ∆Intensity')
+        plt.grid('on')
+
+        delta_histogram, bin_edges = np.histogram(self.delta_input[:,0], num_bins, range_bins)
+
+        def double_gaussian(x, amp1, mean1, sigma1, amp2, mean2, sigma2):
+            return (
+                amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2))
+                + amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2))
+            )
+
+
+        p0 = [30, -0.2, 0.15, 5, -0.5, 0.1]
+        p0 = np.array(p0)
+
+        def double_gaussian_penalized(x, amp1, mean1, sigma1, amp2, mean2, sigma2):
+            model = (
+                amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2)) +
+                amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2))
+            )
+
+            penalty_strength = 1e6
+            penalty = penalty_strength * np.sum((np.array(
+                [amp1, mean1, sigma1, amp2, mean2, sigma2]
+            ) - p0)**2)
+
+            return model + penalty / len(x)
+
+
+        x = np.linspace(range_bins[0], range_bins[1], num_bins)
+        y = delta_histogram
+        from scipy.optimize import curve_fit
+        try:
+            popt, _ = curve_fit(
+                double_gaussian_penalized,
+                x,
+                y,
+                p0=p0,
+                maxfev=10000
+            )
+        except (RuntimeError, ValueError):
+            popt = np.asarray(p0)
+
+        amp1, mean1, sigma1, amp2, mean2, sigma2 = popt
+
+        plt.subplot(143)
+        plt.plot(x, y, 'k.', label='Data')
+        plt.plot(x, double_gaussian(x, *popt), 'r-', label='Total fit')
+        plt.plot(x, amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2)), 'b--')
+        plt.plot(x, amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2)), 'g--')
+        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label = 'Gaussian Means')
+        plt.legend()
+        plt.ylim([0.8,250])
+        plt.xlabel('$I_{site}-median(I_{neighbors})$ \"(∆I)\"')
+        plt.ylabel('Atomic site count')
+        plt.title('Gaussian fit of ∆Intensity')
+        plt.grid('on')
+        plt.subplot(144)
+        plt.plot(x, y, 'k.', label='Data')
+        plt.plot(x, double_gaussian(x, *popt), 'r-', label='Total fit')
+        plt.plot(x, amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2)), 'b--')
+        plt.plot(x, amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2)), 'g--')
+        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label = 'Gaussian Means')
+        plt.legend()
+        plt.yscale('log')
+        plt.ylim([0.8,250])
+        plt.xlabel('$I_{site}-median(I_{neighbors})$ \"(∆I)\"')
+        plt.ylabel('Atomic site count [log scale]')
+        plt.title('Gaussian fit of ∆Intensity')
+        plt.grid('on')
+
+        # use the estimates to retrieve the sites
+        # positions_b = self.bsites_assume[:,1:]
+        # b_int = self.bsites_assume[:,0]
+        # a_x = self.atoms[0]["x"]
+        # a_y = self.atoms[0]["y"]
+        # a_int = self.atoms[0]["int_peak"]
+        # b_int /= np.max(a_int)
+        # a_int /= np.max(a_int)
+
+        positions_b_defect = positions_b[self.delta_input[:,0] < (mean2 + sigma2*1.2),:]
+
+        fig, ax = plt.subplots(figsize = (10,10), dpi = 300)
+
+        import matplotlib.patches as patches    
+
+        show_2d(
+            self.input_image,
+            # lower_quantile = 0.23,
+            figax = (fig, ax),
+        )
+
+        for i in range(positions_b_defect.shape[0]):
+            circle = patches.Circle((positions_b_defect[i,1],positions_b_defect[i,0]), 10, fill=False, edgecolor='red', linewidth=2, )
+            ax.add_patch(circle)
+        
+
+
+        return self
+
+
+
+
+
+
 
     def line_profile(
             self,
