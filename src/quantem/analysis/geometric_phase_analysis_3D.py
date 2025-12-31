@@ -1137,7 +1137,11 @@ class geometric_phase_analysis_3D(AutoSerialize):
         peakList: (maxNumPeaks_in) np.ndarray, np.dtype([("x", float), ("y", float), ("z", float), ("intensity", float)])
             An array of peak coordinates with a custom datatype.
         """
+<<<<<<< HEAD
         peakList = self.get_maxima_3D(np.abs(self.imFFT), maxNumPeaks = maxNumPeaks_in)
+=======
+        peakList = self.get_maxima_3D(np.abs(self.imFFT), maxNumPeaks = maxNumPeaks_in, _ar_FT = self.imFFT)
+>>>>>>> 3768fa2 (0709 analysis)
         return peakList
         
     # Functions adapted from py4DSTEM for 3D peak finding.
