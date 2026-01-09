@@ -137,7 +137,6 @@ class Lattice(AutoSerialize):
         plot_lattice: bool = True,
         bound_num_vectors: int | None = None,
         input_mask=None,
-        refine_lattice=True,
         refine_maxiter: int = 200,
         **kwargs,
     ) -> "Lattice":
