@@ -42,12 +42,13 @@ def dft_upsample(
     if xp.any(xp.isnan(F)) or xp.any(xp.isinf(F)):
         n_nan = int(xp.sum(xp.isnan(F)).item())
         n_inf = int(xp.sum(xp.isinf(F)).item())
-        raise ValueError(f"Input F contains NaN/Inf (n_nan={n_nan}, n_inf={n_inf}). "
-                         "Trace this back to earlier processing (masking / divisions).")
+        raise ValueError(
+            f"Input F contains NaN/Inf (n_nan={n_nan}, n_inf={n_inf}). "
+            "Trace this back to earlier processing (masking / divisions)."
+        )
 
     # print(shift)
     # print(up)
-
 
     M, N = F.shape
     du = np.ceil(1.5 * up).astype(int)
@@ -144,7 +145,7 @@ def cross_correlation_shift(
             # print(v[2] - v[0])
             # print(4 * v[1] - 2 * v[2] - 2 * v[0])
             # print((v[2] - v[0]) / (4 * v[1] - 2 * v[2] - 2 * v[0]))
-            print('nan encountered')
+            print("nan encountered")
         return (v[2] - v[0]) / (4 * v[1] - 2 * v[2] - 2 * v[0])
 
     dx = parabolic_peak(vx)

@@ -706,8 +706,6 @@ class ObjectDIP(ObjectConstraints):
     def num_slices(self) -> int:
         return self._num_slices
 
-
-
     @property
     def name(self) -> str:
         return "ObjectDIP"

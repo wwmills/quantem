@@ -2,7 +2,6 @@ import math
 from itertools import product
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Sequence, Tuple, Union
 
-import matplotlib.pyplot as plt
 import numpy as np
 from tqdm.auto import tqdm
 

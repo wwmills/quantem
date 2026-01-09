@@ -1,19 +1,16 @@
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from numpy.typing import NDArray
+from scipy.interpolate import interp1d
+from scipy.ndimage import gaussian_filter, map_coordinates
 from scipy.optimize import least_squares
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.vector import Vector
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.visualization import show_2d
-from scipy.ndimage import map_coordinates
 
-from quantem.core import config
-
-import matplotlib.pyplot as plt
-from scipy.interpolate import interp1d
-from scipy.ndimage import gaussian_filter
 
 class Lattice(AutoSerialize):
     """
@@ -284,11 +281,23 @@ class Lattice(AutoSerialize):
 
                 if input_mask is not None:
                     pixel_buffer = 1028
-                    input_mask_padded = np.zeros([input_mask.shape[0] + 2*pixel_buffer,input_mask.shape[1] + 2*pixel_buffer]).astype(bool)
-                    input_mask_padded[pixel_buffer:-pixel_buffer, pixel_buffer:-pixel_buffer] = input_mask
+                    input_mask_padded = np.zeros(
+                        [
+                            input_mask.shape[0] + 2 * pixel_buffer,
+                            input_mask.shape[1] + 2 * pixel_buffer,
+                        ]
+                    ).astype(bool)
+                    input_mask_padded[pixel_buffer:-pixel_buffer, pixel_buffer:-pixel_buffer] = (
+                        input_mask
+                    )
                     x_round = np.round(x).astype(np.int32) + pixel_buffer
                     y_round = np.round(y).astype(np.int32) + pixel_buffer
-                    valid_mask &= input_mask_padded[x_round, y_round] & input_mask_padded[x_round+1, y_round] & input_mask_padded[x_round, y_round+1] & input_mask_padded[x_round+1, y_round+1]
+                    valid_mask &= (
+                        input_mask_padded[x_round, y_round]
+                        & input_mask_padded[x_round + 1, y_round]
+                        & input_mask_padded[x_round, y_round + 1]
+                        & input_mask_padded[x_round + 1, y_round + 1]
+                    )
 
                 n_valid = np.sum(valid_mask)
                 if n_valid == 0:
@@ -296,7 +305,6 @@ class Lattice(AutoSerialize):
 
                 x_valid = x[valid_mask]
                 y_valid = y[valid_mask]
-
 
                 x0, y0 = x0_cache[:n_valid], y0_cache[:n_valid]
                 dx, dy = dx_cache[:n_valid], dy_cache[:n_valid]
@@ -968,7 +976,7 @@ class Lattice(AutoSerialize):
                 ix0, iy0 = int(np.floor(x0)), int(np.floor(y0))
                 i0, i1 = max(0, ix0 - R), min(H - 1, ix0 + R)
                 j0, j1 = max(0, iy0 - R), min(W - 1, iy0 + R)
-                if i1 <= i0 or j1 <= j0: # this doesn't do anything
+                if i1 <= i0 or j1 <= j0:  # this doesn't do anything
                     continue
 
                 patch = im[i0 : i1 + 1, j0 : j1 + 1]
@@ -980,7 +988,9 @@ class Lattice(AutoSerialize):
                 JJ = np.broadcast_to(jj, patch.shape)
 
                 r2 = (II - x0) ** 2 + (JJ - y0) ** 2
-                mask = r2 <= (r_fit * r_fit) # why not just square this with **? Or square root instead of r2
+                mask = r2 <= (
+                    r_fit * r_fit
+                )  # why not just square this with **? Or square root instead of r2
                 if not np.any(mask):
                     continue
 
@@ -1058,9 +1068,6 @@ class Lattice(AutoSerialize):
 
             self.atoms.set_data(updated, s)
 
-
-
-
         if hasattr(self, "check_for_dislocations"):
             if self.check_for_dislocations is True:
                 # Ensure extra fields exist
@@ -1109,8 +1116,14 @@ class Lattice(AutoSerialize):
 
                         vals = patch[mask].astype(float).ravel()
                         pmin, pmax = float(vals.min()), float(vals.max())
-                        bg0 = float(np.median(patch[~mask])) if np.any(~mask) else float(np.median(patch))
-                        amp0 = max(float(im[np.clip(ix0, 0, H - 1), np.clip(iy0, 0, W - 1)] - bg0), 1e-6)
+                        bg0 = (
+                            float(np.median(patch[~mask]))
+                            if np.any(~mask)
+                            else float(np.median(patch))
+                        )
+                        amp0 = max(
+                            float(im[np.clip(ix0, 0, H - 1), np.clip(iy0, 0, W - 1)] - bg0), 1e-6
+                        )
                         sig0 = max(r_fit * 0.5, 0.5)
 
                         x_coords = II[mask].astype(float).ravel()
@@ -1161,7 +1174,7 @@ class Lattice(AutoSerialize):
                     self.atoms_dislocation.set_data(updated, s)
 
         if plot_atoms:
-            fig, ax = show_2d(self._image.array, figsize = (10,10),returnfig=True, **kwargs)
+            fig, ax = show_2d(self._image.array, figsize=(10, 10), returnfig=True, **kwargs)
             if ax.images:
                 ax.images[-1].set_zorder(0)
             for s in range(self._num_sites):
@@ -1190,7 +1203,7 @@ class Lattice(AutoSerialize):
                         xs = self.atoms_dislocation[s]["x"]
                         ys = self.atoms_dislocation[s]["y"]
                         # print(xs)
-                        rgb = site_colors(int(self._numbers[s]+1))
+                        rgb = site_colors(int(self._numbers[s] + 1))
                         ax.scatter(
                             ys,
                             xs,
@@ -1209,10 +1222,10 @@ class Lattice(AutoSerialize):
 
     def atoms_first(
         self,
-        origin = None,
-        u = None,
-        v = None,
-        positions_frac = None,
+        origin=None,
+        u=None,
+        v=None,
+        positions_frac=None,
         tolerance_uv: float = 1.1,
         numbers=None,
         edge_min_dist_px=None,
@@ -1229,35 +1242,35 @@ class Lattice(AutoSerialize):
         input_mask=None,
         refine_lattice=True,
         refine_maxiter: int = 200,
-        intensity_radius = None,
+        intensity_radius=None,
         intensity_min: float | None = None,
         contrast_min=None,
-        annulus_radii = None,
-        check_uv_duplication = True,
-        check_for_dislocations = False,
-        merge_dislocation = False,
+        annulus_radii=None,
+        check_uv_duplication=True,
+        check_for_dislocations=False,
+        merge_dislocation=False,
         **kwargs,
     ):
         self.check_for_dislocations = check_for_dislocations and check_uv_duplication
         # find all candidates above threshold
         maxima_candidates = self.get_maxima_2D(
-            self.image.array, 
-            subpixel = subpixel,
-            upsample_factor = upsample_factor,
-            sigma = sigma,
-            minAbsoluteIntensity = minAbsoluteIntensity,
-            minRelativeIntensity = minRelativeIntensity,
-            relativeToPeak = relativeToPeak,
-            minSpacing = minSpacing,
-            edgeBoundary = edgeBoundary,
-            maxNumPeaks = maxNumPeaks,
-            )
+            self.image.array,
+            subpixel=subpixel,
+            upsample_factor=upsample_factor,
+            sigma=sigma,
+            minAbsoluteIntensity=minAbsoluteIntensity,
+            minRelativeIntensity=minRelativeIntensity,
+            relativeToPeak=relativeToPeak,
+            minSpacing=minSpacing,
+            edgeBoundary=edgeBoundary,
+            maxNumPeaks=maxNumPeaks,
+        )
         H, W = self._image.shape  # x=rows, y=cols
 
         if origin is None:
-            max_intensity_index = np.argmax(maxima_candidates[:]['intensity'])
-            origin_x = maxima_candidates[max_intensity_index]['x']
-            origin_y = maxima_candidates[max_intensity_index]['y']
+            max_intensity_index = np.argmax(maxima_candidates[:]["intensity"])
+            origin_x = maxima_candidates[max_intensity_index]["x"]
+            origin_y = maxima_candidates[max_intensity_index]["y"]
             origin = np.array([origin_x, origin_y])
 
         if u is None or v is None:
@@ -1265,26 +1278,31 @@ class Lattice(AutoSerialize):
             num_peaks_use = 2
             center_ignore_buffer = 15
             minSpacingPeaks = 5
-            uv_result_inv = self.auto_peak_finder(num_peaks_search = num_peaks_search, num_peaks_use = num_peaks_use, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
+            uv_result_inv = self.auto_peak_finder(
+                num_peaks_search=num_peaks_search,
+                num_peaks_use=num_peaks_use,
+                center_ignore_buffer=center_ignore_buffer,
+                minSpacingPeaks=minSpacingPeaks,
+            )
 
-            g_vector_1_c = np.array([uv_result_inv[0]['x'], uv_result_inv[0]['y']])
-            g_vector_2_c = np.array([uv_result_inv[1]['x'], uv_result_inv[1]['y']])
+            g_vector_1_c = np.array([uv_result_inv[0]["x"], uv_result_inv[0]["y"]])
+            g_vector_2_c = np.array([uv_result_inv[1]["x"], uv_result_inv[1]["y"]])
             g_vec1 = np.zeros(2)
-            g_vec1[0] = ((g_vector_1_c[0] - (0.5*H))/H)
-            g_vec1[1] = ((g_vector_1_c[1] - (0.5*W))/W)
+            g_vec1[0] = (g_vector_1_c[0] - (0.5 * H)) / H
+            g_vec1[1] = (g_vector_1_c[1] - (0.5 * W)) / W
             g_vec2 = np.zeros(2)
-            g_vec2[0] = ((g_vector_2_c[0] - (0.5*H))/H)
-            g_vec2[1] = ((g_vector_2_c[1] - (0.5*W))/W)
+            g_vec2[0] = (g_vector_2_c[0] - (0.5 * H)) / H
+            g_vec2[1] = (g_vector_2_c[1] - (0.5 * W)) / W
             g_matrix = np.array([g_vec1, g_vec2])
             a_matrix = np.linalg.inv(g_matrix)
             a_transpose = a_matrix.T
-            u = np.array([a_transpose[0,0], a_transpose[0,1]])
-            v = np.array([a_transpose[1,0], a_transpose[1,1]])
+            u = np.array([a_transpose[0, 0], a_transpose[0, 1]])
+            v = np.array([a_transpose[1, 0], a_transpose[1, 1]])
             self.u = u
             self.v = v
 
         if positions_frac is None:
-            positions_frac = np.atleast_2d(np.array((0,0)))
+            positions_frac = np.atleast_2d(np.array((0, 0)))
 
         self._positions_frac = np.atleast_2d(np.array(positions_frac, dtype=float))
         self._num_sites = self._positions_frac.shape[0]
@@ -1372,13 +1390,13 @@ class Lattice(AutoSerialize):
                 DT = None
 
         # find the maxima closest to the origin:
-        maxima_candidates_x = maxima_candidates[:]['x']
-        maxima_candidates_y = maxima_candidates[:]['y']
+        maxima_candidates_x = maxima_candidates[:]["x"]
+        maxima_candidates_y = maxima_candidates[:]["y"]
 
-        pm_arr = np.array([-1,1]) # np.array([-1,0,1])
+        pm_arr = np.array([-1, 1])  # np.array([-1,0,1])
         u_norm = np.linalg.norm(u)
         v_norm = np.linalg.norm(v)
-        uv_arr = np.array([np.asarray(u),np.asarray(v)])
+        uv_arr = np.array([np.asarray(u), np.asarray(v)])
         uv_norm = 0.5 * (u_norm + v_norm)
         self.uv_norm = uv_norm
         self.uv_arr = uv_arr
@@ -1426,15 +1444,15 @@ class Lattice(AutoSerialize):
             raise ValueError("Zero maxima candidates kept")
 
         # find the maxima closest to the origin:
-        maxima_candidates_x = maxima_candidates[:]['x']
-        maxima_candidates_y = maxima_candidates[:]['y']
-        maxima_candidates_intensity = maxima_candidates[:]['intensity']
+        maxima_candidates_x = maxima_candidates[:]["x"]
+        maxima_candidates_y = maxima_candidates[:]["y"]
+        maxima_candidates_intensity = maxima_candidates[:]["intensity"]
 
         # the unique ids array is an array of the original index, candidacy, a (of a * u), and b (of b * v)
         unique_ids = np.zeros([6, len(maxima_candidates)])
-        unique_ids[0,:] = np.arange(0,len(maxima_candidates))
-        unique_ids[4,:] = -1*np.arange(1,1+len(maxima_candidates))
-        unique_ids[5,:] -= 1
+        unique_ids[0, :] = np.arange(0, len(maxima_candidates))
+        unique_ids[4, :] = -1 * np.arange(1, 1 + len(maxima_candidates))
+        unique_ids[5, :] -= 1
 
         # Show the candidates that were found (tuning the find peaks functionality)
         if plot_atoms:
@@ -1457,51 +1475,70 @@ class Lattice(AutoSerialize):
             ax.set_xlim(0, W)
             ax.set_ylim(H, 0)
 
-        radial_dist = ((maxima_candidates_x - origin[0])**2 + (maxima_candidates_y - origin[1])**2)**(0.5)
-        origin_candidate_index = np.argmin(radial_dist) # use the first minima, if there are multiple
-        unique_ids[1,origin_candidate_index] = 1
-        unique_ids[4,origin_candidate_index] = 0
+        radial_dist = (
+            (maxima_candidates_x - origin[0]) ** 2 + (maxima_candidates_y - origin[1]) ** 2
+        ) ** (0.5)
+        origin_candidate_index = np.argmin(
+            radial_dist
+        )  # use the first minima, if there are multiple
+        unique_ids[1, origin_candidate_index] = 1
+        unique_ids[4, origin_candidate_index] = 0
 
         atoms_found_this_iteration = np.zeros(len(maxima_candidates))
         atoms_found_prev_iteration = np.zeros(len(maxima_candidates))
-        atoms_found_previous_iterations = np.zeros(len(maxima_candidates), dtype = bool)
+        atoms_found_previous_iterations = np.zeros(len(maxima_candidates), dtype=bool)
         atoms_found_prev_iteration[origin_candidate_index] = 1
         found_atoms_in_prev_iteration = True
         iteration_while = 0
 
-
-        def check_dislocations(
-            ):
+        def check_dislocations():
             if check_for_dislocations:
                 for atom_index in range(len(maxima_candidates)):
-                    if unique_ids[1,atom_index] == 1:
+                    if unique_ids[1, atom_index] == 1:
                         for pm in pm_arr:
                             for uv_index, lat_vec in enumerate(uv_arr):
                                 position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
                                 position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
-                                radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
-                                radial_dist[atom_index] = uv_norm * (tolerance_uv - 1) * 2 # make sure that self is outside of range
+                                radial_dist = (
+                                    (maxima_candidates_x - position_x) ** 2
+                                    + (maxima_candidates_y - position_y) ** 2
+                                ) ** (0.5)
+                                radial_dist[atom_index] = (
+                                    uv_norm * (tolerance_uv - 1) * 2
+                                )  # make sure that self is outside of range
                                 if (radial_dist < (uv_norm * (tolerance_uv - 1))).any():
                                     successful_candidate_index = np.argmin(radial_dist)
                                     if unique_ids[1, successful_candidate_index] == 2:
                                         atoms_found_this_iteration[successful_candidate_index] += 1
-                                        unique_ids[1, successful_candidate_index] = 3 # for being found in dislocation search
-                                        unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uv_index == 0)
-                                        unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uv_index == 1)
+                                        unique_ids[1, successful_candidate_index] = (
+                                            3  # for being found in dislocation search
+                                        )
+                                        unique_ids[2, successful_candidate_index] = unique_ids[
+                                            2, atom_index
+                                        ] + pm * int(uv_index == 0)
+                                        unique_ids[3, successful_candidate_index] = unique_ids[
+                                            3, atom_index
+                                        ] + pm * int(uv_index == 1)
                                         unique_ids[4, successful_candidate_index] = 0
-                maxima_dislocation_x = maxima_candidates_x[unique_ids[1,:] == 3]
-                maxima_dislocation_y = maxima_candidates_y[unique_ids[1,:] == 3]
-                maxima_dislocation_u = unique_ids[2,unique_ids[1,:] == 3]
-                maxima_dislocation_v = unique_ids[3,unique_ids[1,:] == 3]
-                maxima_dislocation_intensity = maxima_candidates_intensity[unique_ids[1,:] == 3]
+                maxima_dislocation_x = maxima_candidates_x[unique_ids[1, :] == 3]
+                maxima_dislocation_y = maxima_candidates_y[unique_ids[1, :] == 3]
+                maxima_dislocation_u = unique_ids[2, unique_ids[1, :] == 3]
+                maxima_dislocation_v = unique_ids[3, unique_ids[1, :] == 3]
+                maxima_dislocation_intensity = maxima_candidates_intensity[unique_ids[1, :] == 3]
                 arr = np.vstack(
-                    (maxima_dislocation_x, maxima_dislocation_y, maxima_dislocation_u, maxima_dislocation_v, maxima_dislocation_intensity)
+                    (
+                        maxima_dislocation_x,
+                        maxima_dislocation_y,
+                        maxima_dislocation_u,
+                        maxima_dislocation_v,
+                        maxima_dislocation_intensity,
+                    )
                 ).T
                 return arr
 
         # first, a loop that finds all of the A sites
 
-        a0 = 0 # here we are just doing a0
+        a0 = 0  # here we are just doing a0
         while found_atoms_in_prev_iteration is True:
             for atom_index in range(len(maxima_candidates)):
                 if atoms_found_prev_iteration[atom_index] > 0:
@@ -1509,32 +1546,49 @@ class Lattice(AutoSerialize):
                         for uv_index, lat_vec in enumerate(uv_arr):
                             position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
                             position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
-                            radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
-                            radial_dist[atom_index] = uv_norm * (tolerance_uv - 1) * 2 # make sure that self is outside of range
+                            radial_dist = (
+                                (maxima_candidates_x - position_x) ** 2
+                                + (maxima_candidates_y - position_y) ** 2
+                            ) ** (0.5)
+                            radial_dist[atom_index] = (
+                                uv_norm * (tolerance_uv - 1) * 2
+                            )  # make sure that self is outside of range
                             if (radial_dist < (uv_norm * (tolerance_uv - 1))).any():
                                 successful_candidate_index = np.argmin(radial_dist)
                                 if unique_ids[1, successful_candidate_index] == 0:
                                     atoms_found_this_iteration[successful_candidate_index] += 1
                                     unique_ids[1, successful_candidate_index] = 1
-                                    unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uv_index == 0)
-                                    unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uv_index == 1)
+                                    unique_ids[2, successful_candidate_index] = unique_ids[
+                                        2, atom_index
+                                    ] + pm * int(uv_index == 0)
+                                    unique_ids[3, successful_candidate_index] = unique_ids[
+                                        3, atom_index
+                                    ] + pm * int(uv_index == 1)
                                     unique_ids[4, successful_candidate_index] = 0
                                     unique_ids[5, successful_candidate_index] = 0
             # check if any atom was somehow still found twice:
             assert np.max(atoms_found_this_iteration) < 2
             # check if any found atoms have the same uv index
             if check_uv_duplication:
-                uv_pairs = unique_ids[1:6,:].T
-                unique_pairs, inverse, counts = np.unique(uv_pairs, axis=0, return_inverse=True, return_counts=True)
-                duplicate_groups = [np.where(inverse == k)[0] for k, c in enumerate(counts) if c > 1]
+                uv_pairs = unique_ids[1:6, :].T
+                unique_pairs, inverse, counts = np.unique(
+                    uv_pairs, axis=0, return_inverse=True, return_counts=True
+                )
+                duplicate_groups = [
+                    np.where(inverse == k)[0] for k, c in enumerate(counts) if c > 1
+                ]
                 mask_atoms_found = atoms_found_this_iteration.astype(bool)
                 if len(duplicate_groups) != 0:
                     for duplicate_group in duplicate_groups:
                         duplicate_group = np.asarray(duplicate_group)
-                        duplicate_atoms_index_found_previous_iterations = duplicate_group[atoms_found_previous_iterations[duplicate_group]]
+                        duplicate_atoms_index_found_previous_iterations = duplicate_group[
+                            atoms_found_previous_iterations[duplicate_group]
+                        ]
                         if duplicate_atoms_index_found_previous_iterations.size > 1:
                             if origin_candidate_index not in duplicate_group:
-                                raise ValueError("The duplicate atoms finding code is somehow bugged")
+                                raise ValueError(
+                                    "The duplicate atoms finding code is somehow bugged"
+                                )
                             else:
                                 kept_index = origin_candidate_index
                         elif duplicate_atoms_index_found_previous_iterations.size == 1:
@@ -1542,16 +1596,18 @@ class Lattice(AutoSerialize):
                         else:
                             kept_index = duplicate_group[mask_atoms_found[duplicate_group]][0]
                         wipe_indicies = duplicate_group[duplicate_group != kept_index]
-                        unique_ids[1, wipe_indicies] = 2 # signals to not accept for this maxima anymore
-                        unique_ids[2:4,wipe_indicies] = 0
-                        unique_ids[5,wipe_indicies] = -1
-                        unique_ids[4,wipe_indicies] = -1*(wipe_indicies+1)
+                        unique_ids[1, wipe_indicies] = (
+                            2  # signals to not accept for this maxima anymore
+                        )
+                        unique_ids[2:4, wipe_indicies] = 0
+                        unique_ids[5, wipe_indicies] = -1
+                        unique_ids[4, wipe_indicies] = -1 * (wipe_indicies + 1)
                         atoms_found_previous_iterations[wipe_indicies] = False
                         mask_atoms_found[wipe_indicies] = False
                         atoms_found_this_iteration[wipe_indicies] = 0
             if np.sum(atoms_found_this_iteration) == 0:
                 found_atoms_in_prev_iteration = False
-                print('stopping search')
+                print("stopping search")
 
             atoms_found_previous_iterations |= atoms_found_this_iteration.astype(bool)
 
@@ -1559,13 +1615,13 @@ class Lattice(AutoSerialize):
             atoms_found_this_iteration = np.zeros(len(maxima_candidates))
             iteration_while += 1
 
-        maxima_accepted_x = maxima_candidates_x[unique_ids[1,:] == 1]
-        maxima_accepted_y = maxima_candidates_y[unique_ids[1,:] == 1]
+        maxima_accepted_x = maxima_candidates_x[unique_ids[1, :] == 1]
+        maxima_accepted_y = maxima_candidates_y[unique_ids[1, :] == 1]
 
-        maxima_accepted_u = unique_ids[2, unique_ids[1,:] == 1]
-        maxima_accepted_v = unique_ids[3, unique_ids[1,:] == 1]
+        maxima_accepted_u = unique_ids[2, unique_ids[1, :] == 1]
+        maxima_accepted_v = unique_ids[3, unique_ids[1, :] == 1]
 
-        maxima_accepted_intensity = maxima_candidates_intensity[unique_ids[1,:] == 1]
+        maxima_accepted_intensity = maxima_candidates_intensity[unique_ids[1, :] == 1]
 
         self.atoms = Vector.from_shape(
             shape=(self._num_sites),
@@ -1574,7 +1630,13 @@ class Lattice(AutoSerialize):
         )
         if not merge_dislocation or not check_for_dislocations:
             arr = np.vstack(
-                (maxima_accepted_x, maxima_accepted_y, maxima_accepted_u, maxima_accepted_v, maxima_accepted_intensity)
+                (
+                    maxima_accepted_x,
+                    maxima_accepted_y,
+                    maxima_accepted_u,
+                    maxima_accepted_v,
+                    maxima_accepted_intensity,
+                )
             ).T
             self.atoms.set_data(arr, 0)
 
@@ -1587,7 +1649,13 @@ class Lattice(AutoSerialize):
 
             maxima_merge_intensity = maxima_candidates_intensity[np.isin(unique_ids[1, :], [1, 3])]
             arr = np.vstack(
-                (maxima_merge_x, maxima_merge_y, maxima_merge_u, maxima_merge_v, maxima_merge_intensity)
+                (
+                    maxima_merge_x,
+                    maxima_merge_y,
+                    maxima_merge_u,
+                    maxima_merge_v,
+                    maxima_merge_intensity,
+                )
             ).T
             self.atoms.set_data(arr, 0)
 
@@ -1595,25 +1663,39 @@ class Lattice(AutoSerialize):
         found_atoms_in_prev_iteration = True
         while found_atoms_in_prev_iteration is True:
             for atom_index in range(len(maxima_candidates)):
-                if not unique_ids[5, atom_index] == 0: # skip this 'for' iteration if the atom is not an A site
+                if (
+                    not unique_ids[5, atom_index] == 0
+                ):  # skip this 'for' iteration if the atom is not an A site
                     continue
                 # print(unique_ids[5, atom_index])
-                for a0 in range(self._num_sites-1):
-                    a0 += 1 # we don't need to go over the 0 index again
+                for a0 in range(self._num_sites - 1):
+                    a0 += 1  # we don't need to go over the 0 index again
                     positions_around_A_site = self.get_xy_shifts(a0)
-                    positions_around_A_site_norm = np.linalg.norm(positions_around_A_site, axis = 1)
+                    positions_around_A_site_norm = np.linalg.norm(positions_around_A_site, axis=1)
                     for pos_index, pos_vec in enumerate(positions_around_A_site):
                         position_x = pos_vec[0] + maxima_candidates_x[atom_index]
                         position_y = pos_vec[1] + maxima_candidates_y[atom_index]
-                        radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
-                        radial_dist[atom_index] = positions_around_A_site_norm[pos_index] * (tolerance_uv - 1) * 2 # make sure that self is outside of range
-                        if (radial_dist < (positions_around_A_site_norm[pos_index] * (tolerance_uv - 1))).any():
+                        radial_dist = (
+                            (maxima_candidates_x - position_x) ** 2
+                            + (maxima_candidates_y - position_y) ** 2
+                        ) ** (0.5)
+                        radial_dist[atom_index] = (
+                            positions_around_A_site_norm[pos_index] * (tolerance_uv - 1) * 2
+                        )  # make sure that self is outside of range
+                        if (
+                            radial_dist
+                            < (positions_around_A_site_norm[pos_index] * (tolerance_uv - 1))
+                        ).any():
                             successful_candidate_index = np.argmin(radial_dist)
                             if unique_ids[1, successful_candidate_index] == 0:
                                 atoms_found_this_iteration[successful_candidate_index] += 1
                                 unique_ids[1, successful_candidate_index] = 1
-                                unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index]
-                                unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index]
+                                unique_ids[2, successful_candidate_index] = unique_ids[
+                                    2, atom_index
+                                ]
+                                unique_ids[3, successful_candidate_index] = unique_ids[
+                                    3, atom_index
+                                ]
                                 unique_ids[4, successful_candidate_index] = 0
                                 unique_ids[5, successful_candidate_index] = a0
                 # check if any atom was somehow still found twice:
@@ -1621,7 +1703,7 @@ class Lattice(AutoSerialize):
                 # uv duplication check won't work as is. since our uv coordinates will have to move to a floating point for extra sites, we will need to use a threshold
             if np.sum(atoms_found_this_iteration) == 0:
                 found_atoms_in_prev_iteration = False
-                print('stopping search')
+                print("stopping search")
 
             atoms_found_previous_iterations |= atoms_found_this_iteration.astype(bool)
             atoms_found_prev_iteration = atoms_found_this_iteration.copy()
@@ -1648,10 +1730,10 @@ class Lattice(AutoSerialize):
             ax.set_xlim(0, W)
             ax.set_ylim(H, 0)
 
-        for a0 in range(self._num_sites -1):
+        for a0 in range(self._num_sites - 1):
             a0 += 1
-            mask_1 = unique_ids[1,:] == 1
-            mask_2 = unique_ids[5,:] == a0
+            mask_1 = unique_ids[1, :] == 1
+            mask_2 = unique_ids[5, :] == a0
             mask = mask_1.astype(bool) & mask_2.astype(bool)
             maxima_accepted_x = maxima_candidates_x[mask]
             maxima_accepted_y = maxima_candidates_y[mask]
@@ -1659,7 +1741,13 @@ class Lattice(AutoSerialize):
             maxima_accepted_v = unique_ids[3, mask]
             maxima_accepted_intensity = maxima_candidates_intensity[mask]
             arr = np.vstack(
-                (maxima_accepted_x, maxima_accepted_y, maxima_accepted_u, maxima_accepted_v, maxima_accepted_intensity)
+                (
+                    maxima_accepted_x,
+                    maxima_accepted_y,
+                    maxima_accepted_u,
+                    maxima_accepted_v,
+                    maxima_accepted_intensity,
+                )
             ).T
             self.atoms.set_data(arr, a0)
 
@@ -1687,12 +1775,12 @@ class Lattice(AutoSerialize):
 
     def atoms_first_uvw(
         self,
-        origin = None,
-        u = None,
-        v = None,
-        positions_frac = None,
+        origin=None,
+        u=None,
+        v=None,
+        positions_frac=None,
         tolerance_uvw: float = 1.1,
-        w = None,
+        w=None,
         numbers=None,
         edge_min_dist_px=None,
         subpixel: str = "poly",
@@ -1708,87 +1796,88 @@ class Lattice(AutoSerialize):
         input_mask=None,
         refine_lattice=True,
         refine_maxiter: int = 200,
-        intensity_radius = None,
+        intensity_radius=None,
         intensity_min: float | None = None,
         contrast_min=None,
-        annulus_radii = None,
-        check_uv_duplication = True,
-        check_for_dislocations = False,
-        merge_dislocation = False,
-        num_peaks_search = 20,
-        num_peaks_use = 2,
-        center_ignore_buffer = 15,
-        minSpacingPeaks = 5,
-        use_found_peaks_directly = False,
-        tolerance_b = None,
+        annulus_radii=None,
+        check_uv_duplication=True,
+        check_for_dislocations=False,
+        merge_dislocation=False,
+        num_peaks_search=20,
+        num_peaks_use=2,
+        center_ignore_buffer=15,
+        minSpacingPeaks=5,
+        use_found_peaks_directly=False,
+        tolerance_b=None,
         **kwargs,
     ):
         self.check_for_dislocations = check_for_dislocations and check_uv_duplication
         # find all candidates above threshold
         maxima_candidates = self.get_maxima_2D(
-            self.image.array, 
-            subpixel = subpixel,
-            upsample_factor = upsample_factor,
-            sigma = sigma,
-            minAbsoluteIntensity = minAbsoluteIntensity,
-            minRelativeIntensity = minRelativeIntensity,
-            relativeToPeak = relativeToPeak,
-            minSpacing = minSpacing,
-            edgeBoundary = edgeBoundary,
-            maxNumPeaks = maxNumPeaks,
-            )
+            self.image.array,
+            subpixel=subpixel,
+            upsample_factor=upsample_factor,
+            sigma=sigma,
+            minAbsoluteIntensity=minAbsoluteIntensity,
+            minRelativeIntensity=minRelativeIntensity,
+            relativeToPeak=relativeToPeak,
+            minSpacing=minSpacing,
+            edgeBoundary=edgeBoundary,
+            maxNumPeaks=maxNumPeaks,
+        )
 
         H, W = self._image.shape  # x=rows, y=cols
 
-
-
-        fig, ax = plt.subplots(figsize = (5,5), dpi = 300)
+        fig, ax = plt.subplots(figsize=(5, 5), dpi=300)
         show_2d(
-                self._image.array,
-                figax = (fig, ax),
-                # scalebar = {
-                #     'sampling':data_1['pixelSize'][1] * 2,
-                #     'units':"nm",
-                #     'length':4,
-                #     'loc':3,
-                #     # 'font_size': scalebar_fontsize,
-                #     'width_px':20
-                # },
-                # lower_quantile = 0.23,
-                cbar = True
-            )
-
+            self._image.array,
+            figax=(fig, ax),
+            # scalebar = {
+            #     'sampling':data_1['pixelSize'][1] * 2,
+            #     'units':"nm",
+            #     'length':4,
+            #     'loc':3,
+            #     # 'font_size': scalebar_fontsize,
+            #     'width_px':20
+            # },
+            # lower_quantile = 0.23,
+            cbar=True,
+        )
 
         if origin is None:
-            max_intensity_index = np.argmax(maxima_candidates[:]['intensity'])
-            origin_x = maxima_candidates[max_intensity_index]['x']
-            origin_y = maxima_candidates[max_intensity_index]['y']
+            max_intensity_index = np.argmax(maxima_candidates[:]["intensity"])
+            origin_x = maxima_candidates[max_intensity_index]["x"]
+            origin_y = maxima_candidates[max_intensity_index]["y"]
             origin = np.array([origin_x, origin_y])
 
         if u is None or v is None:
-            uv_result_inv = self.auto_peak_finder(num_peaks_search = num_peaks_search, num_peaks_use = num_peaks_use, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
+            uv_result_inv = self.auto_peak_finder(
+                num_peaks_search=num_peaks_search,
+                num_peaks_use=num_peaks_use,
+                center_ignore_buffer=center_ignore_buffer,
+                minSpacingPeaks=minSpacingPeaks,
+            )
 
-            g_vector_1_c = np.array([uv_result_inv[0]['x'], uv_result_inv[0]['y']])
-            g_vector_2_c = np.array([uv_result_inv[1]['x'], uv_result_inv[1]['y']])
+            g_vector_1_c = np.array([uv_result_inv[0]["x"], uv_result_inv[0]["y"]])
+            g_vector_2_c = np.array([uv_result_inv[1]["x"], uv_result_inv[1]["y"]])
             g_vec1 = np.zeros(2)
-            g_vec1[0] = ((g_vector_1_c[0] - (0.5*H))/H)
-            g_vec1[1] = ((g_vector_1_c[1] - (0.5*W))/W)
+            g_vec1[0] = (g_vector_1_c[0] - (0.5 * H)) / H
+            g_vec1[1] = (g_vector_1_c[1] - (0.5 * W)) / W
             g_vec2 = np.zeros(2)
-            g_vec2[0] = ((g_vector_2_c[0] - (0.5*H))/H)
-            g_vec2[1] = ((g_vector_2_c[1] - (0.5*W))/W)
+            g_vec2[0] = (g_vector_2_c[0] - (0.5 * H)) / H
+            g_vec2[1] = (g_vector_2_c[1] - (0.5 * W)) / W
             g_matrix = np.array([g_vec1, g_vec2])
             a_matrix = np.linalg.inv(g_matrix)
             a_transpose = a_matrix.T
-            u = np.array([a_transpose[0,0], a_transpose[0,1]])
-            v = np.array([a_transpose[1,0], a_transpose[1,1]])
+            u = np.array([a_transpose[0, 0], a_transpose[0, 1]])
+            v = np.array([a_transpose[1, 0], a_transpose[1, 1]])
             self.u = u
             self.v = v
 
-
         if positions_frac is None:
-            positions_frac = np.atleast_2d(np.array((0,0))) # 1, 1
+            positions_frac = np.atleast_2d(np.array((0, 0)))  # 1, 1
         # if (positions_frac[0] == np.array([0,0])).all():
-            # positions_frac[0] = np.atleast_2d(np.array((1,1)))
+        # positions_frac[0] = np.atleast_2d(np.array((1,1)))
 
         self._positions_frac = np.atleast_2d(np.array(positions_frac, dtype=float))
         self._num_sites = self._positions_frac.shape[0]
@@ -1799,13 +1888,15 @@ class Lattice(AutoSerialize):
 
         # print("numbers",self._numbers)
         # print("num sites",self._num_sites)
-        
+
         if w is None:
-            if np.abs(np.rad2deg(np.arccos(np.dot(u, v)/(np.linalg.norm(u) * np.linalg.norm(v))))) > np.deg2rad(90):
-                w = np.asarray(u)+np.asarray(v)
+            if np.abs(
+                np.rad2deg(np.arccos(np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v))))
+            ) > np.deg2rad(90):
+                w = np.asarray(u) + np.asarray(v)
                 w_sign = 1
             else:
-                w = np.asarray(u)-np.asarray(v)
+                w = np.asarray(u) - np.asarray(v)
                 w_sign = -1
         else:
             w_sign = 1
@@ -1891,16 +1982,15 @@ class Lattice(AutoSerialize):
                 DT = None
 
         # find the maxima closest to the origin:
-        maxima_candidates_x = maxima_candidates[:]['x']
-        maxima_candidates_y = maxima_candidates[:]['y']
+        maxima_candidates_x = maxima_candidates[:]["x"]
+        maxima_candidates_y = maxima_candidates[:]["y"]
 
-        pm_arr = np.array([-1,1])
+        pm_arr = np.array([-1, 1])
         # pm_arr = np.array([-1,0,1])
         u_norm = np.linalg.norm(u)
         v_norm = np.linalg.norm(v)
         w_norm = np.linalg.norm(w)
-        uvw_arr = np.array([np.asarray(u),np.asarray(v),np.asarray(w)])
-        uv_arr = np.array([np.asarray(u), np.asarray(v)])
+        uvw_arr = np.array([np.asarray(u), np.asarray(v), np.asarray(w)])
         uvw_norm = 0.5 * (u_norm + v_norm + w_norm)
         self.uv_norm = uvw_norm
         self.uv_arr = uvw_arr
@@ -1948,15 +2038,15 @@ class Lattice(AutoSerialize):
             raise ValueError("Zero maxima candidates kept")
 
         # find the maxima closest to the origin:
-        maxima_candidates_x = maxima_candidates[:]['x']
-        maxima_candidates_y = maxima_candidates[:]['y']
-        maxima_candidates_intensity = maxima_candidates[:]['intensity']
+        maxima_candidates_x = maxima_candidates[:]["x"]
+        maxima_candidates_y = maxima_candidates[:]["y"]
+        maxima_candidates_intensity = maxima_candidates[:]["intensity"]
 
         # the unique ids array is an array of the original index, candidacy, a (of a * u), and b (of b * v), and c (of c * w)
         unique_ids = np.zeros([6, len(maxima_candidates)])
-        unique_ids[0,:] = np.arange(0,len(maxima_candidates))
-        unique_ids[4,:] = -1*np.arange(1,1+len(maxima_candidates))
-        unique_ids[5,:] -= 1
+        unique_ids[0, :] = np.arange(0, len(maxima_candidates))
+        unique_ids[4, :] = -1 * np.arange(1, 1 + len(maxima_candidates))
+        unique_ids[5, :] -= 1
 
         if plot_atoms:
             fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
@@ -1975,12 +2065,9 @@ class Lattice(AutoSerialize):
                 marker="o",
                 zorder=25,
             )
-            ax.scatter(origin[1], origin[0], c = 'red', marker = 'x', s = 80)
+            ax.scatter(origin[1], origin[0], c="red", marker="x", s=80)
             ax.set_xlim(0, W)
             ax.set_ylim(H, 0)
-
-
-
 
         if use_found_peaks_directly:
             self.atoms = Vector.from_shape(
@@ -1994,25 +2081,29 @@ class Lattice(AutoSerialize):
             maxima_accepted_v = np.zeros_like(maxima_accepted_x)
             maxima_accepted_intensity = maxima_candidates_intensity
             arr = np.vstack(
-                (maxima_accepted_x, maxima_accepted_y, maxima_accepted_u, maxima_accepted_v, maxima_accepted_intensity)
+                (
+                    maxima_accepted_x,
+                    maxima_accepted_y,
+                    maxima_accepted_u,
+                    maxima_accepted_v,
+                    maxima_accepted_intensity,
+                )
             ).T
             self.atoms.set_data(arr, 0)
             return self
 
-
-
-
-
-
-
-        radial_dist = ((maxima_candidates_x - origin[0])**2 + (maxima_candidates_y - origin[1])**2)**(0.5)
-        origin_candidate_index = np.argmin(radial_dist) # use the first minima, if there are multiple
-        unique_ids[1,origin_candidate_index] = 1
-        unique_ids[4,origin_candidate_index] = 0
+        radial_dist = (
+            (maxima_candidates_x - origin[0]) ** 2 + (maxima_candidates_y - origin[1]) ** 2
+        ) ** (0.5)
+        origin_candidate_index = np.argmin(
+            radial_dist
+        )  # use the first minima, if there are multiple
+        unique_ids[1, origin_candidate_index] = 1
+        unique_ids[4, origin_candidate_index] = 0
 
         atoms_found_this_iteration = np.zeros(len(maxima_candidates))
         atoms_found_prev_iteration = np.zeros(len(maxima_candidates))
-        atoms_found_previous_iterations = np.zeros(len(maxima_candidates), dtype = bool)
+        atoms_found_previous_iterations = np.zeros(len(maxima_candidates), dtype=bool)
         atoms_found_prev_iteration[origin_candidate_index] = 1
         found_atoms_in_prev_iteration = True
         iteration_while = 0
@@ -2020,33 +2111,54 @@ class Lattice(AutoSerialize):
         def check_dislocations():
             if check_for_dislocations:
                 for atom_index in range(len(maxima_candidates)):
-                    if unique_ids[1,atom_index] == 1:
+                    if unique_ids[1, atom_index] == 1:
                         for pm in pm_arr:
                             for uvw_index, lat_vec in enumerate(uvw_arr):
                                 position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
                                 position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
-                                radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
-                                radial_dist[atom_index] = uvw_norm * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
+                                radial_dist = (
+                                    (maxima_candidates_x - position_x) ** 2
+                                    + (maxima_candidates_y - position_y) ** 2
+                                ) ** (0.5)
+                                radial_dist[atom_index] = (
+                                    uvw_norm * (tolerance_uvw - 1) * 2
+                                )  # make sure that self is outside of range
                                 if (radial_dist < (uvw_norm * (tolerance_uvw - 1))).any():
                                     successful_candidate_index = np.argmin(radial_dist)
                                     if unique_ids[1, successful_candidate_index] == 2:
                                         atoms_found_this_iteration[successful_candidate_index] += 1
-                                        unique_ids[1, successful_candidate_index] = 3 # for being found in dislocation search
-                                        unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uvw_index == 0) + pm*int(uvw_index == 2)
-                                        unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uvw_index == 1) - w_sign * pm*int(uvw_index == 2)
+                                        unique_ids[1, successful_candidate_index] = (
+                                            3  # for being found in dislocation search
+                                        )
+                                        unique_ids[2, successful_candidate_index] = (
+                                            unique_ids[2, atom_index]
+                                            + pm * int(uvw_index == 0)
+                                            + pm * int(uvw_index == 2)
+                                        )
+                                        unique_ids[3, successful_candidate_index] = (
+                                            unique_ids[3, atom_index]
+                                            + pm * int(uvw_index == 1)
+                                            - w_sign * pm * int(uvw_index == 2)
+                                        )
                                         unique_ids[4, successful_candidate_index] = 0
-                maxima_dislocation_x = maxima_candidates_x[unique_ids[1,:] == 3]
-                maxima_dislocation_y = maxima_candidates_y[unique_ids[1,:] == 3]
-                maxima_dislocation_u = unique_ids[2,unique_ids[1,:] == 3]
-                maxima_dislocation_v = unique_ids[3,unique_ids[1,:] == 3]
-                maxima_dislocation_intensity = maxima_candidates_intensity[unique_ids[1,:] == 3]
+                maxima_dislocation_x = maxima_candidates_x[unique_ids[1, :] == 3]
+                maxima_dislocation_y = maxima_candidates_y[unique_ids[1, :] == 3]
+                maxima_dislocation_u = unique_ids[2, unique_ids[1, :] == 3]
+                maxima_dislocation_v = unique_ids[3, unique_ids[1, :] == 3]
+                maxima_dislocation_intensity = maxima_candidates_intensity[unique_ids[1, :] == 3]
                 arr = np.vstack(
-                    (maxima_dislocation_x, maxima_dislocation_y, maxima_dislocation_u, maxima_dislocation_v, maxima_dislocation_intensity)
+                    (
+                        maxima_dislocation_x,
+                        maxima_dislocation_y,
+                        maxima_dislocation_u,
+                        maxima_dislocation_v,
+                        maxima_dislocation_intensity,
+                    )
                 ).T
                 return arr
 
         # first, a loop that finds all of the A sites
-        a0 = 0 # here we are just doing a0
+        a0 = 0  # here we are just doing a0
         while found_atoms_in_prev_iteration is True:
             for atom_index in range(len(maxima_candidates)):
                 if atoms_found_prev_iteration[atom_index] > 0:
@@ -2054,8 +2166,13 @@ class Lattice(AutoSerialize):
                         for uvw_index, lat_vec in enumerate(uvw_arr):
                             position_x = pm * lat_vec[0] + maxima_candidates_x[atom_index]
                             position_y = pm * lat_vec[1] + maxima_candidates_y[atom_index]
-                            radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
-                            radial_dist[atom_index] = np.inf #uvw_norm * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
+                            radial_dist = (
+                                (maxima_candidates_x - position_x) ** 2
+                                + (maxima_candidates_y - position_y) ** 2
+                            ) ** (0.5)
+                            radial_dist[atom_index] = (
+                                np.inf
+                            )  # uvw_norm * (tolerance_uvw - 1) * 2 # make sure that self is outside of range
                             if (radial_dist < (uvw_norm * (tolerance_uvw - 1))).any():
                                 successful_candidate_index = np.argmin(radial_dist)
                                 # print('threshold',(uvw_norm * (tolerance_uvw - 1)))
@@ -2065,25 +2182,41 @@ class Lattice(AutoSerialize):
                                 if unique_ids[1, successful_candidate_index] == 0:
                                     atoms_found_this_iteration[successful_candidate_index] += 1
                                     unique_ids[1, successful_candidate_index] = 1
-                                    unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index] + pm*int(uvw_index == 0) + pm*int(uvw_index == 2)
-                                    unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index] + pm*int(uvw_index == 1) + w_sign*pm*int(uvw_index == 2)
+                                    unique_ids[2, successful_candidate_index] = (
+                                        unique_ids[2, atom_index]
+                                        + pm * int(uvw_index == 0)
+                                        + pm * int(uvw_index == 2)
+                                    )
+                                    unique_ids[3, successful_candidate_index] = (
+                                        unique_ids[3, atom_index]
+                                        + pm * int(uvw_index == 1)
+                                        + w_sign * pm * int(uvw_index == 2)
+                                    )
                                     unique_ids[4, successful_candidate_index] = 0
                                     unique_ids[5, successful_candidate_index] = a0
             # check if any atom was somehow still found twice:
             assert np.max(atoms_found_this_iteration) < 2
             # check if any found atoms have the same uv index
             if check_uv_duplication:
-                uv_pairs = unique_ids[1:6,:].T
-                unique_pairs, inverse, counts = np.unique(uv_pairs, axis=0, return_inverse=True, return_counts=True)
-                duplicate_groups = [np.where(inverse == k)[0] for k, c in enumerate(counts) if c > 1]
+                uv_pairs = unique_ids[1:6, :].T
+                unique_pairs, inverse, counts = np.unique(
+                    uv_pairs, axis=0, return_inverse=True, return_counts=True
+                )
+                duplicate_groups = [
+                    np.where(inverse == k)[0] for k, c in enumerate(counts) if c > 1
+                ]
                 mask_atoms_found = atoms_found_this_iteration.astype(bool)
                 if len(duplicate_groups) != 0:
                     for duplicate_group in duplicate_groups:
                         duplicate_group = np.asarray(duplicate_group)
-                        duplicate_atoms_index_found_previous_iterations = duplicate_group[atoms_found_previous_iterations[duplicate_group]]
+                        duplicate_atoms_index_found_previous_iterations = duplicate_group[
+                            atoms_found_previous_iterations[duplicate_group]
+                        ]
                         if duplicate_atoms_index_found_previous_iterations.size > 1:
                             if origin_candidate_index not in duplicate_group:
-                                raise ValueError("The duplicate atoms finding code is somehow bugged")
+                                raise ValueError(
+                                    "The duplicate atoms finding code is somehow bugged"
+                                )
                             else:
                                 kept_index = origin_candidate_index
                         elif duplicate_atoms_index_found_previous_iterations.size == 1:
@@ -2091,17 +2224,19 @@ class Lattice(AutoSerialize):
                         else:
                             kept_index = duplicate_group[mask_atoms_found[duplicate_group]][0]
                         wipe_indicies = duplicate_group[duplicate_group != kept_index]
-                        unique_ids[1, wipe_indicies] = 2 # this signals to not accept for this maxima anymore (and flags this as a dulpicate)
-                        unique_ids[2:4,wipe_indicies] = 0
-                        unique_ids[5,wipe_indicies] = -1
-                        unique_ids[4,wipe_indicies] = -1*(wipe_indicies+1)
+                        unique_ids[1, wipe_indicies] = (
+                            2  # this signals to not accept for this maxima anymore (and flags this as a dulpicate)
+                        )
+                        unique_ids[2:4, wipe_indicies] = 0
+                        unique_ids[5, wipe_indicies] = -1
+                        unique_ids[4, wipe_indicies] = -1 * (wipe_indicies + 1)
                         atoms_found_previous_iterations[wipe_indicies] = False
                         mask_atoms_found[wipe_indicies] = False
                         atoms_found_this_iteration[wipe_indicies] = 0
             if np.sum(atoms_found_this_iteration) == 0:
                 found_atoms_in_prev_iteration = False
                 # print('stopping search')
-            
+
             atoms_found_previous_iterations |= atoms_found_this_iteration.astype(bool)
 
             atoms_found_prev_iteration = atoms_found_this_iteration.copy()
@@ -2110,21 +2245,21 @@ class Lattice(AutoSerialize):
         if check_for_dislocations:
             atom_arr = check_dislocations()
             self.atoms_dislocation = Vector.from_shape(
-                    shape=(self._num_sites),
-                    fields=("x", "y", "a", "b", "int_peak"),
-                    units=("px", "px", "ind", "ind", "counts"),
-                )
+                shape=(self._num_sites),
+                fields=("x", "y", "a", "b", "int_peak"),
+                units=("px", "px", "ind", "ind", "counts"),
+            )
             self.atoms_dislocation.set_data(atom_arr, 0)
 
         # add interactive bit here
 
-        maxima_accepted_x = maxima_candidates_x[unique_ids[1,:] == 1]
-        maxima_accepted_y = maxima_candidates_y[unique_ids[1,:] == 1]
+        maxima_accepted_x = maxima_candidates_x[unique_ids[1, :] == 1]
+        maxima_accepted_y = maxima_candidates_y[unique_ids[1, :] == 1]
 
-        maxima_accepted_u = unique_ids[2, unique_ids[1,:] == 1]
-        maxima_accepted_v = unique_ids[3, unique_ids[1,:] == 1]
+        maxima_accepted_u = unique_ids[2, unique_ids[1, :] == 1]
+        maxima_accepted_v = unique_ids[3, unique_ids[1, :] == 1]
 
-        maxima_accepted_intensity = maxima_candidates_intensity[unique_ids[1,:] == 1]
+        maxima_accepted_intensity = maxima_candidates_intensity[unique_ids[1, :] == 1]
 
         self.atoms = Vector.from_shape(
             shape=(self._num_sites),
@@ -2134,12 +2269,17 @@ class Lattice(AutoSerialize):
 
         if not merge_dislocation or not check_for_dislocations:
             arr = np.vstack(
-                (maxima_accepted_x, maxima_accepted_y, maxima_accepted_u, maxima_accepted_v, maxima_accepted_intensity)
+                (
+                    maxima_accepted_x,
+                    maxima_accepted_y,
+                    maxima_accepted_u,
+                    maxima_accepted_v,
+                    maxima_accepted_intensity,
+                )
             ).T
             self.atoms.set_data(arr, 0)
 
         if merge_dislocation and check_for_dislocations:
-
             maxima_merge_x = maxima_candidates_x[np.isin(unique_ids[1, :], [1, 3])]
             maxima_merge_y = maxima_candidates_y[np.isin(unique_ids[1, :], [1, 3])]
 
@@ -2148,34 +2288,53 @@ class Lattice(AutoSerialize):
 
             maxima_merge_intensity = maxima_candidates_intensity[np.isin(unique_ids[1, :], [1, 3])]
             arr = np.vstack(
-                (maxima_merge_x, maxima_merge_y, maxima_merge_u, maxima_merge_v, maxima_merge_intensity)
+                (
+                    maxima_merge_x,
+                    maxima_merge_y,
+                    maxima_merge_u,
+                    maxima_merge_v,
+                    maxima_merge_intensity,
+                )
             ).T
             self.atoms.set_data(arr, 0)
 
         # second, a loop that uses these A sites to find all other sites
-        uvw_arr_save = uvw_arr.copy()
         found_atoms_in_prev_iteration = True
         while found_atoms_in_prev_iteration is True:
             for atom_index in range(len(maxima_candidates)):
-                if not unique_ids[5, atom_index] == 0: # skip this 'for' iteration if the atom is not an A site
+                if (
+                    not unique_ids[5, atom_index] == 0
+                ):  # skip this 'for' iteration if the atom is not an A site
                     continue
                 # print(unique_ids[5, atom_index])
-                for a0 in range(self._num_sites-1):
-                    a0 += 1 # we don't need to go over the 0 index again
+                for a0 in range(self._num_sites - 1):
+                    a0 += 1  # we don't need to go over the 0 index again
                     positions_around_A_site = self.get_xy_shifts(a0)
-                    positions_around_A_site_norm = np.linalg.norm(positions_around_A_site, axis = 1)
+                    positions_around_A_site_norm = np.linalg.norm(positions_around_A_site, axis=1)
                     for pos_index, pos_vec in enumerate(positions_around_A_site):
                         position_x = pos_vec[0] + maxima_candidates_x[atom_index]
                         position_y = pos_vec[1] + maxima_candidates_y[atom_index]
-                        radial_dist = ((maxima_candidates_x - position_x)**2 + (maxima_candidates_y - position_y)**2)**(0.5)
-                        radial_dist[atom_index] = positions_around_A_site_norm[pos_index] * (tolerance_b - 1) * 2 # make sure that self is outside of range
-                        if (radial_dist < (positions_around_A_site_norm[pos_index] * (tolerance_b - 1))).any():
+                        radial_dist = (
+                            (maxima_candidates_x - position_x) ** 2
+                            + (maxima_candidates_y - position_y) ** 2
+                        ) ** (0.5)
+                        radial_dist[atom_index] = (
+                            positions_around_A_site_norm[pos_index] * (tolerance_b - 1) * 2
+                        )  # make sure that self is outside of range
+                        if (
+                            radial_dist
+                            < (positions_around_A_site_norm[pos_index] * (tolerance_b - 1))
+                        ).any():
                             successful_candidate_index = np.argmin(radial_dist)
                             if unique_ids[1, successful_candidate_index] == 0:
                                 atoms_found_this_iteration[successful_candidate_index] += 1
                                 unique_ids[1, successful_candidate_index] = 1
-                                unique_ids[2, successful_candidate_index] = unique_ids[2, atom_index]
-                                unique_ids[3, successful_candidate_index] = unique_ids[3, atom_index]
+                                unique_ids[2, successful_candidate_index] = unique_ids[
+                                    2, atom_index
+                                ]
+                                unique_ids[3, successful_candidate_index] = unique_ids[
+                                    3, atom_index
+                                ]
                                 unique_ids[4, successful_candidate_index] = 0
                                 unique_ids[5, successful_candidate_index] = a0
                 # check if any atom was somehow still found twice:
@@ -2184,7 +2343,7 @@ class Lattice(AutoSerialize):
             if np.sum(atoms_found_this_iteration) == 0:
                 found_atoms_in_prev_iteration = False
                 # print('stopping search')
-                
+
             atoms_found_previous_iterations |= atoms_found_this_iteration.astype(bool)
 
             atoms_found_prev_iteration = atoms_found_this_iteration.copy()
@@ -2211,11 +2370,10 @@ class Lattice(AutoSerialize):
         #     ax.set_xlim(0, W)
         #     ax.set_ylim(H, 0)
 
-
-        for a0 in range(self._num_sites -1):
+        for a0 in range(self._num_sites - 1):
             a0 += 1
-            mask_1 = unique_ids[1,:] == 1
-            mask_2 = unique_ids[5,:] == a0
+            mask_1 = unique_ids[1, :] == 1
+            mask_2 = unique_ids[5, :] == a0
             mask = mask_1.astype(bool) & mask_2.astype(bool)
             maxima_accepted_x = maxima_candidates_x[mask]
             maxima_accepted_y = maxima_candidates_y[mask]
@@ -2226,65 +2384,65 @@ class Lattice(AutoSerialize):
             maxima_accepted_intensity = maxima_candidates_intensity[mask]
 
             arr = np.vstack(
-                (maxima_accepted_x, maxima_accepted_y, maxima_accepted_u, maxima_accepted_v, maxima_accepted_intensity)
+                (
+                    maxima_accepted_x,
+                    maxima_accepted_y,
+                    maxima_accepted_u,
+                    maxima_accepted_v,
+                    maxima_accepted_intensity,
+                )
             ).T
             self.atoms.set_data(arr, a0)
-
 
         if plot_atoms:
             fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
             if ax.images:
                 ax.images[-1].set_zorder(0)
             for a0 in range(self._num_sites):
-
                 atoms_arr = self.atoms.get_data(a0)
-                xs = atoms_arr[:,0]
-                ys = atoms_arr[:,1]
+                xs = atoms_arr[:, 0]
+                ys = atoms_arr[:, 1]
                 # xs = maxima_accepted_x
                 # ys = maxima_accepted_y
-                rgb = site_colors(int(self._numbers[0] + 2*a0))
+                rgb = site_colors(int(self._numbers[0] + 2 * a0))
                 ax.scatter(
                     ys,
                     xs,
-                    s=200*(a0+1),
+                    s=200 * (a0 + 1),
                     facecolor=(rgb[0], rgb[1], rgb[2], 0.85),
                     edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
                     linewidths=0.75,
                     marker="o",
                     zorder=25,
                 )
-            ax.scatter(origin[1], origin[0], c = 'red', marker = 'x', s = 80)
+            ax.scatter(origin[1], origin[0], c="red", marker="x", s=80)
             ax.set_xlim(0, W)
             ax.set_ylim(H, 0)
 
         return self
 
-
     def find_correct_b(
-            self,
+        self,
     ):
         return 0
 
-
-
-
     def auto_find_b_frac_orientation(
         self,
-        num_b_per_uc = 1,
-        order = 1,
-        interpolate_intensity = True,
-        avg_inside_radius = False,
-        max_inside_radius = False,
-        fit_guassian = False,
-        radius = 4,
-        max_shift_gauss = 3,
-        dedup_cutoff_px = 5,
-        plot_atoms = True,
-        print_message = True,
+        num_b_per_uc=1,
+        order=1,
+        interpolate_intensity=True,
+        avg_inside_radius=False,
+        max_inside_radius=False,
+        fit_guassian=False,
+        radius=4,
+        max_shift_gauss=3,
+        dedup_cutoff_px=5,
+        plot_atoms=True,
+        print_message=True,
     ):
-
         def generate_frac_variants(frac, tol=1e-6):
             import itertools
+
             frac = np.asarray(frac, dtype=float)
             variants = []
             for perm in set(itertools.permutations(frac)):
@@ -2299,53 +2457,50 @@ class Lattice(AutoSerialize):
 
         candidates = generate_frac_variants(self._positions_frac[1])
 
-        
         intensities = np.zeros([candidates.shape[0]])
         frac_ind = 0
         for frac in candidates:
             self._positions_frac[1] = frac
             self.measure_b_intensity_near_a(
-                num_b_per_uc = num_b_per_uc,
-                order = order,
-                interpolate_intensity = interpolate_intensity,
-                avg_inside_radius = avg_inside_radius,
-                max_inside_radius = max_inside_radius,
-                fit_guassian = fit_guassian,
-                radius = radius,
-                max_shift_gauss = max_shift_gauss,
-                dedup_cutoff_px = dedup_cutoff_px,
-                plot_atoms = plot_atoms,
+                num_b_per_uc=num_b_per_uc,
+                order=order,
+                interpolate_intensity=interpolate_intensity,
+                avg_inside_radius=avg_inside_radius,
+                max_inside_radius=max_inside_radius,
+                fit_guassian=fit_guassian,
+                radius=radius,
+                max_shift_gauss=max_shift_gauss,
+                dedup_cutoff_px=dedup_cutoff_px,
+                plot_atoms=plot_atoms,
             )
 
-            intensities[frac_ind] = np.sum(self.bsites_assume[:,0])
+            intensities[frac_ind] = np.sum(self.bsites_assume[:, 0])
             frac_ind += 1
 
         best_index = np.argmax(intensities)
 
         if print_message:
-            print('Found orientation of b site. Setting position fraction to', candidates[best_index])
+            print(
+                "Found orientation of b site. Setting position fraction to", candidates[best_index]
+            )
         self._positions_frac[1] = candidates[best_index]
 
         return self
 
-
-
-
-
     def measure_b_intensity_near_a(
-            self,
-            num_b_per_uc = 1,
-            order = 1,
-            interpolate_intensity = True,
-            avg_inside_radius = False,
-            max_inside_radius = False,
-            fit_guassian = False,
-            radius = 4,
-            max_shift_gauss = 3,
-            dedup_cutoff_px = 5,
-            plot_atoms = True,
-            title = '',
-            **kwargs,
+        self,
+        num_b_per_uc=1,
+        order=1,
+        interpolate_intensity=True,
+        avg_inside_radius=False,
+        max_inside_radius=False,
+        fit_guassian=False,
+        radius=4,
+        max_shift_gauss=3,
+        dedup_cutoff_px=5,
+        plot_atoms=True,
+        title="",
+        **kwargs,
     ):
         # going to assume that there is a b site near the a sites.
         # i am just going to measure the intensity of the b sites
@@ -2354,9 +2509,9 @@ class Lattice(AutoSerialize):
         # this means that i only have to check for the b site in one location for every a site
         # nominally all a sites are present, but they could also not be present.
         # in case the a sites are not present, i could try doing it from multiple directions and then keeping sites only once where at least one b site turned up.
-        from scipy.spatial import cKDTree
         from scipy.ndimage import map_coordinates
         from scipy.optimize import least_squares
+        from scipy.spatial import cKDTree
 
         def extract_circular_roi(image, x0, y0, radius):
             x_min = int(np.floor(x0 - radius))
@@ -2374,18 +2529,17 @@ class Lattice(AutoSerialize):
             x = np.arange(x_min, x_max)
             y = np.arange(y_min, y_max)
 
-            xx, yy = np.meshgrid(x, y, indexing='ij')
+            xx, yy = np.meshgrid(x, y, indexing="ij")
 
-            rr = np.sqrt((xx - x0)**2 + (yy - y0)**2)
+            rr = np.sqrt((xx - x0) ** 2 + (yy - y0) ** 2)
 
             mask = rr <= radius
 
             return roi, mask, xx, yy
 
-
         def gaussian_2d(params, x, y):
             amp, x0, y0, sigma, offset = params
-            return amp * np.exp(-((x-x0)**2 + (y-y0)**2)/(2*sigma**2)) + offset
+            return amp * np.exp(-((x - x0) ** 2 + (y - y0) ** 2) / (2 * sigma**2)) + offset
 
         def fit_gaussian_local(image, x_init, y_init, radius, max_shift_px):
             roi, mask, xx, yy = extract_circular_roi(image, x_init, y_init, radius)
@@ -2400,16 +2554,8 @@ class Lattice(AutoSerialize):
             p0 = [amp0, x_init, y_init, sigma0, offset0]
 
             bounds = (
-                [0,
-                x_init - max_shift_px,
-                y_init - max_shift_px,
-                0.5,
-                -np.inf],
-                [np.inf,
-                x_init + max_shift_px,
-                y_init + max_shift_px,
-                radius,
-                np.inf]
+                [0, x_init - max_shift_px, y_init - max_shift_px, 0.5, -np.inf],
+                [np.inf, x_init + max_shift_px, y_init + max_shift_px, radius, np.inf],
             )
 
             def residuals(p):
@@ -2419,15 +2565,13 @@ class Lattice(AutoSerialize):
 
             return res.x, res.cost
 
-
-
         atoms_arr = self.atoms.get_data(0)
-        a_x = atoms_arr[:,0]
-        a_y = atoms_arr[:,1]
-        positions_around_A_site = self.get_xy_shifts(1) # this function is just for B sites right now, so hard coding this 1 (zero indexed)
+        a_x = atoms_arr[:, 0]
+        a_y = atoms_arr[:, 1]
+        positions_around_A_site = self.get_xy_shifts(
+            1
+        )  # this function is just for B sites right now, so hard coding this 1 (zero indexed)
         positions_per_uc = positions_around_A_site[:num_b_per_uc]
-        positions_around_A_site_norm = np.linalg.norm(positions_around_A_site, axis = 1)
-
 
         n_A = a_x.shape[0]
         n_B = num_b_per_uc
@@ -2447,13 +2591,17 @@ class Lattice(AutoSerialize):
                         self._image.array,
                         [[position_x], [position_y]],
                         order=order,
-                        mode='nearest'
+                        mode="nearest",
                     )[0]
                 elif avg_inside_radius:
-                    roi, mask, _, _ = extract_circular_roi(self._image.array, position_x, position_y, radius)
+                    roi, mask, _, _ = extract_circular_roi(
+                        self._image.array, position_x, position_y, radius
+                    )
                     intensity = roi[mask].mean()
                 elif max_inside_radius:
-                    roi, mask, xx, yy = extract_circular_roi(self._image.array, position_x, position_y, radius)
+                    roi, mask, xx, yy = extract_circular_roi(
+                        self._image.array, position_x, position_y, radius
+                    )
                     idx = np.argmax(roi[mask])
                     intensity_a = roi[mask]
                     xs_a = xx[mask]
@@ -2464,19 +2612,20 @@ class Lattice(AutoSerialize):
                 elif fit_guassian:
                     gauss_params, fit_cost = fit_gaussian_local(
                         self._image.array,
-                        position_x, position_y,
+                        position_x,
+                        position_y,
                         radius=radius,
-                        max_shift_px=max_shift_gauss
+                        max_shift_px=max_shift_gauss,
                     )
                     intensity_less_offset, position_x, position_y, sigma, offset = gauss_params
                     intensity = intensity_less_offset + offset
                 else:
-                    intensity = self._image.array[np.round(position_x).astype(int), np.round(position_y).astype(int)]
+                    intensity = self._image.array[
+                        np.round(position_x).astype(int), np.round(position_y).astype(int)
+                    ]
                 bsite_data[pos_index, atom_index, :] = intensity, position_x, position_y
 
-
         def deduplicate_positions(positions, cutoff_px):
-
             tree = cKDTree(positions)
             pairs = tree.query_pairs(cutoff_px)
 
@@ -2500,24 +2649,16 @@ class Lattice(AutoSerialize):
             for i in range(len(positions)):
                 r = find(i)
                 clusters.setdefault(r, []).append(i)
-            return np.array([
-                positions[idxs].mean(axis=0)
-                for idxs in clusters.values()
-            ])
-
+            return np.array([positions[idxs].mean(axis=0) for idxs in clusters.values()])
 
         bsite_flat = bsite_data.reshape(-1, 3)
         mask = np.isfinite(bsite_flat[:, 0])
         bsite_flat_valid = bsite_flat[mask]
 
-        positions = bsite_flat_valid[:, 1:3]    # (N, 2)
+        positions = bsite_flat_valid[:, 1:3]  # (N, 2)
         intensities = bsite_flat_valid[:, 0]
 
-
-        dedup_positions = deduplicate_positions(
-            positions,
-            cutoff_px=dedup_cutoff_px
-        )
+        dedup_positions = deduplicate_positions(positions, cutoff_px=dedup_cutoff_px)
 
         tree = cKDTree(positions)
 
@@ -2534,13 +2675,13 @@ class Lattice(AutoSerialize):
         self.bsites_assume = unique_data
 
         if plot_atoms:
-            fig, ax = show_2d(self._image.array, figsize = (10,10), returnfig=True, **kwargs)
+            fig, ax = show_2d(self._image.array, figsize=(10, 10), returnfig=True, **kwargs)
             if ax.images:
                 ax.images[-1].set_zorder(0)
 
             atoms_arr = self.atoms.get_data(0)
-            xs = atoms_arr[:,0]
-            ys = atoms_arr[:,1]
+            xs = atoms_arr[:, 0]
+            ys = atoms_arr[:, 1]
             rgb = site_colors(int(self._numbers[0]))
             ax.scatter(
                 ys,
@@ -2555,8 +2696,8 @@ class Lattice(AutoSerialize):
 
             rgb = site_colors(int(self._numbers[0] + 2))
             ax.scatter(
-                unique_data[:,2],
-                unique_data[:,1],
+                unique_data[:, 2],
+                unique_data[:, 1],
                 s=200,
                 facecolor=(rgb[0], rgb[1], rgb[2], 0.05),
                 edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
@@ -2570,24 +2711,20 @@ class Lattice(AutoSerialize):
 
         return self
 
-
-
-
     def measure_intensity_input_image(
-            self,
-            input_image,
-            order = 1,
-            interpolate_intensity = False,
-            avg_inside_radius = False,
-            max_inside_radius = False,
-            fit_guassian = True,
-            radius = 5,
-            max_shift_gauss = 2,
-            plot_atoms = True,
-            title = '',
-            **kwargs,
+        self,
+        input_image,
+        order=1,
+        interpolate_intensity=False,
+        avg_inside_radius=False,
+        max_inside_radius=False,
+        fit_guassian=True,
+        radius=5,
+        max_shift_gauss=2,
+        plot_atoms=True,
+        title="",
+        **kwargs,
     ):
-        from scipy.spatial import cKDTree
         from scipy.ndimage import map_coordinates
         from scipy.optimize import least_squares
 
@@ -2609,18 +2746,17 @@ class Lattice(AutoSerialize):
             x = np.arange(x_min, x_max)
             y = np.arange(y_min, y_max)
 
-            xx, yy = np.meshgrid(x, y, indexing='ij')
+            xx, yy = np.meshgrid(x, y, indexing="ij")
 
-            rr = np.sqrt((xx - x0)**2 + (yy - y0)**2)
+            rr = np.sqrt((xx - x0) ** 2 + (yy - y0) ** 2)
 
             mask = rr <= radius
 
             return roi, mask, xx, yy
 
-
         def gaussian_2d(params, x, y):
             amp, x0, y0, sigma, offset = params
-            return amp * np.exp(-((x-x0)**2 + (y-y0)**2)/(2*sigma**2)) + offset
+            return amp * np.exp(-((x - x0) ** 2 + (y - y0) ** 2) / (2 * sigma**2)) + offset
 
         def fit_gaussian_local(image, x_init, y_init, radius, max_shift_px):
             roi, mask, xx, yy = extract_circular_roi(image, x_init, y_init, radius)
@@ -2635,16 +2771,8 @@ class Lattice(AutoSerialize):
             p0 = [amp0, x_init, y_init, sigma0, offset0]
 
             bounds = (
-                [0,
-                x_init - max_shift_px,
-                y_init - max_shift_px,
-                0.5,
-                -np.inf],
-                [np.inf,
-                x_init + max_shift_px,
-                y_init + max_shift_px,
-                radius,
-                np.inf]
+                [0, x_init - max_shift_px, y_init - max_shift_px, 0.5, -np.inf],
+                [np.inf, x_init + max_shift_px, y_init + max_shift_px, radius, np.inf],
             )
 
             def residuals(p):
@@ -2654,18 +2782,15 @@ class Lattice(AutoSerialize):
 
             return res.x, res.cost
 
-
-
         atoms_arr = self.atoms.get_data(0)
-        a_x = atoms_arr[:,0]
-        a_y = atoms_arr[:,1]
+        a_x = atoms_arr[:, 0]
+        a_y = atoms_arr[:, 1]
 
-        b_x = self.bsites_assume[:,1]
-        b_y = self.bsites_assume[:,2]
+        b_x = self.bsites_assume[:, 1]
+        b_y = self.bsites_assume[:, 2]
         # positions_around_A_site = self.get_xy_shifts(1) # this function is just for B sites right now, so hard coding this 1 (zero indexed)
         # positions_per_uc = positions_around_A_site[:num_b_per_uc]
         # positions_around_A_site_norm = np.linalg.norm(positions_around_A_site, axis = 1)
-
 
         n_A = a_x.shape[0]
         n_B = b_x.shape[0]
@@ -2682,36 +2807,33 @@ class Lattice(AutoSerialize):
                 continue
             if interpolate_intensity:
                 intensity = map_coordinates(
-                    input_image,
-                    [[position_x], [position_y]],
-                    order=order,
-                    mode='nearest'
+                    input_image, [[position_x], [position_y]], order=order, mode="nearest"
                 )[0]
             elif avg_inside_radius:
                 roi, mask, _, _ = extract_circular_roi(input_image, position_x, position_y, radius)
                 intensity = roi[mask].mean()
             elif max_inside_radius:
-                roi, mask, xx, yy = extract_circular_roi(input_image, position_x, position_y, radius)
+                roi, mask, xx, yy = extract_circular_roi(
+                    input_image, position_x, position_y, radius
+                )
                 idx = np.argmax(roi[mask])
                 intensity_a = roi[mask]
-                xs_a = xx[mask]
-                ys_a = yy[mask]
                 intensity = intensity_a[idx]
-                xs = xs_a[idx]
-                ys = ys_a[idx]
             elif fit_guassian:
                 gauss_params, fit_cost = fit_gaussian_local(
                     self._image.array,
-                    position_x, position_y,
+                    position_x,
+                    position_y,
                     radius=radius,
-                    max_shift_px=max_shift_gauss
+                    max_shift_px=max_shift_gauss,
                 )
                 intensity_less_offset, position_x, position_y, sigma, offset = gauss_params
                 intensity = intensity_less_offset + offset
             else:
-                intensity = self._image.array[np.round(position_x).astype(int), np.round(position_y).astype(int)]
+                intensity = self._image.array[
+                    np.round(position_x).astype(int), np.round(position_y).astype(int)
+                ]
             a_int_input[atom_index] = intensity
-
 
         for atom_index in range(b_x.shape[0]):
             position_x = b_x[atom_index]
@@ -2721,39 +2843,36 @@ class Lattice(AutoSerialize):
                 continue
             if interpolate_intensity:
                 intensity = map_coordinates(
-                    input_image,
-                    [[position_x], [position_y]],
-                    order=order,
-                    mode='nearest'
+                    input_image, [[position_x], [position_y]], order=order, mode="nearest"
                 )[0]
             elif avg_inside_radius:
                 roi, mask, _, _ = extract_circular_roi(input_image, position_x, position_y, radius)
                 intensity = roi[mask].mean()
             elif max_inside_radius:
-                roi, mask, xx, yy = extract_circular_roi(input_image, position_x, position_y, radius)
+                roi, mask, xx, yy = extract_circular_roi(
+                    input_image, position_x, position_y, radius
+                )
                 idx = np.argmax(roi[mask])
                 intensity_a = roi[mask]
-                xs_a = xx[mask]
-                ys_a = yy[mask]
                 intensity = intensity_a[idx]
-                xs = xs_a[idx]
-                ys = ys_a[idx]
             elif fit_guassian:
                 gauss_params, fit_cost = fit_gaussian_local(
                     self._image.array,
-                    position_x, position_y,
+                    position_x,
+                    position_y,
                     radius=radius,
-                    max_shift_px=max_shift_gauss
+                    max_shift_px=max_shift_gauss,
                 )
                 intensity_less_offset, position_x, position_y, sigma, offset = gauss_params
                 intensity = intensity_less_offset + offset
             else:
-                intensity = self._image.array[np.round(position_x).astype(int), np.round(position_y).astype(int)]
+                intensity = self._image.array[
+                    np.round(position_x).astype(int), np.round(position_y).astype(int)
+                ]
             b_int_input[atom_index] = intensity
 
-
         if plot_atoms:
-            fig, ax = show_2d(input_image, figsize = (10,10), returnfig=True, **kwargs)
+            fig, ax = show_2d(input_image, figsize=(10, 10), returnfig=True, **kwargs)
             if ax.images:
                 ax.images[-1].set_zorder(0)
 
@@ -2789,54 +2908,45 @@ class Lattice(AutoSerialize):
 
         return self
 
-
-
-
-
     def get_ab_positions(
         self,
     ):
-        positions_b = self.bsites_assume[:,1:]
+        positions_b = self.bsites_assume[:, 1:]
         a_x = self.atoms[0]["x"]
         a_y = self.atoms[0]["y"]
         positions_a = np.column_stack((a_x, a_y))
         return positions_a, positions_b
 
-
     def bsites_assume_preliminary(
-            self,
+        self,
     ):
         # get the A sites
         a_x = self.atoms[0]["x"]
         a_y = self.atoms[0]["y"]
         a_int = self.atoms[0]["int_peak"]
 
-
         # bsite_data[pos_index, atom_index, :] = intensity, position_x, position_y
         # self.bsites_assume = unique_data
-        b_int = self.bsites_assume[:,0]
-        b_x = self.bsites_assume[:,1]
-        b_y = self.bsites_assume[:,2]
+        b_int = self.bsites_assume[:, 0]
+        b_x = self.bsites_assume[:, 1]
+        b_y = self.bsites_assume[:, 2]
 
-
-        plt.figure(figsize = (5,5), dpi = 300)
-        plt.plot(a_int, c = '#4281f5', label = 'A intensities')
-        plt.plot(np.sort(b_int), c = '#ef42f5', label = 'B intensities')
+        plt.figure(figsize=(5, 5), dpi=300)
+        plt.plot(a_int, c="#4281f5", label="A intensities")
+        plt.plot(np.sort(b_int), c="#ef42f5", label="B intensities")
         plt.legend()
 
-        a_int_normalized = a_int.copy()/np.max(a_int)
-        b_int_normalized = b_int.copy()/np.max(a_int) # normalizing by A
+        a_int_normalized = a_int.copy() / np.max(a_int)
+        b_int_normalized = b_int.copy() / np.max(a_int)  # normalizing by A
 
-        plt.figure(figsize = (5,5), dpi = 300)
-        plt.plot(a_int_normalized, c = '#4281f5', label = 'A intensities')
-        plt.plot(np.sort(b_int_normalized), c = '#ef42f5', label = 'B intensities')
+        plt.figure(figsize=(5, 5), dpi=300)
+        plt.plot(a_int_normalized, c="#4281f5", label="A intensities")
+        plt.plot(np.sort(b_int_normalized), c="#ef42f5", label="B intensities")
         plt.legend()
 
         n_bins = 50
         bin_edges = np.linspace(0, 1, n_bins + 1)
-        bins = (bin_edges[:-1] + bin_edges[1:])/2
-        a_hist = np.histogram(a_int_normalized, bin_edges)
-        b_hist = np.histogram(b_int_normalized, bin_edges)
+        bins = (bin_edges[:-1] + bin_edges[1:]) / 2
 
         # plt.figure(figsize = (5,5), dpi = 300)
         # plt.hist(a_hist, bins)#, color = '#4281f5')
@@ -2846,43 +2956,39 @@ class Lattice(AutoSerialize):
         # plt.hist(b_hist, bins)#, color = '#ef42f5')
         # plt.title('B Site Histogram')
         # # plt.legend()
-        plt.figure(figsize = (5,5), dpi = 300)
-        plt.hist(a_int_normalized, bins)#, color = '#4281f5')
-        plt.title('A Site Histogram')
+        plt.figure(figsize=(5, 5), dpi=300)
+        plt.hist(a_int_normalized, bins)  # , color = '#4281f5')
+        plt.title("A Site Histogram")
         # plt.legend()
-        plt.figure(figsize = (5,5), dpi = 300)
-        plt.hist(b_int_normalized, bins)#, color = '#ef42f5')
-        plt.title('B Site Histogram')
-        plt.yscale('log')
+        plt.figure(figsize=(5, 5), dpi=300)
+        plt.hist(b_int_normalized, bins)  # , color = '#ef42f5')
+        plt.title("B Site Histogram")
+        plt.yscale("log")
         # plt.legend()
 
-
-        plt.figure(figsize = (5,5), dpi = 300)
-        plt.scatter(a_y, a_x, c = a_int_normalized, cmap = 'viridis', label = 'A sites')
-        plt.scatter(b_y, b_x, c = b_int_normalized, cmap = 'magma', label = 'B sites')
+        plt.figure(figsize=(5, 5), dpi=300)
+        plt.scatter(a_y, a_x, c=a_int_normalized, cmap="viridis", label="A sites")
+        plt.scatter(b_y, b_x, c=b_int_normalized, cmap="magma", label="B sites")
         plt.colorbar()
-        plt.ylim([np.max(a_y)+20,-20])
+        plt.ylim([np.max(a_y) + 20, -20])
 
         return self
 
     # also I think it is necessary to have a function that compares the intensity of a B site to that of its neighboring A sites.
     # ohh new idea as well. Now that I have the positions of the atoms, I can go back and measure the intensity over the original image.
 
-
     def delta_intensities_assume(
-            self,
-            uc_val = 2,
-            delta_input_cutoff = None,
-            plot_atoms = False,
+        self,
+        uc_val=2,
+        delta_input_cutoff=None,
+        plot_atoms=False,
     ):
-        
         from scipy.spatial import cKDTree
 
-
         neighbor_cutoff_pix = uc_val * self.uv_norm
-        # 
-        positions_b = self.bsites_assume[:,1:]
-        b_int = self.bsites_assume[:,0]
+        #
+        positions_b = self.bsites_assume[:, 1:]
+        b_int = self.bsites_assume[:, 0]
         a_x = self.atoms[0]["x"]
         a_y = self.atoms[0]["y"]
         a_int = self.atoms[0]["int_peak"]
@@ -2907,108 +3013,99 @@ class Lattice(AutoSerialize):
             median_a_intensity = np.median(a_neighbor_intensities)
             b_neighbor_intensities = b_int[idxs_b - num_a]
             median_b_intensity = np.median(b_neighbor_intensities)
-            all_neighbor_intensities = np.concatenate([a_neighbor_intensities, b_neighbor_intensities])
+            all_neighbor_intensities = np.concatenate(
+                [a_neighbor_intensities, b_neighbor_intensities]
+            )
             median_all_intensity = np.median(all_neighbor_intensities)
 
-
-
-            delta_data[i, 0] = b_int[i] - median_a_intensity # the delta intensity
-            delta_data[i, 1] = b_int[i] - median_b_intensity # the delta intensity
-            delta_data[i, 2] = b_int[i] - median_all_intensity # the delta intensity
-            delta_data[i, 3] = idxs_a.shape[0] # number of neighbors used
-            delta_data[i, 4] = idxs_b.shape[0] # number of neighbors used
+            delta_data[i, 0] = b_int[i] - median_a_intensity  # the delta intensity
+            delta_data[i, 1] = b_int[i] - median_b_intensity  # the delta intensity
+            delta_data[i, 2] = b_int[i] - median_all_intensity  # the delta intensity
+            delta_data[i, 3] = idxs_a.shape[0]  # number of neighbors used
+            delta_data[i, 4] = idxs_b.shape[0]  # number of neighbors used
 
         self.delta_assume = delta_data
 
         # delta_intensities, num_neighbors = lattice.intensity_neighborhood(neighborhood_units = neighborhood_units, return_delta = True)
 
-        plt.figure(figsize = (24,7), dpi = 300)
+        plt.figure(figsize=(24, 7), dpi=300)
         # plt.rcParams['font.family'] = 'serif'
-        # params = {'mathtext.default': 'regular' }          
+        # params = {'mathtext.default': 'regular' }
         # plt.rcParams.update(params)
         plt.subplot(141)
-        plt.scatter(self.delta_assume[:,0], self.delta_assume[:,3], alpha = 0.2)
-        plt.title('Number of A neighbors for each site')
-        plt.xlabel('$I_{site}-median(I_{A neighbors})$ \"(∆I)\"')
-        plt.ylabel('Number of neighbors in px range ' + str(np.round(neighbor_cutoff_pix)))
+        plt.scatter(self.delta_assume[:, 0], self.delta_assume[:, 3], alpha=0.2)
+        plt.title("Number of A neighbors for each site")
+        plt.xlabel('$I_{site}-median(I_{A neighbors})$ "(∆I)"')
+        plt.ylabel("Number of neighbors in px range " + str(np.round(neighbor_cutoff_pix)))
 
         num_bins = 100
         range_bins = [-0.12, 0.1]
         hist_bins = np.linspace(range_bins[0], range_bins[1], num_bins)
         plt.subplot(142)
-        plt.hist(self.delta_assume[:,0], bins = hist_bins)
-        plt.xlabel('$I_{site}-median(I_{A neighbors})$ \"(∆I)\"')
-        plt.ylabel('A site count')
-        plt.title('Histogram of ∆Intensity')
-        plt.grid('on')
+        plt.hist(self.delta_assume[:, 0], bins=hist_bins)
+        plt.xlabel('$I_{site}-median(I_{A neighbors})$ "(∆I)"')
+        plt.ylabel("A site count")
+        plt.title("Histogram of ∆Intensity")
+        plt.grid("on")
 
-        delta_histogram, bin_edges = np.histogram(self.delta_assume[:,0], num_bins, range_bins)
+        delta_histogram, bin_edges = np.histogram(self.delta_assume[:, 0], num_bins, range_bins)
 
         def double_gaussian(x, amp1, mean1, sigma1, amp2, mean2, sigma2):
-            return (
-                amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2))
-                + amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2))
+            return amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)) + amp2 * np.exp(
+                -((x - mean2) ** 2) / (2 * sigma2**2)
             )
-
 
         p0 = [100, -0.025, 0.01, 10, -0.07, 0.01]
         p0 = np.array(p0)
 
         def double_gaussian_penalized(x, amp1, mean1, sigma1, amp2, mean2, sigma2):
-            model = (
-                amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2)) +
-                amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2))
+            model = amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)) + amp2 * np.exp(
+                -((x - mean2) ** 2) / (2 * sigma2**2)
             )
 
             penalty_strength = 1e6
-            penalty = penalty_strength * np.sum((np.array(
-                [amp1, mean1, sigma1, amp2, mean2, sigma2]
-            ) - p0)**2)
+            penalty = penalty_strength * np.sum(
+                (np.array([amp1, mean1, sigma1, amp2, mean2, sigma2]) - p0) ** 2
+            )
 
             return model + penalty / len(x)
-
 
         x = np.linspace(range_bins[0], range_bins[1], num_bins)
         y = delta_histogram
         from scipy.optimize import curve_fit
+
         try:
-            popt, _ = curve_fit(
-                double_gaussian_penalized,
-                x,
-                y,
-                p0=p0,
-                maxfev=10000
-            )
+            popt, _ = curve_fit(double_gaussian_penalized, x, y, p0=p0, maxfev=10000)
         except (RuntimeError, ValueError):
             popt = np.asarray(p0)
 
         amp1, mean1, sigma1, amp2, mean2, sigma2 = popt
 
         plt.subplot(143)
-        plt.plot(x, y, 'k.', label='Data')
-        plt.plot(x, double_gaussian(x, *popt), 'r-', label='Total fit')
-        plt.plot(x, amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2)), 'b--')
-        plt.plot(x, amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2)), 'g--')
-        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label = 'Gaussian Means')
+        plt.plot(x, y, "k.", label="Data")
+        plt.plot(x, double_gaussian(x, *popt), "r-", label="Total fit")
+        plt.plot(x, amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)), "b--")
+        plt.plot(x, amp2 * np.exp(-((x - mean2) ** 2) / (2 * sigma2**2)), "g--")
+        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label="Gaussian Means")
         plt.legend()
-        plt.ylim([0.8,250])
-        plt.xlabel('$I_{site}-median(I_{neighbors})$ \"(∆I)\"')
-        plt.ylabel('Atomic site count')
-        plt.title('Gaussian fit of ∆Intensity')
-        plt.grid('on')
+        plt.ylim([0.8, 250])
+        plt.xlabel('$I_{site}-median(I_{neighbors})$ "(∆I)"')
+        plt.ylabel("Atomic site count")
+        plt.title("Gaussian fit of ∆Intensity")
+        plt.grid("on")
         plt.subplot(144)
-        plt.plot(x, y, 'k.', label='Data')
-        plt.plot(x, double_gaussian(x, *popt), 'r-', label='Total fit')
-        plt.plot(x, amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2)), 'b--')
-        plt.plot(x, amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2)), 'g--')
-        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label = 'Gaussian Means')
+        plt.plot(x, y, "k.", label="Data")
+        plt.plot(x, double_gaussian(x, *popt), "r-", label="Total fit")
+        plt.plot(x, amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)), "b--")
+        plt.plot(x, amp2 * np.exp(-((x - mean2) ** 2) / (2 * sigma2**2)), "g--")
+        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label="Gaussian Means")
         plt.legend()
-        plt.yscale('log')
-        plt.ylim([0.8,250])
-        plt.xlabel('$I_{site}-median(I_{neighbors})$ \"(∆I)\"')
-        plt.ylabel('Atomic site count [log scale]')
-        plt.title('Gaussian fit of ∆Intensity')
-        plt.grid('on')
+        plt.yscale("log")
+        plt.ylim([0.8, 250])
+        plt.xlabel('$I_{site}-median(I_{neighbors})$ "(∆I)"')
+        plt.ylabel("Atomic site count [log scale]")
+        plt.title("Gaussian fit of ∆Intensity")
+        plt.grid("on")
 
         # use the estimates to retrieve the sites
         # positions_b = self.bsites_assume[:,1:]
@@ -3020,86 +3117,92 @@ class Lattice(AutoSerialize):
         # a_int /= np.max(a_int)
 
         if delta_input_cutoff is None:
-            positions_b_defect = positions_b[self.delta_assume[:,0] < (mean2 + sigma2*1.2),:]
+            positions_b_defect = positions_b[self.delta_assume[:, 0] < (mean2 + sigma2 * 1.2), :]
         else:
-            positions_b_defect = positions_b[self.delta_assume[:,0] < delta_input_cutoff,:]
-            
-        if plot_atoms:
-            fig, ax = plt.subplots(figsize = (5,5), dpi = 300)
+            positions_b_defect = positions_b[self.delta_assume[:, 0] < delta_input_cutoff, :]
 
-            import matplotlib.patches as patches    
+        if plot_atoms:
+            fig, ax = plt.subplots(figsize=(5, 5), dpi=300)
+
+            import matplotlib.patches as patches
 
             show_2d(
                 self._image.array,
                 # lower_quantile = 0.23,
-                figax = (fig, ax),
+                figax=(fig, ax),
             )
 
             for i in range(positions_b_defect.shape[0]):
-                circle = patches.Circle((positions_b_defect[i,1],positions_b_defect[i,0]), 10, fill=False, edgecolor='red', linewidth=2, )
+                circle = patches.Circle(
+                    (positions_b_defect[i, 1], positions_b_defect[i, 0]),
+                    10,
+                    fill=False,
+                    edgecolor="red",
+                    linewidth=2,
+                )
                 ax.add_patch(circle)
-            
-            
-            fig.text(
-                0.5, -0.05,
-                "Number of A sites counted: " + str(num_a) + ", number of B sites counted: " + str(num_b) + ", number of defects counted: " + str(positions_b_defect.shape[0]),
-                ha="center",
-                va="top"
-            )
 
+            fig.text(
+                0.5,
+                -0.05,
+                "Number of A sites counted: "
+                + str(num_a)
+                + ", number of B sites counted: "
+                + str(num_b)
+                + ", number of defects counted: "
+                + str(positions_b_defect.shape[0]),
+                ha="center",
+                va="top",
+            )
 
         return self
 
-
-
-    def circle_defects(
-            self,
-            delta_threshold,
-            out,
-            show_histogram = False,
-            figax = None
-    ):
+    def circle_defects(self, delta_threshold, out, show_histogram=False, figax=None):
         import matplotlib.patches as patches
-        
+
         out.clear_output(wait=True)
         with out:
-
             if figax is None:
-                fig, ax = plt.subplots(figsize = (5,5), dpi = 300)
+                fig, ax = plt.subplots(figsize=(5, 5), dpi=300)
             else:
                 fig, ax = figax
 
             ax.clear()
 
-
-            positions_b = self.bsites_assume[:,1:]
-            positions_b_defect = positions_b[self.delta_assume[:,0] < delta_threshold,:]
+            positions_b = self.bsites_assume[:, 1:]
+            positions_b_defect = positions_b[self.delta_assume[:, 0] < delta_threshold, :]
 
             show_2d(
                 self._image.array,
-                figax = (fig, ax),
+                figax=(fig, ax),
             )
 
             for i in range(positions_b_defect.shape[0]):
-                circle = patches.Circle((positions_b_defect[i,1],positions_b_defect[i,0]), 10, fill=False, edgecolor='red', linewidth=2, )
+                circle = patches.Circle(
+                    (positions_b_defect[i, 1], positions_b_defect[i, 0]),
+                    10,
+                    fill=False,
+                    edgecolor="red",
+                    linewidth=2,
+                )
                 ax.add_patch(circle)
 
             if show_histogram:
                 num_bins = 100
-                range_bins = [np.min(self.delta_assume[:,0])-0.01, np.max(self.delta_assume[:,0])+0.01]
+                range_bins = [
+                    np.min(self.delta_assume[:, 0]) - 0.01,
+                    np.max(self.delta_assume[:, 0]) + 0.01,
+                ]
                 hist_bins = np.linspace(range_bins[0], range_bins[1], num_bins)
                 # plt.subplot(142)
                 plt.figure()
-                plt.hist(self.delta_assume[:,0], bins = hist_bins)
-                plt.xlabel('$I_{site}-median(I_{A neighbors})$ \"(∆I)\"')
-                plt.ylabel('A site count')
-                plt.title('Histogram of ∆Intensity')
-                plt.grid('on')
+                plt.hist(self.delta_assume[:, 0], bins=hist_bins)
+                plt.xlabel('$I_{site}-median(I_{A neighbors})$ "(∆I)"')
+                plt.ylabel("A site count")
+                plt.title("Histogram of ∆Intensity")
+                plt.grid("on")
 
         return self
-
-
-
 
     # def interactive_circle_defects(self):
 
@@ -3139,69 +3242,56 @@ class Lattice(AutoSerialize):
 
     #     display(ui, out_plot)
 
-
-
-
     def interactive_circle_defects(
-            self,
-            scalebar = None,
-            ind = None,
-            init_threshold_low = None,
-            init_threshold_high = None,
+        self,
+        scalebar=None,
+        ind=None,
+        init_threshold_low=None,
+        init_threshold_high=None,
     ):
-        import matplotlib.patches as patches
         import ipywidgets as widgets
-        from ipywidgets import interactive_output, HBox, VBox
+        import matplotlib.patches as patches
+        from ipywidgets import interactive_output
 
         if init_threshold_low is None:
-            init_threshold_low = np.min(self.delta_assume[:,0])+0.01
+            init_threshold_low = np.min(self.delta_assume[:, 0]) + 0.01
         if init_threshold_high is None:
-            init_threshold_high = np.median(self.delta_assume[:,0])
+            init_threshold_high = np.median(self.delta_assume[:, 0])
         thresh_slider_l = widgets.FloatSlider(
             value=init_threshold_low,
-            min=np.min(self.delta_assume[:,0])-0.01,
-            max = np.max(self.delta_assume[:,0])+0.01,
-            description='threshold',
+            min=np.min(self.delta_assume[:, 0]) - 0.01,
+            max=np.max(self.delta_assume[:, 0]) + 0.01,
+            description="threshold",
             step=0.001,
             continuous_update=True,
-            readout_format='.4f'
-    )
+            readout_format=".4f",
+        )
         thresh_slider_h = widgets.FloatSlider(
             value=init_threshold_high,
-            min=np.min(self.delta_assume[:,0])-0.01,
-            max = np.max(self.delta_assume[:,0])+0.01,
-            description='threshold',
+            min=np.min(self.delta_assume[:, 0]) - 0.01,
+            max=np.max(self.delta_assume[:, 0]) + 0.01,
+            description="threshold",
             step=0.001,
             continuous_update=True,
-            readout_format='.4f'
-    )
+            readout_format=".4f",
+        )
         out = widgets.Output()
 
-        def circle_defects(
-                delta_high,
-                delta_low,
-                show_histogram = False,
-                figax = None
-        ):
-            
+        def circle_defects(delta_high, delta_low, show_histogram=False, figax=None):
             out.clear_output(wait=True)
             with out:
-
                 if figax is None:
-                    fig, ax = plt.subplots(figsize = (5,5), dpi = 300)
+                    fig, ax = plt.subplots(figsize=(5, 5), dpi=300)
                 else:
                     fig, ax = figax
 
                 ax.clear()
 
+                positions_b = self.bsites_assume[:, 1:]
 
-
-
-                positions_b = self.bsites_assume[:,1:]
-
-                delta = self.delta_assume[:,0] 
+                delta = self.delta_assume[:, 0]
                 mask_mono = (delta >= delta_low) & (delta < delta_high)
-                mask_di = (delta < delta_low)
+                mask_di = delta < delta_low
                 positions_b_mono = positions_b[mask_mono, :]
                 positions_b_di = positions_b[mask_di, :]
 
@@ -3213,99 +3303,118 @@ class Lattice(AutoSerialize):
                 num_b = positions_b.shape[0]
 
                 # a rough area estimate using the site positions:
-                min_x = min((np.min(a_x), np.min(positions_b[:,0])))
-                max_x = max((np.max(a_x), np.max(positions_b[:,0])))
+                min_x = min((np.min(a_x), np.min(positions_b[:, 0])))
+                max_x = max((np.max(a_x), np.max(positions_b[:, 0])))
 
-                min_y = min((np.min(a_y), np.min(positions_b[:,1])))
-                max_y = max((np.max(a_y), np.max(positions_b[:,1])))
+                min_y = min((np.min(a_y), np.min(positions_b[:, 1])))
+                max_y = max((np.max(a_y), np.max(positions_b[:, 1])))
 
                 x_length_pix = max_x - min_x
                 y_length_pix = max_y - min_y
 
-                pixel_size = scalebar['sampling']
-                pixel_units = scalebar['units']
-                if pixel_units == 'nm':
+                pixel_size = scalebar["sampling"]
+                pixel_units = scalebar["units"]
+                if pixel_units == "nm":
                     cm_multiplier = 1e7
 
-                area_analyzed = pixel_size **2 * y_length_pix * x_length_pix / (cm_multiplier ** 2) # area in cm
+                area_analyzed = (
+                    pixel_size**2 * y_length_pix * x_length_pix / (cm_multiplier**2)
+                )  # area in cm
 
                 monovacancy_density = positions_b_mono.shape[0] / area_analyzed
                 divacancy_density = positions_b_di.shape[0] / area_analyzed
 
                 show_2d(
                     self._image.array,
-                    figax = (fig, ax),
-                    scalebar = scalebar,
+                    figax=(fig, ax),
+                    scalebar=scalebar,
                 )
 
                 for i in range(positions_b_mono.shape[0]):
-                    circle = patches.Circle((positions_b_mono[i,1],positions_b_mono[i,0]), 10, fill=False, edgecolor='red', linewidth=1, )
+                    circle = patches.Circle(
+                        (positions_b_mono[i, 1], positions_b_mono[i, 0]),
+                        10,
+                        fill=False,
+                        edgecolor="red",
+                        linewidth=1,
+                    )
                     ax.add_patch(circle)
 
                 for i in range(positions_b_di.shape[0]):
-                    circle = patches.Circle((positions_b_di[i,1],positions_b_di[i,0]), 10, fill=False, edgecolor='blue', linewidth=1, )
+                    circle = patches.Circle(
+                        (positions_b_di[i, 1], positions_b_di[i, 0]),
+                        10,
+                        fill=False,
+                        edgecolor="blue",
+                        linewidth=1,
+                    )
                     ax.add_patch(circle)
 
                 rect = patches.Rectangle(
-                    (min_y - 5, min_x- 5),
+                    (min_y - 5, min_x - 5),
                     max_y - min_y + 10,
                     max_x - min_x + 10,
                     linewidth=0.5,
-                    edgecolor='#695147',
-                    facecolor='none'
+                    edgecolor="#695147",
+                    facecolor="none",
                 )
 
                 ax.add_patch(rect)
 
                 fig.text(
-                    0.5, -0.01,
-                    "Number of A sites: " + str(num_a) + ", Number of B sites: " + str(num_b) +
-                    "\nNumber of mono Se vacancies: " + str(positions_b_mono.shape[0]) +", Number of di Se vacancies: " +  str(positions_b_di.shape[0]) +
-                    f"\nMonovacancy density: {monovacancy_density:.1e} cm$^{{-2}}$" + f", Divacancy density: {divacancy_density:.1e} cm$^{{-2}}$" + 
-                    f"\nArea analyzed: {area_analyzed:.1e} cm$^{{2}}$",
+                    0.5,
+                    -0.01,
+                    "Number of A sites: "
+                    + str(num_a)
+                    + ", Number of B sites: "
+                    + str(num_b)
+                    + "\nNumber of mono Se vacancies: "
+                    + str(positions_b_mono.shape[0])
+                    + ", Number of di Se vacancies: "
+                    + str(positions_b_di.shape[0])
+                    + f"\nMonovacancy density: {monovacancy_density:.1e} cm$^{{-2}}$"
+                    + f", Divacancy density: {divacancy_density:.1e} cm$^{{-2}}$"
+                    + f"\nArea analyzed: {area_analyzed:.1e} cm$^{{2}}$",
                     ha="center",
-                    va="top"
+                    va="top",
                 )
 
                 if ind is not None:
-                    ax.set_title('Pair index: ' + str(ind))
+                    ax.set_title("Pair index: " + str(ind))
 
                 if show_histogram:
                     num_bins = 100
-                    range_bins = [np.min(self.delta_assume[:,0])-0.01, np.max(self.delta_assume[:,0])+0.01]
+                    range_bins = [
+                        np.min(self.delta_assume[:, 0]) - 0.01,
+                        np.max(self.delta_assume[:, 0]) + 0.01,
+                    ]
                     hist_bins = np.linspace(range_bins[0], range_bins[1], num_bins)
                     # plt.subplot(142)
                     plt.figure()
-                    plt.hist(self.delta_assume[:,0], bins = hist_bins)
-                    plt.xlabel('$I_{site}-median(I_{A neighbors})$ \"(∆I)\"')
-                    plt.ylabel('A site count')
-                    plt.title('Histogram of ∆Intensity')
-                    plt.grid('on')
+                    plt.hist(self.delta_assume[:, 0], bins=hist_bins)
+                    plt.xlabel('$I_{site}-median(I_{A neighbors})$ "(∆I)"')
+                    plt.ylabel("A site count")
+                    plt.title("Histogram of ∆Intensity")
+                    plt.grid("on")
 
-        ui = VBox([HBox([thresh_slider_l, thresh_slider_h])])
-        out_plot = interactive_output(circle_defects, {'delta_low': thresh_slider_l, 'delta_high': thresh_slider_h})
+        interactive_output(
+            circle_defects, {"delta_low": thresh_slider_l, "delta_high": thresh_slider_h}
+        )
 
-        display(ui, out_plot)
+        # display(ui, out_plot)
         return self
 
-
-
-
-
     def delta_intensities_input(
-            self,
-            uc_val = 2,
+        self,
+        uc_val=2,
     ):
-        
         from scipy.spatial import cKDTree
 
-
         neighbor_cutoff_pix = uc_val * self.uv_norm
-        
 
         # self.input_image_a_int = a_int_input
         # self.input_image_b_int = b_int_input
-        positions_b = self.bsites_assume[:,1:]
+        positions_b = self.bsites_assume[:, 1:]
         b_int = self.input_image_b_int
         a_x = self.atoms[0]["x"]
         a_y = self.atoms[0]["y"]
@@ -3331,108 +3440,99 @@ class Lattice(AutoSerialize):
             median_a_intensity = np.median(a_neighbor_intensities)
             b_neighbor_intensities = b_int[idxs_b - num_a]
             median_b_intensity = np.median(b_neighbor_intensities)
-            all_neighbor_intensities = np.concatenate([a_neighbor_intensities, b_neighbor_intensities])
+            all_neighbor_intensities = np.concatenate(
+                [a_neighbor_intensities, b_neighbor_intensities]
+            )
             median_all_intensity = np.median(all_neighbor_intensities)
 
-
-
-            delta_data[i, 0] = b_int[i] - median_a_intensity # the delta intensity
-            delta_data[i, 1] = b_int[i] - median_b_intensity # the delta intensity
-            delta_data[i, 2] = b_int[i] - median_all_intensity # the delta intensity
-            delta_data[i, 3] = idxs_a.shape[0] # number of neighbors used
-            delta_data[i, 4] = idxs_b.shape[0] # number of neighbors used
+            delta_data[i, 0] = b_int[i] - median_a_intensity  # the delta intensity
+            delta_data[i, 1] = b_int[i] - median_b_intensity  # the delta intensity
+            delta_data[i, 2] = b_int[i] - median_all_intensity  # the delta intensity
+            delta_data[i, 3] = idxs_a.shape[0]  # number of neighbors used
+            delta_data[i, 4] = idxs_b.shape[0]  # number of neighbors used
 
         self.delta_input = delta_data
 
         # delta_intensities, num_neighbors = lattice.intensity_neighborhood(neighborhood_units = neighborhood_units, return_delta = True)
 
-        plt.figure(figsize = (24,7), dpi = 300)
+        plt.figure(figsize=(24, 7), dpi=300)
         # plt.rcParams['font.family'] = 'serif'
-        # params = {'mathtext.default': 'regular' }          
+        # params = {'mathtext.default': 'regular' }
         # plt.rcParams.update(params)
         plt.subplot(141)
-        plt.scatter(self.delta_input[:,0], self.delta_input[:,3], alpha = 0.2)
-        plt.title('Number of A neighbors for each site')
-        plt.xlabel('$I_{site}-median(I_{A neighbors})$ \"(∆I)\"')
-        plt.ylabel('Number of neighbors in px range ' + str(np.round(neighbor_cutoff_pix)))
+        plt.scatter(self.delta_input[:, 0], self.delta_input[:, 3], alpha=0.2)
+        plt.title("Number of A neighbors for each site")
+        plt.xlabel('$I_{site}-median(I_{A neighbors})$ "(∆I)"')
+        plt.ylabel("Number of neighbors in px range " + str(np.round(neighbor_cutoff_pix)))
 
         num_bins = 100
         range_bins = [-0.6, 0.1]
         hist_bins = np.linspace(range_bins[0], range_bins[1], num_bins)
         plt.subplot(142)
-        plt.hist(self.delta_input[:,0], bins = hist_bins)
-        plt.xlabel('$I_{site}-median(I_{A neighbors})$ \"(∆I)\"')
-        plt.ylabel('A site count')
-        plt.title('Histogram of ∆Intensity')
-        plt.grid('on')
+        plt.hist(self.delta_input[:, 0], bins=hist_bins)
+        plt.xlabel('$I_{site}-median(I_{A neighbors})$ "(∆I)"')
+        plt.ylabel("A site count")
+        plt.title("Histogram of ∆Intensity")
+        plt.grid("on")
 
-        delta_histogram, bin_edges = np.histogram(self.delta_input[:,0], num_bins, range_bins)
+        delta_histogram, bin_edges = np.histogram(self.delta_input[:, 0], num_bins, range_bins)
 
         def double_gaussian(x, amp1, mean1, sigma1, amp2, mean2, sigma2):
-            return (
-                amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2))
-                + amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2))
+            return amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)) + amp2 * np.exp(
+                -((x - mean2) ** 2) / (2 * sigma2**2)
             )
-
 
         p0 = [30, -0.2, 0.15, 5, -0.5, 0.1]
         p0 = np.array(p0)
 
         def double_gaussian_penalized(x, amp1, mean1, sigma1, amp2, mean2, sigma2):
-            model = (
-                amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2)) +
-                amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2))
+            model = amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)) + amp2 * np.exp(
+                -((x - mean2) ** 2) / (2 * sigma2**2)
             )
 
             penalty_strength = 1e6
-            penalty = penalty_strength * np.sum((np.array(
-                [amp1, mean1, sigma1, amp2, mean2, sigma2]
-            ) - p0)**2)
+            penalty = penalty_strength * np.sum(
+                (np.array([amp1, mean1, sigma1, amp2, mean2, sigma2]) - p0) ** 2
+            )
 
             return model + penalty / len(x)
-
 
         x = np.linspace(range_bins[0], range_bins[1], num_bins)
         y = delta_histogram
         from scipy.optimize import curve_fit
+
         try:
-            popt, _ = curve_fit(
-                double_gaussian_penalized,
-                x,
-                y,
-                p0=p0,
-                maxfev=10000
-            )
+            popt, _ = curve_fit(double_gaussian_penalized, x, y, p0=p0, maxfev=10000)
         except (RuntimeError, ValueError):
             popt = np.asarray(p0)
 
         amp1, mean1, sigma1, amp2, mean2, sigma2 = popt
 
         plt.subplot(143)
-        plt.plot(x, y, 'k.', label='Data')
-        plt.plot(x, double_gaussian(x, *popt), 'r-', label='Total fit')
-        plt.plot(x, amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2)), 'b--')
-        plt.plot(x, amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2)), 'g--')
-        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label = 'Gaussian Means')
+        plt.plot(x, y, "k.", label="Data")
+        plt.plot(x, double_gaussian(x, *popt), "r-", label="Total fit")
+        plt.plot(x, amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)), "b--")
+        plt.plot(x, amp2 * np.exp(-((x - mean2) ** 2) / (2 * sigma2**2)), "g--")
+        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label="Gaussian Means")
         plt.legend()
-        plt.ylim([0.8,250])
-        plt.xlabel('$I_{site}-median(I_{neighbors})$ \"(∆I)\"')
-        plt.ylabel('Atomic site count')
-        plt.title('Gaussian fit of ∆Intensity')
-        plt.grid('on')
+        plt.ylim([0.8, 250])
+        plt.xlabel('$I_{site}-median(I_{neighbors})$ "(∆I)"')
+        plt.ylabel("Atomic site count")
+        plt.title("Gaussian fit of ∆Intensity")
+        plt.grid("on")
         plt.subplot(144)
-        plt.plot(x, y, 'k.', label='Data')
-        plt.plot(x, double_gaussian(x, *popt), 'r-', label='Total fit')
-        plt.plot(x, amp1 * np.exp(-(x - mean1)**2 / (2 * sigma1**2)), 'b--')
-        plt.plot(x, amp2 * np.exp(-(x - mean2)**2 / (2 * sigma2**2)), 'g--')
-        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label = 'Gaussian Means')
+        plt.plot(x, y, "k.", label="Data")
+        plt.plot(x, double_gaussian(x, *popt), "r-", label="Total fit")
+        plt.plot(x, amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)), "b--")
+        plt.plot(x, amp2 * np.exp(-((x - mean2) ** 2) / (2 * sigma2**2)), "g--")
+        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label="Gaussian Means")
         plt.legend()
-        plt.yscale('log')
-        plt.ylim([0.8,250])
-        plt.xlabel('$I_{site}-median(I_{neighbors})$ \"(∆I)\"')
-        plt.ylabel('Atomic site count [log scale]')
-        plt.title('Gaussian fit of ∆Intensity')
-        plt.grid('on')
+        plt.yscale("log")
+        plt.ylim([0.8, 250])
+        plt.xlabel('$I_{site}-median(I_{neighbors})$ "(∆I)"')
+        plt.ylabel("Atomic site count [log scale]")
+        plt.title("Gaussian fit of ∆Intensity")
+        plt.grid("on")
 
         # use the estimates to retrieve the sites
         # positions_b = self.bsites_assume[:,1:]
@@ -3443,39 +3543,31 @@ class Lattice(AutoSerialize):
         # b_int /= np.max(a_int)
         # a_int /= np.max(a_int)
 
-        positions_b_defect = positions_b[self.delta_input[:,0] < (mean2 + sigma2*1.2),:]
+        positions_b_defect = positions_b[self.delta_input[:, 0] < (mean2 + sigma2 * 1.2), :]
 
-        fig, ax = plt.subplots(figsize = (10,10), dpi = 300)
+        fig, ax = plt.subplots(figsize=(10, 10), dpi=300)
 
-        import matplotlib.patches as patches    
+        import matplotlib.patches as patches
 
         show_2d(
             self.input_image,
             # lower_quantile = 0.23,
-            figax = (fig, ax),
+            figax=(fig, ax),
         )
 
         for i in range(positions_b_defect.shape[0]):
-            circle = patches.Circle((positions_b_defect[i,1],positions_b_defect[i,0]), 10, fill=False, edgecolor='red', linewidth=2, )
+            circle = patches.Circle(
+                (positions_b_defect[i, 1], positions_b_defect[i, 0]),
+                10,
+                fill=False,
+                edgecolor="red",
+                linewidth=2,
+            )
             ax.add_patch(circle)
-        
-
 
         return self
 
-
-
-
-
-
-
-    def line_profile(
-            self,
-            origin,
-            direction,
-            num_samples=None
-        ):
-
+    def line_profile(self, origin, direction, num_samples=None):
         nx, ny = self._image.array.shape
         # print(nx, ny)
         print(direction)
@@ -3487,11 +3579,11 @@ class Lattice(AutoSerialize):
         if num_samples is None:
             num_samples = int(np.hypot(nx, ny))
 
-        corners = np.array([[0,0],[nx,0],[0,ny],[nx,ny]])
+        corners = np.array([[0, 0], [nx, 0], [0, ny], [nx, ny]])
         t_values = []
         for corner in corners:
             dx, dy = corner - origin
-            t_values.append(np.dot([dx,dy], v))  # projection along direction
+            t_values.append(np.dot([dx, dy], v))  # projection along direction
         t_min, t_max = min(t_values), max(t_values)
         # print(t_min, t_max, num_samples)
         t = np.linspace(t_min, t_max, num_samples)
@@ -3501,14 +3593,14 @@ class Lattice(AutoSerialize):
         y = y0 + v[1] * t
 
         # Interpolated intensities
-        profile = map_coordinates(self.image.array, [x, y], order=1, mode='nearest')
+        profile = map_coordinates(self.image.array, [x, y], order=1, mode="nearest")
 
         # Clip valid region (inside image bounds)
         mask = (x >= 0) & (x < nx) & (y >= 0) & (y < ny)
         return t[mask], profile[mask], x[mask], y[mask]
 
     # overloading this handle
-    def line_profile(
+    def line_profile_pts(
         image,
         p1=None,
         p2=None,
@@ -3516,9 +3608,8 @@ class Lattice(AutoSerialize):
         direction=None,
         num_samples=None,
         order=1,
-        mode='nearest'
+        mode="nearest",
     ):
-
         nx, ny = image.shape
 
         if p1 is not None and p2 is not None:
@@ -3540,7 +3631,7 @@ class Lattice(AutoSerialize):
             if num_samples is None:
                 num_samples = int(np.hypot(nx, ny))
 
-            corners = np.array([[0,0],[nx,0],[0,ny],[nx,ny]])
+            corners = np.array([[0, 0], [nx, 0], [0, ny], [nx, ny]])
             t_values = [(np.dot(corner - origin, v)) for corner in corners]
             t_min, t_max = min(t_values), max(t_values)
             t = np.linspace(t_min, t_max, num_samples)
@@ -3557,39 +3648,48 @@ class Lattice(AutoSerialize):
 
         return t[mask], profile[mask], x[mask], y[mask]
 
-
     def find_b_sites(
-            self,
-            max_perpendicular_distance = 5,
-            sigma_perp = 5,
-            sigma_parallel = 5,
+        self,
+        max_perpendicular_distance=5,
+        sigma_perp=5,
+        sigma_parallel=5,
     ):
-
         atoms_arr = self.atoms.get_data(0)
-        a_x = atoms_arr[:,0]
-        a_y = atoms_arr[:,1]
-        a_intensity = self.atoms[0]['int_peak']
-        pm_arr = np.array([1,-1])
+        a_x = atoms_arr[:, 0]
+        a_y = atoms_arr[:, 1]
+        a_intensity = self.atoms[0]["int_peak"]
 
         for lat_vec in self.uv_arr:
             for atom_index in range(a_x.shape[0]):
-                neighbor_x = [a_x[i] for i in self.atom_neighbor_arr[:,atom_index] if i is not None]
-                neighbor_y = [a_y[i] for i in self.atom_neighbor_arr[:,atom_index] if i is not None]
+                neighbor_x = [
+                    a_x[i] for i in self.atom_neighbor_arr[:, atom_index] if i is not None
+                ]
+                neighbor_y = [
+                    a_y[i] for i in self.atom_neighbor_arr[:, atom_index] if i is not None
+                ]
                 atom_x = a_x[atom_index]
                 atom_y = a_y[atom_index]
                 position_x = lat_vec[0] + atom_x
                 position_y = lat_vec[1] + atom_y
-                radial_dist = ((neighbor_x - position_x)**2 + (neighbor_y - position_y)**2)**(0.5)
+                radial_dist = (
+                    (neighbor_x - position_x) ** 2 + (neighbor_y - position_y) ** 2
+                ) ** (0.5)
                 if (radial_dist < (self.uv_norm * (self.tolerance_uv - 1))).any():
                     successful_candidate_index = np.argmin(radial_dist)
-                    successful_candidate_index = self.atom_neighbor_arr[successful_candidate_index, atom_index]
+                    successful_candidate_index = self.atom_neighbor_arr[
+                        successful_candidate_index, atom_index
+                    ]
                     vec_x = a_x[successful_candidate_index] - atom_x
                     vec_y = a_y[successful_candidate_index] - atom_y
                     line_profile_vector = np.array([vec_x, vec_y])
                     line_profile_origin = np.array([atom_x, atom_y])
-                    slice_coordinates, slice_y, x_coords_slice, y_coords_slice = self.line_profile(line_profile_origin, line_profile_vector)
-                    mask, near_peaks, t_values, distances = self.select_peaks_near_line(atom_index, line_profile_vector, max_perpendicular_distance)
-                    
+                    slice_coordinates, slice_y, x_coords_slice, y_coords_slice = self.line_profile(
+                        line_profile_origin, line_profile_vector
+                    )
+                    mask, near_peaks, t_values, distances = self.select_peaks_near_line(
+                        atom_index, line_profile_vector, max_perpendicular_distance
+                    )
+
                     t_profile = np.asarray(slice_coordinates)
                     t_values = np.asarray(t_values)
                     distances = np.asarray(distances)
@@ -3598,17 +3698,19 @@ class Lattice(AutoSerialize):
                     A_eff = A * np.exp(-0.5 * (distances / sigma_perp) ** 2)
                     gaussian_sum = np.zeros_like(t_profile, dtype=float)
                     for t_i, A_i in zip(t_values, A_eff):
-                        gaussian_sum += A_i * np.exp(-0.5 * ((t_profile - t_i) / sigma_parallel) ** 2)
+                        gaussian_sum += A_i * np.exp(
+                            -0.5 * ((t_profile - t_i) / sigma_parallel) ** 2
+                        )
                     if atom_index < 3:
                         plt.figure()
                         plt.plot()
-                        plt.figure(figsize=(10,4))
-                        plt.subplot(1,2,1)
-                        plt.imshow(self.image.array, cmap='gray', origin='upper')
-                        plt.plot(y_coords_slice, x_coords_slice, 'r-', lw=1)
+                        plt.figure(figsize=(10, 4))
+                        plt.subplot(1, 2, 1)
+                        plt.imshow(self.image.array, cmap="gray", origin="upper")
+                        plt.plot(y_coords_slice, x_coords_slice, "r-", lw=1)
                         plt.title("Line through image")
 
-                        plt.subplot(1,2,2)
+                        plt.subplot(1, 2, 2)
                         plt.plot(slice_coordinates, slice_y)
                         plt.plot(slice_coordinates, gaussian_sum)
                         plt.title("Line profile")
@@ -3619,23 +3721,21 @@ class Lattice(AutoSerialize):
         return self
 
     def find_parallel_sites(
-            self,
-            t,
-            profile,
-            x_coords,
-            y_coords,
-            direction,
-            origin = None,
-            max_perpendicular_distance = 10,
-            gaussian_smooth_data = None,
-            return_fit = False,
-            plot_profile = True,
+        self,
+        t,
+        profile,
+        x_coords,
+        y_coords,
+        direction,
+        origin=None,
+        max_perpendicular_distance=10,
+        gaussian_smooth_data=None,
+        return_fit=False,
+        plot_profile=True,
     ):
-
-        atoms_arr = self.atoms.get_data(0)
-        a_intensity = self.atoms[0]['int_peak']
-        bg_intensity = self.atoms[0]['int_bg']
-        sigma_arr = self.atoms[0]['sigma']
+        a_intensity = self.atoms[0]["int_peak"]
+        bg_intensity = self.atoms[0]["int_bg"]
+        sigma_arr = self.atoms[0]["sigma"]
         if origin is None:
             t_near_zero = np.argmin(np.abs(t))
             x_origin = x_coords[t_near_zero]
@@ -3643,8 +3743,13 @@ class Lattice(AutoSerialize):
         else:
             x_origin = origin[0]
             y_origin = origin[1]
-        mask, near_peaks, t_values_s, distances = self.select_peaks_near_line(x_origin, y_origin, direction = direction, max_perpendicular_distance = max_perpendicular_distance)
-        
+        mask, near_peaks, t_values_s, distances = self.select_peaks_near_line(
+            x_origin,
+            y_origin,
+            direction=direction,
+            max_perpendicular_distance=max_perpendicular_distance,
+        )
+
         t_profile = np.asarray(profile)
         t_values = np.asarray(t)
         distances = np.asarray(distances)
@@ -3662,11 +3767,7 @@ class Lattice(AutoSerialize):
             s_index += 1
 
         bg_interp_func = interp1d(
-            t_values_s,
-            B,
-            kind='linear',
-            bounds_error=False, 
-            fill_value=(B[0], B[-1])
+            t_values_s, B, kind="linear", bounds_error=False, fill_value=(B[0], B[-1])
         )
 
         B_interp = bg_interp_func(t_values)
@@ -3675,21 +3776,31 @@ class Lattice(AutoSerialize):
         nx, ny = self.image.array.shape
 
         if plot_profile is True:
-            plt.figure(figsize=(10,4))
-            plt.subplot(1,2,1)
-            plt.imshow(self.image.array, cmap='gray', origin='upper')
-            plt.plot(y_coords, x_coords, 'r-', lw=1)
-            plt.quiver(y_coords[0], x_coords[0], direction[1], direction[0], angles = 'xy', scale_units = 'xy',  scale = 1, color = 'red', zorder = 10)
+            plt.figure(figsize=(10, 4))
+            plt.subplot(1, 2, 1)
+            plt.imshow(self.image.array, cmap="gray", origin="upper")
+            plt.plot(y_coords, x_coords, "r-", lw=1)
+            plt.quiver(
+                y_coords[0],
+                x_coords[0],
+                direction[1],
+                direction[0],
+                angles="xy",
+                scale_units="xy",
+                scale=1,
+                color="red",
+                zorder=10,
+            )
             plt.title("Line through image")
-            plt.xlim([0,nx-1])
-            plt.ylim([ny-1, 0])
+            plt.xlim([0, nx - 1])
+            plt.ylim([ny - 1, 0])
 
-            plt.subplot(1,2,2)
+            plt.subplot(1, 2, 2)
             if gaussian_smooth_data is not None:
                 plt.plot(t_values, gaussian_filter(t_profile, gaussian_smooth_data))
             else:
                 plt.plot(t_values, t_profile)
-            plt.plot(t_values, gaussian_sum, alpha = 0.5)
+            plt.plot(t_values, gaussian_sum, alpha=0.5)
             plt.title("Line profile")
             plt.xlabel("Distance along line (pixels)")
             plt.ylabel("Intensity")
@@ -3703,19 +3814,14 @@ class Lattice(AutoSerialize):
     def unit_vector(
         self,
         v,
-        ):
+    ):
         v = np.array(v, dtype=float)
         norm = np.linalg.norm(v)
         if norm == 0:
             raise ValueError("direction vector cannot be zero")
         return v / norm
 
-    def project_point_to_line_rowmajor(
-        self,
-        point,
-        origin,
-        direction
-        ):
+    def project_point_to_line_rowmajor(self, point, origin, direction):
         p = np.array(point, dtype=float)
         origin = np.array(origin, dtype=float)
         v = self.unit_vector(direction)
@@ -3727,14 +3833,13 @@ class Lattice(AutoSerialize):
         return s, perp_dist, proj
 
     def select_peaks_near_line(
-            self,
-            atom_index,
-            direction,
-            max_perpendicular_distance,
+        self,
+        atom_index,
+        direction,
+        max_perpendicular_distance,
     ):
         atoms_arr = self.atoms.get_data(0)
-        a_xy = atoms_arr[:,0:2]
-        selected_atoms_arr = np.zeros(a_xy.shape[0])
+        a_xy = atoms_arr[:, 0:2]
         v = self.unit_vector(direction)
         center_atom_to_rest = a_xy - a_xy[atom_index]
 
@@ -3753,16 +3858,15 @@ class Lattice(AutoSerialize):
 
         return mask, near_peaks, t_values, distances
 
-    def select_peaks_near_line(
-            self,
-            x_c,
-            y_c,
-            direction,
-            max_perpendicular_distance,
+    def select_peaks_near_line_center(
+        self,
+        x_c,
+        y_c,
+        direction,
+        max_perpendicular_distance,
     ):
         atoms_arr = self.atoms.get_data(0)
-        a_xy = atoms_arr[:,0:2]
-        selected_atoms_arr = np.zeros(a_xy.shape[0])
+        a_xy = atoms_arr[:, 0:2]
         v = self.unit_vector(direction)
         # v = self.unit_vector(direction)
 
@@ -3786,64 +3890,55 @@ class Lattice(AutoSerialize):
 
         return mask, near_peaks, t_values, distances
 
-
-
-    def gaussian(
-        self,
-        s,
-        amp,
-        mu,
-        sigma
-        ):
-        return amp * np.exp(-0.5 * ((s - mu) / sigma)**2)
-
+    def gaussian(self, s, amp, mu, sigma):
+        return amp * np.exp(-0.5 * ((s - mu) / sigma) ** 2)
 
     def get_xy_shifts(
-            self,
-            a0,
+        self,
+        a0,
     ):
         position_fraction = self._positions_frac[a0]
 
         if (position_fraction == np.zeros([2])).all():
-            p1 = np.array([1,0]) @ self.uv_arr[:2]
-            p2 = np.array([-1,0]) @ self.uv_arr[:2]
-            p3 = np.array([0,1]) @ self.uv_arr[:2]
-            p4 = np.array([0,-1]) @ self.uv_arr[:2]
+            p1 = np.array([1, 0]) @ self.uv_arr[:2]
+            p2 = np.array([-1, 0]) @ self.uv_arr[:2]
+            p3 = np.array([0, 1]) @ self.uv_arr[:2]
+            p4 = np.array([0, -1]) @ self.uv_arr[:2]
         else:
-            p1 = (np.array([0,0]) + position_fraction) @ self.uv_arr[:2]
-            p2 = (np.array([-1,0]) + position_fraction) @ self.uv_arr[:2]
-            p3 = (np.array([0,-1]) + position_fraction) @ self.uv_arr[:2]
-            p4 = (np.array([-1,-1]) + position_fraction) @ self.uv_arr[:2]
+            p1 = (np.array([0, 0]) + position_fraction) @ self.uv_arr[:2]
+            p2 = (np.array([-1, 0]) + position_fraction) @ self.uv_arr[:2]
+            p3 = (np.array([0, -1]) + position_fraction) @ self.uv_arr[:2]
+            p4 = (np.array([-1, -1]) + position_fraction) @ self.uv_arr[:2]
 
         return np.array([p1, p2, p3, p4])
 
     def get_a_positions_near_b_site(
-            self,
+        self,
     ):
         b_frac = self._positions_frac[1]
-        p1 = (np.array([0,0]) - b_frac) @ self.uv_arr[:2]
-        p2 = (np.array([1,0]) - b_frac) @ self.uv_arr[:2]
-        p3 = (np.array([0,1]) - b_frac) @ self.uv_arr[:2]
-        p4 = (np.array([1,1]) - b_frac) @ self.uv_arr[:2]
-        return np.array([p1,p2,p3,p4])        
+        p1 = (np.array([0, 0]) - b_frac) @ self.uv_arr[:2]
+        p2 = (np.array([1, 0]) - b_frac) @ self.uv_arr[:2]
+        p3 = (np.array([0, 1]) - b_frac) @ self.uv_arr[:2]
+        p4 = (np.array([1, 1]) - b_frac) @ self.uv_arr[:2]
+        return np.array([p1, p2, p3, p4])
 
     def organize_b_neighbors(
         self,
-        site_search_radius = 2,
-        num_bins = 128,
-        tolerance_uv = None,
-        num_sites_use = 1,
+        site_search_radius=2,
+        num_bins=128,
+        tolerance_uv=None,
+        num_sites_use=1,
         # centers = None,
     ):
-        a_x_b = self.atoms.get_data(1)[:,0]
-        a_y_b = self.atoms.get_data(1)[:,1]
-        
-        a_x_a = self.atoms.get_data(0)[:,0]
-        a_y_a = self.atoms.get_data(0)[:,1]
+        a_x_b = self.atoms.get_data(1)[:, 0]
+        a_y_b = self.atoms.get_data(1)[:, 1]
+
+        a_x_a = self.atoms.get_data(0)[:, 0]
+        a_y_a = self.atoms.get_data(0)[:, 1]
         b_neighbor_arr = np.empty((2, 4, a_x_b.shape[0]), dtype=object)
-        pm_arr = np.array([-1,1])
+        pm_arr = np.array([-1, 1])
         a_positions_around_site = self.get_a_positions_near_b_site()
-        pm_arr = np.array([-1,1])
+        pm_arr = np.array([-1, 1])
         uvw_arr = self.uv_arr
         uvw_norm = self.uv_norm
         tolerance_uv = self.tolerance_uv
@@ -3853,21 +3948,23 @@ class Lattice(AutoSerialize):
                 for uvw_index, lat_vec in enumerate(uvw_arr):
                     position_x = pm * lat_vec[0] + a_x_b[atom_index]
                     position_y = pm * lat_vec[1] + a_y_b[atom_index]
-                    radial_dist = ((a_x_b - position_x)**2 + (a_y_b - position_y)**2)**(0.5)
-                    radial_dist[atom_index] = uvw_norm * (tolerance_uv - 1) * 2 # make sure that self is outside of range
+                    radial_dist = ((a_x_b - position_x) ** 2 + (a_y_b - position_y) ** 2) ** (0.5)
+                    radial_dist[atom_index] = (
+                        uvw_norm * (tolerance_uv - 1) * 2
+                    )  # make sure that self is outside of range
                     if (radial_dist < (uvw_norm * (tolerance_uv - 1))).any():
                         successful_candidate_index = np.argmin(radial_dist)
-                        if (pm == 1 and uvw_index == 0):
-                            b_neighbor_arr[1, 0,atom_index] = int(successful_candidate_index)
+                        if pm == 1 and uvw_index == 0:
+                            b_neighbor_arr[1, 0, atom_index] = int(successful_candidate_index)
 
-                        if (pm == -1 and uvw_index == 0):
-                            b_neighbor_arr[1, 1,atom_index] = int(successful_candidate_index) 
+                        if pm == -1 and uvw_index == 0:
+                            b_neighbor_arr[1, 1, atom_index] = int(successful_candidate_index)
 
-                        if (pm == 1 and uvw_index == 1):
-                            b_neighbor_arr[1, 2,atom_index] = int(successful_candidate_index) 
+                        if pm == 1 and uvw_index == 1:
+                            b_neighbor_arr[1, 2, atom_index] = int(successful_candidate_index)
 
-                        if (pm == -1 and uvw_index == 1):
-                            b_neighbor_arr[1, 3,atom_index] = int(successful_candidate_index) 
+                        if pm == -1 and uvw_index == 1:
+                            b_neighbor_arr[1, 3, atom_index] = int(successful_candidate_index)
                         # leaving out the w vector for right now...
 
             # A sites near the B sites
@@ -3875,32 +3972,30 @@ class Lattice(AutoSerialize):
             for pos_index, pos_vec in enumerate(a_positions_around_site):
                 position_x = pos_vec[0] + a_x_b[atom_index]
                 position_y = pos_vec[1] + a_y_b[atom_index]
-                radial_dist = ((a_x_a - position_x)**2 + (a_y_a - position_y)**2)**(0.5)
+                radial_dist = ((a_x_a - position_x) ** 2 + (a_y_a - position_y) ** 2) ** (0.5)
                 # this line is not necessary because the coordinate of the b site is not in the a site coordinate list
                 # radial_dist[atom_index] = self.uv_norm * (tolerance_uv - 1) * 2 # make sure that self is outside of range
                 if (radial_dist < (self.uv_norm * (tolerance_uv - 1))).any():
                     successful_candidate_index = np.argmin(radial_dist)
-                    if (pos_index == 0):
-                        b_neighbor_arr[0, 0,atom_index] = int(successful_candidate_index)
+                    if pos_index == 0:
+                        b_neighbor_arr[0, 0, atom_index] = int(successful_candidate_index)
 
-                    if (pos_index == 1):
-                        b_neighbor_arr[0, 1,atom_index] = int(successful_candidate_index) 
+                    if pos_index == 1:
+                        b_neighbor_arr[0, 1, atom_index] = int(successful_candidate_index)
 
-                    if (pos_index == 2):
-                        b_neighbor_arr[0, 2,atom_index] = int(successful_candidate_index) 
+                    if pos_index == 2:
+                        b_neighbor_arr[0, 2, atom_index] = int(successful_candidate_index)
 
-                    if (pos_index == 3):
-                        b_neighbor_arr[0, 3,atom_index] = int(successful_candidate_index)
+                    if pos_index == 3:
+                        b_neighbor_arr[0, 3, atom_index] = int(successful_candidate_index)
 
-                    if (pos_index == 4):
-                        b_neighbor_arr[0, 4,atom_index] = int(successful_candidate_index) 
+                    if pos_index == 4:
+                        b_neighbor_arr[0, 4, atom_index] = int(successful_candidate_index)
 
-                    if (pos_index == 5):
-                        b_neighbor_arr[0, 5,atom_index] = int(successful_candidate_index)
+                    if pos_index == 5:
+                        b_neighbor_arr[0, 5, atom_index] = int(successful_candidate_index)
 
         self.b_neighbor_arr = b_neighbor_arr
-
-
 
         # if centers is None:
         #     centers = np.arange(0,2)
@@ -3928,9 +4023,7 @@ class Lattice(AutoSerialize):
         #     plt.scatter(a_y_b[np.array(valid_neighbors_1, int)], a_x_b[np.array(valid_neighbors_1, int)], color='red', alpha=0.5)
         #     plt.scatter(a_y_a[np.array(valid_neighbors_0, int)], a_x_a[np.array(valid_neighbors_0, int)], color='green')
 
-
         return self
-
 
     # def organize_nearest_neighbors_2(
     #     self,
@@ -3964,7 +4057,7 @@ class Lattice(AutoSerialize):
     #         else:
     #             w_ = np.asarray(positive_vector)-np.asarray(negative_vector)
     #             w_sign = -1
-            
+
     #         p_v_c = positive_vector @ uv_arr[:2]
     #         n_v_c = negative_vector @ uv_arr[:2]
     #         w_v_c = w_ @ uv_arr[:2]
@@ -3992,25 +4085,24 @@ class Lattice(AutoSerialize):
     #                                 atom_neighbor_arr[a0_iter, a1_iter, 0,atom_index] = int(successful_candidate_index)
 
     #                             if (pm == -1 and uvw_index == 0):
-    #                                 atom_neighbor_arr[a0_iter, a1_iter, 1,atom_index] = int(successful_candidate_index) 
+    #                                 atom_neighbor_arr[a0_iter, a1_iter, 1,atom_index] = int(successful_candidate_index)
 
     #                             if (pm == 1 and uvw_index == 1):
-    #                                 atom_neighbor_arr[a0_iter, a1_iter, 2,atom_index] = int(successful_candidate_index) 
+    #                                 atom_neighbor_arr[a0_iter, a1_iter, 2,atom_index] = int(successful_candidate_index)
 
     #                             if (pm == -1 and uvw_index == 1):
-    #                                 atom_neighbor_arr[a0_iter, a1_iter, 3,atom_index] = int(successful_candidate_index) 
+    #                                 atom_neighbor_arr[a0_iter, a1_iter, 3,atom_index] = int(successful_candidate_index)
 
     #                             if (pm == 1 and uvw_index == 2):
-    #                                 atom_neighbor_arr[a0_iter, a1_iter, 4,atom_index] = int(successful_candidate_index) 
+    #                                 atom_neighbor_arr[a0_iter, a1_iter, 4,atom_index] = int(successful_candidate_index)
 
     #                             if (pm == -1 and uvw_index == 2):
-    #                                 atom_neighbor_arr[a0_iter, a1_iter, 5,atom_index] = int(successful_candidate_index) 
+    #                                 atom_neighbor_arr[a0_iter, a1_iter, 5,atom_index] = int(successful_candidate_index)
     #             a1_iter += 1
     #         a0_iter += 1
     #     self.atom_neighbor_arr = atom_neighbor_arr
     #     self.which_centers = which_centers
     #     self.which_neighbors = which_neighbors
-
 
     #     plt.figure()
     #     index_show = 10
@@ -4024,18 +4116,18 @@ class Lattice(AutoSerialize):
 
     def organize_nearest_neighbors(
         self,
-        site_search_radius = 2,
-        num_bins = 128,
-        tolerance_uv = None,
-        num_sites_use = 1,
+        site_search_radius=2,
+        num_bins=128,
+        tolerance_uv=None,
+        num_sites_use=1,
     ):
         if tolerance_uv is None:
             tolerance_uv = self.tolerance_uv
         for a0 in range(num_sites_use):
             atoms_arr = self.atoms.get_data(a0)
-            a_x = atoms_arr[:,0]
-            a_y = atoms_arr[:,1]
-            pm_arr = np.array([1,-1])
+            a_x = atoms_arr[:, 0]
+            a_y = atoms_arr[:, 1]
+            pm_arr = np.array([1, -1])
 
             atom_neighbor_arr = np.empty((6, a_x.shape[0]), dtype=object)
             has_six_neighbors_arr = np.zeros(a_x.shape[0])
@@ -4044,34 +4136,36 @@ class Lattice(AutoSerialize):
                     for uvw_index, lat_vec in enumerate(self.uv_arr):
                         position_x = pm * lat_vec[0] + a_x[atom_index]
                         position_y = pm * lat_vec[1] + a_y[atom_index]
-                        radial_dist = ((a_x - position_x)**2 + (a_y - position_y)**2)**(0.5)
-                        radial_dist[atom_index] = self.uv_norm * (tolerance_uv - 1) * 2 # make sure that self is outside of range
+                        radial_dist = ((a_x - position_x) ** 2 + (a_y - position_y) ** 2) ** (0.5)
+                        radial_dist[atom_index] = (
+                            self.uv_norm * (tolerance_uv - 1) * 2
+                        )  # make sure that self is outside of range
                         if (radial_dist < (self.uv_norm * (tolerance_uv - 1))).any():
                             successful_candidate_index = np.argmin(radial_dist)
-                            if (pm == 1 and uvw_index == 0):
-                                atom_neighbor_arr[0,atom_index] = int(successful_candidate_index)
+                            if pm == 1 and uvw_index == 0:
+                                atom_neighbor_arr[0, atom_index] = int(successful_candidate_index)
                                 has_six_neighbors_arr[atom_index] += 1
 
-                            if (pm == -1 and uvw_index == 0):
-                                atom_neighbor_arr[1,atom_index] = int(successful_candidate_index) 
+                            if pm == -1 and uvw_index == 0:
+                                atom_neighbor_arr[1, atom_index] = int(successful_candidate_index)
                                 has_six_neighbors_arr[atom_index] += 1
 
-                            if (pm == 1 and uvw_index == 1):
-                                atom_neighbor_arr[2,atom_index] = int(successful_candidate_index) 
+                            if pm == 1 and uvw_index == 1:
+                                atom_neighbor_arr[2, atom_index] = int(successful_candidate_index)
                                 has_six_neighbors_arr[atom_index] += 1
 
-                            if (pm == -1 and uvw_index == 1):
-                                atom_neighbor_arr[3,atom_index] = int(successful_candidate_index) 
+                            if pm == -1 and uvw_index == 1:
+                                atom_neighbor_arr[3, atom_index] = int(successful_candidate_index)
                                 has_six_neighbors_arr[atom_index] += 1
 
-                            if (pm == 1 and uvw_index == 2):
-                                atom_neighbor_arr[4,atom_index] = int(successful_candidate_index) 
+                            if pm == 1 and uvw_index == 2:
+                                atom_neighbor_arr[4, atom_index] = int(successful_candidate_index)
                                 has_six_neighbors_arr[atom_index] += 1
 
-                            if (pm == -1 and uvw_index == 2):
-                                atom_neighbor_arr[5,atom_index] = int(successful_candidate_index) 
+                            if pm == -1 and uvw_index == 2:
+                                atom_neighbor_arr[5, atom_index] = int(successful_candidate_index)
                                 has_six_neighbors_arr[atom_index] += 1
-                
+
             self.has_six_neighbors_arr = has_six_neighbors_arr == 6
             self.atom_neighbor_arr = atom_neighbor_arr
         return self
@@ -4080,7 +4174,9 @@ class Lattice(AutoSerialize):
         self,
         atom_index,
     ):
-        neighbor_arr = np.asarray([i for i in self.atom_neighbor_arr[:, atom_index] if i is not None], dtype = int)
+        neighbor_arr = np.asarray(
+            [i for i in self.atom_neighbor_arr[:, atom_index] if i is not None], dtype=int
+        )
         neighbors_pass = [i for i in neighbor_arr if not self.added_to_neighbor_list_already[i]]
 
         self.added_to_neighbor_list_already[neighbors_pass] = 1
@@ -4091,31 +4187,39 @@ class Lattice(AutoSerialize):
         self,
         atom_indexes,
     ):
-        atom_indexes_less_none =  [i for i in atom_indexes if i is not None]
+        atom_indexes_less_none = [i for i in atom_indexes if i is not None]
         arr_present = False
         arr = None
         for atom_index in atom_indexes_less_none:
             if arr_present:
-                arr = np.concatenate((arr, np.asarray(self.get_next_neighborhood_layer(atom_index))))
+                arr = np.concatenate(
+                    (arr, np.asarray(self.get_next_neighborhood_layer(atom_index)))
+                )
             else:
                 arr = np.asarray(self.get_next_neighborhood_layer(atom_index))
                 arr_present = True
         if arr is None:
             return None
         else:
-            return np.asarray(arr, dtype = int)
+            return np.asarray(arr, dtype=int)
 
     def get_next_neighborhood_layer_b(
         self,
         atom_index,
         a_or_b,
     ):
-        neighbor_arr = np.asarray([i for i in self.b_neighbor_arr[a_or_b,:, atom_index] if i is not None], dtype = int)
+        neighbor_arr = np.asarray(
+            [i for i in self.b_neighbor_arr[a_or_b, :, atom_index] if i is not None], dtype=int
+        )
         if a_or_b == 0:
-            neighbors_pass = [i for i in neighbor_arr if not self.added_to_neighbor_list_already[i]]
+            neighbors_pass = [
+                i for i in neighbor_arr if not self.added_to_neighbor_list_already[i]
+            ]
             self.added_to_neighbor_list_already[neighbors_pass] = 1
         if a_or_b == 1:
-            neighbors_pass = [i for i in neighbor_arr if not self.added_to_neighbor_list_already_b[i]]
+            neighbors_pass = [
+                i for i in neighbor_arr if not self.added_to_neighbor_list_already_b[i]
+            ]
             self.added_to_neighbor_list_already_b[neighbors_pass] = 1
 
         return neighbors_pass
@@ -4125,33 +4229,33 @@ class Lattice(AutoSerialize):
         atom_indexes,
         a_or_b,
     ):
-        atom_indexes_less_none =  [i for i in atom_indexes if i is not None]
+        atom_indexes_less_none = [i for i in atom_indexes if i is not None]
         arr_present = False
         arr = None
         for atom_index in atom_indexes_less_none:
             if arr_present:
-                arr = np.concatenate((arr, np.asarray(self.get_next_neighborhood_layer_b(atom_index, a_or_b))))
+                arr = np.concatenate(
+                    (arr, np.asarray(self.get_next_neighborhood_layer_b(atom_index, a_or_b)))
+                )
             else:
                 arr = np.asarray(self.get_next_neighborhood_layer_b(atom_index, a_or_b))
                 arr_present = True
-        
 
         # if a_or_b  == 0:
         #     arr = arr[1:] # get rid of the b index
         if arr is None:
             return None
         else:
-            return np.asarray(arr, dtype = int)
+            return np.asarray(arr, dtype=int)
 
     def neighborhood_unfinished(
         self,
-        neighborhood_units = 2,
+        neighborhood_units=2,
     ):
-        
         self.neighborhood_units = neighborhood_units
         for a0 in range(self._num_sites):
             atoms_arr = self.atoms.get_data(a0)
-            a_x = atoms_arr[:,0]
+            a_x = atoms_arr[:, 0]
             atom_neighbor_list = []
             self.added_to_neighbor_list_already = np.zeros(a_x.shape[0])
             self.num_neighbors = np.zeros(a_x.shape[0])
@@ -4160,25 +4264,28 @@ class Lattice(AutoSerialize):
                 self.added_to_neighbor_list_already[atom_index] = 1
                 neighbors_search_out = np.array([atom_index])
                 for neighbor_iteration in range(neighborhood_units):
-                    neighbors_search_out = self.get_next_neighborhood_layer_arr(neighbors_search_out)
+                    neighbors_search_out = self.get_next_neighborhood_layer_arr(
+                        neighbors_search_out
+                    )
                     neighbors_search = np.concatenate((neighbors_search, neighbors_search_out))
                     if neighbors_search_out.size == 0:
                         break
                 atom_neighbor_list.append(neighbors_search)
-                self.num_neighbors[atom_index] = np.sum(self.added_to_neighbor_list_already) - 1 # minus one because the central atom is not neighbor
+                self.num_neighbors[atom_index] = (
+                    np.sum(self.added_to_neighbor_list_already) - 1
+                )  # minus one because the central atom is not neighbor
                 self.added_to_neighbor_list_already = np.zeros(a_x.shape[0])
         self.atom_neighbor_layer_arr = atom_neighbor_list
         return self
-    
+
     def neighborhood_a(
         self,
-        neighborhood_units = 2,
+        neighborhood_units=2,
     ):
-        
         self.neighborhood_units = neighborhood_units
         for a0 in range(1):
             atoms_arr = self.atoms.get_data(a0)
-            a_x = atoms_arr[:,0]
+            a_x = atoms_arr[:, 0]
             atom_neighbor_list = []
             self.added_to_neighbor_list_already = np.zeros(a_x.shape[0])
             self.num_neighbors = np.zeros(a_x.shape[0])
@@ -4187,25 +4294,28 @@ class Lattice(AutoSerialize):
                 self.added_to_neighbor_list_already[atom_index] = 1
                 neighbors_search_out = np.array([atom_index])
                 for neighbor_iteration in range(neighborhood_units):
-                    neighbors_search_out = self.get_next_neighborhood_layer_arr(neighbors_search_out)
+                    neighbors_search_out = self.get_next_neighborhood_layer_arr(
+                        neighbors_search_out
+                    )
                     neighbors_search = np.concatenate((neighbors_search, neighbors_search_out))
                     if neighbors_search_out.size == 0:
                         break
                 atom_neighbor_list.append(neighbors_search)
-                self.num_neighbors[atom_index] = np.sum(self.added_to_neighbor_list_already) - 1 # minus one because the central atom is not neighbor
+                self.num_neighbors[atom_index] = (
+                    np.sum(self.added_to_neighbor_list_already) - 1
+                )  # minus one because the central atom is not neighbor
                 self.added_to_neighbor_list_already = np.zeros(a_x.shape[0])
         self.atom_neighbor_layer_arr = atom_neighbor_list
         return self
 
     # neighborhood b collects all of the b and a neighbors in the vicinity of central b atoms
     def neighborhood_b(
-            self,
-            neighborhood_units = 2,
-        ):
-
+        self,
+        neighborhood_units=2,
+    ):
         self.neighborhood_units = neighborhood_units
-        a_x_b = self.atoms.get_data(1)[:,0]
-        a_x_a = self.atoms.get_data(0)[:,0]
+        a_x_b = self.atoms.get_data(1)[:, 0]
+        a_x_a = self.atoms.get_data(0)[:, 0]
         atom_neighbor_list_b = []
         atom_neighbor_list_a = []
         self.added_to_neighbor_list_already_b = np.zeros(a_x_b.shape[0])
@@ -4219,11 +4329,17 @@ class Lattice(AutoSerialize):
             neighbors_search_out_a = np.array([atom_b_index])
             for neighbor_iteration in range(neighborhood_units):
                 if neighbor_iteration == 0:
-                    neighbors_search_out_a = self.get_next_neighborhood_layer_arr_b(neighbors_search_out_a, 0)
+                    neighbors_search_out_a = self.get_next_neighborhood_layer_arr_b(
+                        neighbors_search_out_a, 0
+                    )
                 else:
-                    neighbors_search_out_a = self.get_next_neighborhood_layer_arr(neighbors_search_out_a)
+                    neighbors_search_out_a = self.get_next_neighborhood_layer_arr(
+                        neighbors_search_out_a
+                    )
 
-                neighbors_search_out_b = self.get_next_neighborhood_layer_arr_b(neighbors_search_out_b, 1)
+                neighbors_search_out_b = self.get_next_neighborhood_layer_arr_b(
+                    neighbors_search_out_b, 1
+                )
                 neighbors_search_a = np.concatenate((neighbors_search_a, neighbors_search_out_a))
                 if neighbor_iteration == 0:
                     neighbors_search_a = neighbors_search_a[1:]
@@ -4237,30 +4353,33 @@ class Lattice(AutoSerialize):
                     break
             atom_neighbor_list_a.append(neighbors_search_a)
             atom_neighbor_list_b.append(neighbors_search_b)
-            self.num_neighbors[atom_b_index] = np.sum(self.added_to_neighbor_list_already_b) + np.sum(self.added_to_neighbor_list_already) - 2 # minus one because the central atom is not neighbor, and counted twice
+            self.num_neighbors[atom_b_index] = (
+                np.sum(self.added_to_neighbor_list_already_b)
+                + np.sum(self.added_to_neighbor_list_already)
+                - 2
+            )  # minus one because the central atom is not neighbor, and counted twice
             self.added_to_neighbor_list_already_b = np.zeros(a_x_b.shape[0])
             self.added_to_neighbor_list_already = np.zeros(a_x_a.shape[0])
         self.atom_neighbor_layer_arr_a = atom_neighbor_list_a
         self.atom_neighbor_layer_arr_b = atom_neighbor_list_b
         return self
 
-
     # for this, the number of A site neighbors will be good probably
     def find_neighbors_in_tolerance(
-            self,
-            tolerance = None,
+        self,
+        tolerance=None,
     ):
-        if not hasattr(self, 'uv_norm'):
-            self.uv_norm = np.mean(np.linalg.norm(self._lat[1:], axis = 1))
+        if not hasattr(self, "uv_norm"):
+            self.uv_norm = np.mean(np.linalg.norm(self._lat[1:], axis=1))
         if tolerance is None:
             tolerance = self.uv_norm * 1.1
         num_sites = len(self._positions_frac)
-        a_x = self.atoms.get_data(0)[:,0]
-        a_y = self.atoms.get_data(0)[:,1]
-        count_a_neighbors = np.zeros([num_sites, 2*a_x.shape[0]])
+        a_x = self.atoms.get_data(0)[:, 0]
+        a_y = self.atoms.get_data(0)[:, 1]
+        count_a_neighbors = np.zeros([num_sites, 2 * a_x.shape[0]])
         for site_index in range(num_sites):
-            a_x_n = self.atoms.get_data(site_index)[:,0]
-            a_y_n = self.atoms.get_data(site_index)[:,1]
+            a_x_n = self.atoms.get_data(site_index)[:, 0]
+            a_y_n = self.atoms.get_data(site_index)[:, 1]
             for atom_index in range(a_x_n.shape[0]):
                 a_x_i = a_x_n[atom_index]
                 a_y_i = a_y_n[atom_index]
@@ -4268,16 +4387,17 @@ class Lattice(AutoSerialize):
                 a_y_ai = a_y - a_y_i
                 radial_dist = np.sqrt(a_x_ai**2 + a_y_ai**2)
                 if site_index == 0:
-                    radial_dist[atom_index] = tolerance * 2 # make sure that self is outside of range
+                    radial_dist[atom_index] = (
+                        tolerance * 2
+                    )  # make sure that self is outside of range
                 count_a_neighbors[site_index, atom_index] = np.sum(radial_dist < tolerance)
         self.count_a_neighbors = count_a_neighbors
         return self
 
-
     def remove_atoms_with_too_few_neighbors(
-            self,
-            min_neighbors = None,
-            return_removed = False,
+        self,
+        min_neighbors=None,
+        return_removed=False,
     ):
         if min_neighbors is None:
             min_neighbors = 2
@@ -4286,7 +4406,7 @@ class Lattice(AutoSerialize):
         removed = []
         for site_index in range(num_sites):
             site_data = self.atoms.get_data(site_index)
-            keep_mask = self.count_a_neighbors[site_index, :site_data.shape[0]] >= min_neighbors
+            keep_mask = self.count_a_neighbors[site_index, : site_data.shape[0]] >= min_neighbors
             updated = site_data[keep_mask]
             removed.append(site_data[~keep_mask])
             self.atoms.set_data(updated, site_index)
@@ -4295,8 +4415,8 @@ class Lattice(AutoSerialize):
         return self
 
     def find_atoms_with_too_few_neighbors(
-            self,
-            min_neighbors = None,
+        self,
+        min_neighbors=None,
     ):
         if min_neighbors is None:
             min_neighbors = 2
@@ -4305,49 +4425,54 @@ class Lattice(AutoSerialize):
         found = []
         for site_index in range(num_sites):
             site_data = self.atoms.get_data(site_index)
-            keep_mask = self.count_a_neighbors[site_index, :site_data.shape[0]] >= min_neighbors
+            keep_mask = self.count_a_neighbors[site_index, : site_data.shape[0]] >= min_neighbors
             found.append(~keep_mask)
         return found
-        
-
 
     def plot_neighbors(
         self,
-        centers = None,
+        centers=None,
     ):
         if centers is None:
-            centers = np.arange(0,2)
+            centers = np.arange(0, 2)
         if isinstance(centers, int):
-            centers = np.arange(0,centers)
+            centers = np.arange(0, centers)
         plt.figure()
-        plt.imshow(self.image.array, cmap = 'gray')
-        a_x_b = self.atoms.get_data(1)[:,0]
-        a_y_b = self.atoms.get_data(1)[:,1]
-        a_x_a = self.atoms.get_data(0)[:,0]
-        a_y_a = self.atoms.get_data(0)[:,1]
+        plt.imshow(self.image.array, cmap="gray")
+        a_x_b = self.atoms.get_data(1)[:, 0]
+        a_y_b = self.atoms.get_data(1)[:, 1]
+        a_x_a = self.atoms.get_data(0)[:, 0]
+        a_y_a = self.atoms.get_data(0)[:, 1]
 
         for atom_b_index in centers:
-            plt.scatter(a_y_b[atom_b_index], a_x_b[atom_b_index], color = 'blue', zorder = 10)
-            plt.scatter(a_y_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)], a_x_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)], color = 'red',  alpha = 0.5)
-            plt.scatter(a_y_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)], a_x_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)], color = 'green')
-
-
-
+            plt.scatter(a_y_b[atom_b_index], a_x_b[atom_b_index], color="blue", zorder=10)
+            plt.scatter(
+                a_y_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)],
+                a_x_b[self.atom_neighbor_layer_arr_b[atom_b_index].astype(int)],
+                color="red",
+                alpha=0.5,
+            )
+            plt.scatter(
+                a_y_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)],
+                a_x_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)],
+                color="green",
+            )
 
     def intensity_neighborhood(
         self,
-        neighborhood_units = 2,
-        return_delta = False,
+        neighborhood_units=2,
+        return_delta=False,
     ):
         self.neighborhood_units = neighborhood_units
-        self.neighborhood_a(neighborhood_units = neighborhood_units)
+        self.neighborhood_a(neighborhood_units=neighborhood_units)
         for a0 in range(self._num_sites):
             a_x = self.atoms[0]["x"]
-            a_y = self.atoms[0]["y"]
             a_intensity = self.atoms[0]["int_peak"]
             delta_intensity = np.zeros([a_x.shape[0]])
             for atom_index in range(len(self.atom_neighbor_layer_arr)):
-                neighbor_intensities = a_intensity[self.atom_neighbor_layer_arr[atom_index][1:]] # 1: excludes the first one, which is itself
+                neighbor_intensities = a_intensity[
+                    self.atom_neighbor_layer_arr[atom_index][1:]
+                ]  # 1: excludes the first one, which is itself
                 median_intensity = np.median(neighbor_intensities)
                 delta_intensity[atom_index] = a_intensity[atom_index] - median_intensity
         self.delta_intensities = delta_intensity
@@ -4356,18 +4481,16 @@ class Lattice(AutoSerialize):
         else:
             return self
 
-
     def neighborhood_b_circular_distance(
-            self,
-            circular_radius_cutoff = None,
+        self,
+        circular_radius_cutoff=None,
     ):
+        a_x_b = self.atoms.get_data(1)[:, 0]
+        a_y_b = self.atoms.get_data(1)[:, 1]
+        a_x_a = self.atoms.get_data(0)[:, 0]
+        a_y_a = self.atoms.get_data(0)[:, 1]
 
-        a_x_b = self.atoms.get_data(1)[:,0]
-        a_y_b = self.atoms.get_data(1)[:,1]
-        a_x_a = self.atoms.get_data(0)[:,0]
-        a_y_a = self.atoms.get_data(0)[:,1]
-
-        if circular_radius_cutoff == None:
+        if circular_radius_cutoff is None:
             lattice_spacing = self.uv_norm * np.linalg.norm(self._positions_frac[1]) * 0.9
             circular_radius_cutoff = lattice_spacing * self.neighborhood_units
 
@@ -4378,33 +4501,36 @@ class Lattice(AutoSerialize):
             a_neighbor_y = a_y_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
             b_x = a_x_b[atom_b_index]
             b_y = a_y_b[atom_b_index]
-            radial_dist_b = np.sqrt((b_neighbor_x - b_x)**2 +(b_neighbor_y - b_y)**2)
-            radial_dist_a = np.sqrt((a_neighbor_x - b_x)**2 +(a_neighbor_y - b_y)**2)
+            radial_dist_b = np.sqrt((b_neighbor_x - b_x) ** 2 + (b_neighbor_y - b_y) ** 2)
+            radial_dist_a = np.sqrt((a_neighbor_x - b_x) ** 2 + (a_neighbor_y - b_y) ** 2)
             mask = radial_dist_b < circular_radius_cutoff
-            self.atom_neighbor_layer_arr_b[atom_b_index] = self.atom_neighbor_layer_arr_b[atom_b_index][mask]
+            self.atom_neighbor_layer_arr_b[atom_b_index] = self.atom_neighbor_layer_arr_b[
+                atom_b_index
+            ][mask]
             mask = radial_dist_a < circular_radius_cutoff
-            self.atom_neighbor_layer_arr_a[atom_b_index] = self.atom_neighbor_layer_arr_a[atom_b_index][mask]
+            self.atom_neighbor_layer_arr_a[atom_b_index] = self.atom_neighbor_layer_arr_a[
+                atom_b_index
+            ][mask]
 
         return self
 
-
-
-
     def gauss_2D_rot(
-            self,
-            x,
-            y,
-            xc,
-            yc,
-            xs,
-            ys,
-            A,
-            B,
-            theta,
+        self,
+        x,
+        y,
+        xc,
+        yc,
+        xs,
+        ys,
+        A,
+        B,
+        theta,
     ):
-        a = np.cos(theta)**2/(2*xs**2) + np.sin(theta)**2/(2*ys**2)
-        b = -np.cos(theta)*np.sin(theta)/(2*xs**2) + np.cos(theta)*np.sin(theta)/(2*ys**2)
-        c = np.sin(theta)**2/(2*xs**2) + np.cos(theta)**2/(2*ys**2)
+        a = np.cos(theta) ** 2 / (2 * xs**2) + np.sin(theta) ** 2 / (2 * ys**2)
+        b = -np.cos(theta) * np.sin(theta) / (2 * xs**2) + np.cos(theta) * np.sin(theta) / (
+            2 * ys**2
+        )
+        c = np.sin(theta) ** 2 / (2 * xs**2) + np.cos(theta) ** 2 / (2 * ys**2)
 
         # arr_pd = np.array([[a, b], [b, c]])
         # check that arr_pd is positive definite
@@ -4413,9 +4539,10 @@ class Lattice(AutoSerialize):
         assert xs > 0
         assert ys > 0
 
-        gaussian_2d = A * np.exp(-(a*(x-xc)**2 + 2*b*(x-xc)*(y-yc) + c*(y-yc)**2)) + B
+        gaussian_2d = (
+            A * np.exp(-(a * (x - xc) ** 2 + 2 * b * (x - xc) * (y - yc) + c * (y - yc) ** 2)) + B
+        )
         return gaussian_2d
-
 
     def local_fitting_subtraction(
         self,
@@ -4424,7 +4551,6 @@ class Lattice(AutoSerialize):
         max_move_px: float | None = None,
         plot_atoms: bool = False,
     ):
-
         im = np.asarray(self._image.array, dtype=float)
         H, W = self._image.shape
         r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
@@ -4462,15 +4588,15 @@ class Lattice(AutoSerialize):
         idx_sigma = self.atoms.fields.index("sigma")
         idx_bg = self.atoms.fields.index("int_bg")
 
-        a_x_b = self.atoms.get_data(1)[:,0]
-        a_y_b = self.atoms.get_data(1)[:,1]
-        a_s_b = self.atoms[1]['sigma']
-        a_ip_b = self.atoms[1]['int_peak']
+        a_x_b = self.atoms.get_data(1)[:, 0]
+        a_y_b = self.atoms.get_data(1)[:, 1]
+        a_s_b = self.atoms[1]["sigma"]
+        a_ip_b = self.atoms[1]["int_peak"]
 
-        a_x_a = self.atoms.get_data(0)[:,0]
-        a_y_a = self.atoms.get_data(0)[:,1]
-        a_s_a = self.atoms[0]['sigma']
-        a_ip_a = self.atoms[0]['int_peak']
+        a_x_a = self.atoms.get_data(0)[:, 0]
+        a_y_a = self.atoms.get_data(0)[:, 1]
+        a_s_a = self.atoms[0]["sigma"]
+        a_ip_a = self.atoms[0]["int_peak"]
 
         H, W = self._image.shape
         window_pix = 10
@@ -4489,10 +4615,18 @@ class Lattice(AutoSerialize):
             a_neighbor_s = a_s_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
             a_neighbor_ip = a_ip_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
 
-            window_fit_x_max = np.ceil(np.max(np.concatenate([a_neighbor_x, b_neighbor_x])) + window_pix).astype(int)
-            window_fit_x_min =np.floor(np.min(np.concatenate([a_neighbor_x, b_neighbor_x])) - window_pix).astype(int)
-            window_fit_y_max = np.ceil(np.max(np.concatenate([a_neighbor_y, b_neighbor_y])) + window_pix).astype(int)
-            window_fit_y_min = np.floor(np.min(np.concatenate([a_neighbor_y, b_neighbor_y])) - window_pix).astype(int)
+            window_fit_x_max = np.ceil(
+                np.max(np.concatenate([a_neighbor_x, b_neighbor_x])) + window_pix
+            ).astype(int)
+            window_fit_x_min = np.floor(
+                np.min(np.concatenate([a_neighbor_x, b_neighbor_x])) - window_pix
+            ).astype(int)
+            window_fit_y_max = np.ceil(
+                np.max(np.concatenate([a_neighbor_y, b_neighbor_y])) + window_pix
+            ).astype(int)
+            window_fit_y_min = np.floor(
+                np.min(np.concatenate([a_neighbor_y, b_neighbor_y])) - window_pix
+            ).astype(int)
 
             window_fit_x_max = min(window_fit_x_max, H)
             window_fit_x_min = max(window_fit_x_min, 0)
@@ -4501,8 +4635,10 @@ class Lattice(AutoSerialize):
 
             x = np.arange(window_fit_x_min, window_fit_x_max)
             y = np.arange(window_fit_y_min, window_fit_y_max)
-            xx, yy = np.meshgrid(x, y, indexing = 'ij')
-            sub_window = self._image.array[window_fit_x_min:window_fit_x_max,window_fit_y_min:window_fit_y_max].copy()
+            xx, yy = np.meshgrid(x, y, indexing="ij")
+            sub_window = self._image.array[
+                window_fit_x_min:window_fit_x_max, window_fit_y_min:window_fit_y_max
+            ].copy()
             if plot_atoms:
                 sub_window_before = sub_window.copy()
 
@@ -4517,7 +4653,7 @@ class Lattice(AutoSerialize):
                     a_neighbor_ip[a_neighbor_index],
                     0,
                     0,
-                    )
+                )
             for b_neighbor_index in range(b_neighbor_x.shape[0]):
                 if self.atom_neighbor_layer_arr_b[atom_b_index][b_neighbor_index] != atom_b_index:
                     sub_window -= self.gauss_2D_rot(
@@ -4530,7 +4666,7 @@ class Lattice(AutoSerialize):
                         b_neighbor_ip[b_neighbor_index],
                         0,
                         0,
-                        )
+                    )
                 # since refine atoms already exists, going to start this without doing any additional refinement of the A site gaussians.
                 # so calculate the gaussians, subtratct them, and decide what to do about background
 
@@ -4551,7 +4687,9 @@ class Lattice(AutoSerialize):
             JJ = np.broadcast_to(jj, patch.shape)
 
             r2 = (II - x0) ** 2 + (JJ - y0) ** 2
-            mask = r2 <= (r_fit * r_fit) # why not just square this with **? Or square root instead of r2
+            mask = r2 <= (
+                r_fit * r_fit
+            )  # why not just square this with **? Or square root instead of r2
             if not np.any(mask):
                 continue
 
@@ -4610,17 +4748,17 @@ class Lattice(AutoSerialize):
                     plt.figure()
                     plt.subplot(121)
                     plt.imshow(sub_window_before)
-                    plt.axis('off')
+                    plt.axis("off")
                     plt.subplot(122)
                     plt.imshow(sub_window)
-                    plt.axis('off')
+                    plt.axis("off")
 
         # plot the difference in values
         # intensity, xc, yc, sigmas
-        delta_int = a_ip_b - updated[:,idx_amp]
-        delta_xc = a_x_b - updated[:,idx_x]
-        delta_yc = a_y_b - updated[:,idx_y]
-        delta_sig = a_s_b - updated[:,idx_sigma]
+        delta_int = a_ip_b - updated[:, idx_amp]
+        delta_xc = a_x_b - updated[:, idx_x]
+        delta_yc = a_y_b - updated[:, idx_y]
+        delta_sig = a_s_b - updated[:, idx_sigma]
 
         # plt.figure(figsize = (10,10))
         # plt.subplot(221)
@@ -4645,43 +4783,66 @@ class Lattice(AutoSerialize):
         # plt.axis('off')
         # plt.tight_layout()
 
-
         s_plot = 40
         alpha_plot = 0.7
-        cmap_plot = 'magma'
+        cmap_plot = "magma"
 
         fig = plt.figure(figsize=(10, 10))
 
         ax1 = plt.subplot(221)
-        ax1.imshow(self._image.array, cmap='gray')
-        sc1 = ax1.scatter(updated[:, idx_y], updated[:, idx_x], c=delta_xc,
-                        s=s_plot, alpha=alpha_plot, cmap=cmap_plot)
-        ax1.set_title('Delta X Center')
-        ax1.axis('off')
+        ax1.imshow(self._image.array, cmap="gray")
+        sc1 = ax1.scatter(
+            updated[:, idx_y],
+            updated[:, idx_x],
+            c=delta_xc,
+            s=s_plot,
+            alpha=alpha_plot,
+            cmap=cmap_plot,
+        )
+        ax1.set_title("Delta X Center")
+        ax1.axis("off")
         fig.colorbar(sc1, ax=ax1, fraction=0.046, pad=0.04)
 
         ax2 = plt.subplot(222)
-        ax2.imshow(self._image.array, cmap='gray')
-        sc2 = ax2.scatter(updated[:, idx_y], updated[:, idx_x], c=delta_yc,
-                        s=s_plot, alpha=alpha_plot, cmap=cmap_plot)
-        ax2.set_title('Delta Y Center')
-        ax2.axis('off')
+        ax2.imshow(self._image.array, cmap="gray")
+        sc2 = ax2.scatter(
+            updated[:, idx_y],
+            updated[:, idx_x],
+            c=delta_yc,
+            s=s_plot,
+            alpha=alpha_plot,
+            cmap=cmap_plot,
+        )
+        ax2.set_title("Delta Y Center")
+        ax2.axis("off")
         fig.colorbar(sc2, ax=ax2, fraction=0.046, pad=0.04)
 
         ax3 = plt.subplot(223)
-        ax3.imshow(self._image.array, cmap='gray')
-        sc3 = ax3.scatter(updated[:, idx_y], updated[:, idx_x], c=delta_int,
-                        s=s_plot, alpha=alpha_plot, cmap=cmap_plot)
-        ax3.set_title('Delta Intensity')
-        ax3.axis('off')
+        ax3.imshow(self._image.array, cmap="gray")
+        sc3 = ax3.scatter(
+            updated[:, idx_y],
+            updated[:, idx_x],
+            c=delta_int,
+            s=s_plot,
+            alpha=alpha_plot,
+            cmap=cmap_plot,
+        )
+        ax3.set_title("Delta Intensity")
+        ax3.axis("off")
         fig.colorbar(sc3, ax=ax3, fraction=0.046, pad=0.04)
 
         ax4 = plt.subplot(224)
-        ax4.imshow(self._image.array, cmap='gray')
-        sc4 = ax4.scatter(updated[:, idx_y], updated[:, idx_x], c=delta_sig,
-                        s=s_plot, alpha=alpha_plot, cmap=cmap_plot)
-        ax4.set_title('Delta Sigma')
-        ax4.axis('off')
+        ax4.imshow(self._image.array, cmap="gray")
+        sc4 = ax4.scatter(
+            updated[:, idx_y],
+            updated[:, idx_x],
+            c=delta_sig,
+            s=s_plot,
+            alpha=alpha_plot,
+            cmap=cmap_plot,
+        )
+        ax4.set_title("Delta Sigma")
+        ax4.axis("off")
         fig.colorbar(sc4, ax=ax4, fraction=0.046, pad=0.04)
 
         plt.tight_layout()
@@ -4697,7 +4858,6 @@ class Lattice(AutoSerialize):
         max_move_px: float | None = None,
         plot_atoms: bool = False,
     ):
-
         im = np.asarray(self._image.array, dtype=float)
         H, W = self._image.shape
         r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
@@ -4728,17 +4888,16 @@ class Lattice(AutoSerialize):
         if needed:
             self.atoms.add_fields(needed)
 
-        a_x_b = self.atoms.get_data(1)[:,0]
-        a_y_b = self.atoms.get_data(1)[:,1]
-        a_s_b = self.atoms[1]['sigma']
-        a_ip_b = self.atoms[1]['int_peak']
-        a_ib_b = self.atoms[1]['int_bg']
+        a_x_b = self.atoms.get_data(1)[:, 0]
+        a_y_b = self.atoms.get_data(1)[:, 1]
+        a_s_b = self.atoms[1]["sigma"]
+        a_ip_b = self.atoms[1]["int_peak"]
+        a_ib_b = self.atoms[1]["int_bg"]
 
-        a_x_a = self.atoms.get_data(0)[:,0]
-        a_y_a = self.atoms.get_data(0)[:,1]
-        a_s_a = self.atoms[0]['sigma']
-        a_ip_a = self.atoms[0]['int_peak']
-        a_ib_a = self.atoms[0]['int_bg']
+        a_x_a = self.atoms.get_data(0)[:, 0]
+        a_y_a = self.atoms.get_data(0)[:, 1]
+        a_s_a = self.atoms[0]["sigma"]
+        a_ip_a = self.atoms[0]["int_peak"]
 
         H, W = self._image.shape
         window_pix = 10
@@ -4753,10 +4912,18 @@ class Lattice(AutoSerialize):
         a_neighbor_s = a_s_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
         a_neighbor_ip = a_ip_a[self.atom_neighbor_layer_arr_a[atom_b_index].astype(int)]
 
-        window_fit_x_max = np.ceil(np.max(np.concatenate([a_neighbor_x, b_neighbor_x])) + window_pix).astype(int)
-        window_fit_x_min = np.floor(np.min(np.concatenate([a_neighbor_x, b_neighbor_x])) - window_pix).astype(int)
-        window_fit_y_max = np.ceil(np.max(np.concatenate([a_neighbor_y, b_neighbor_y])) + window_pix).astype(int)
-        window_fit_y_min = np.floor(np.min(np.concatenate([a_neighbor_y, b_neighbor_y])) - window_pix).astype(int)
+        window_fit_x_max = np.ceil(
+            np.max(np.concatenate([a_neighbor_x, b_neighbor_x])) + window_pix
+        ).astype(int)
+        window_fit_x_min = np.floor(
+            np.min(np.concatenate([a_neighbor_x, b_neighbor_x])) - window_pix
+        ).astype(int)
+        window_fit_y_max = np.ceil(
+            np.max(np.concatenate([a_neighbor_y, b_neighbor_y])) + window_pix
+        ).astype(int)
+        window_fit_y_min = np.floor(
+            np.min(np.concatenate([a_neighbor_y, b_neighbor_y])) - window_pix
+        ).astype(int)
 
         window_fit_x_max = min(window_fit_x_max, H)
         window_fit_x_min = max(window_fit_x_min, 0)
@@ -4765,8 +4932,10 @@ class Lattice(AutoSerialize):
 
         x = np.arange(window_fit_x_min, window_fit_x_max)
         y = np.arange(window_fit_y_min, window_fit_y_max)
-        xx, yy = np.meshgrid(x, y, indexing = 'ij')
-        sub_window = self._image.array[window_fit_x_min:window_fit_x_max,window_fit_y_min:window_fit_y_max].copy()
+        xx, yy = np.meshgrid(x, y, indexing="ij")
+        sub_window = self._image.array[
+            window_fit_x_min:window_fit_x_max, window_fit_y_min:window_fit_y_max
+        ].copy()
         if plot_atoms:
             sub_window_before = sub_window.copy()
         for a_neighbor_index in range(a_neighbor_x.shape[0]):
@@ -4780,7 +4949,7 @@ class Lattice(AutoSerialize):
                 a_neighbor_ip[a_neighbor_index],
                 0,
                 0,
-                )
+            )
         for b_neighbor_index in range(b_neighbor_x.shape[0]):
             if self.atom_neighbor_layer_arr_b[atom_b_index][b_neighbor_index] != atom_b_index:
                 sub_window -= self.gauss_2D_rot(
@@ -4793,7 +4962,7 @@ class Lattice(AutoSerialize):
                     b_neighbor_ip[b_neighbor_index],
                     0,
                     0,
-                    )
+                )
                 # since refine atoms already exists, going to start this without doing any additional refinement of the A site gaussians.
                 # so calculate the gaussians, subtratct them, and decide what to do about background
 
@@ -4802,9 +4971,14 @@ class Lattice(AutoSerialize):
         ix0, iy0 = int(np.floor(x0)), int(np.floor(y0))
         i0, i1 = max(0, ix0 - R), min(H - 1, ix0 + R)
         j0, j1 = max(0, iy0 - R), min(W - 1, iy0 + R)
-        if i1 <= i0 or j1 <= j0: # this doesn't do anything
-            return a_x_b[atom_b_index], a_y_b[atom_b_index], a_ip_b[atom_b_index], a_s_b[atom_b_index], a_ib_b[atom_b_index]
-
+        if i1 <= i0 or j1 <= j0:  # this doesn't do anything
+            return (
+                a_x_b[atom_b_index],
+                a_y_b[atom_b_index],
+                a_ip_b[atom_b_index],
+                a_s_b[atom_b_index],
+                a_ib_b[atom_b_index],
+            )
 
         patch = im[i0 : i1 + 1, j0 : j1 + 1]
 
@@ -4815,9 +4989,17 @@ class Lattice(AutoSerialize):
         JJ = np.broadcast_to(jj, patch.shape)
 
         r2 = (II - x0) ** 2 + (JJ - y0) ** 2
-        mask = r2 <= (r_fit * r_fit) # why not just square this with **? Or square root instead of r2
+        mask = r2 <= (
+            r_fit * r_fit
+        )  # why not just square this with **? Or square root instead of r2
         if not np.any(mask):
-            return a_x_b[atom_b_index], a_y_b[atom_b_index], a_ip_b[atom_b_index], a_s_b[atom_b_index], a_ib_b[atom_b_index]
+            return (
+                a_x_b[atom_b_index],
+                a_y_b[atom_b_index],
+                a_ip_b[atom_b_index],
+                a_s_b[atom_b_index],
+                a_ib_b[atom_b_index],
+            )
 
         vals = patch[mask].astype(float).ravel()
         pmin, pmax = float(vals.min()), float(vals.max())
@@ -4867,23 +5049,20 @@ class Lattice(AutoSerialize):
             plt.figure()
             plt.subplot(121)
             plt.imshow(sub_window_before)
-            plt.axis('off')
+            plt.axis("off")
             plt.subplot(122)
             plt.imshow(sub_window)
-            plt.axis('off')
+            plt.axis("off")
 
         x_c, y_c, amp, sig, bg = res.x
         return x_c, y_c, amp, sig, bg
 
-
     def local_fitting_subtraction_loop(
-            self,
-            fit_radius,
-            max_move_px,
-            max_nfev,
+        self,
+        fit_radius,
+        max_move_px,
+        max_nfev,
     ):
-        
-
         # Single lookup of column indices for writing
         idx_x = self.atoms.fields.index("x")
         idx_y = self.atoms.fields.index("y")
@@ -4900,42 +5079,40 @@ class Lattice(AutoSerialize):
                 fit_radius,
                 max_move_px,
                 max_nfev,
-                )
+            )
             updated[atom_b_index, idx_x] = x_c
             updated[atom_b_index, idx_y] = y_c
             updated[atom_b_index, idx_amp] = amp
             updated[atom_b_index, idx_sigma] = sig
             updated[atom_b_index, idx_bg] = bg
 
-
         self.atoms.set_data(updated, 1)
-
-
-
-
-
-
 
     def auto_peak_finder(
         self,
-        num_peaks_search = 20,
-        num_peaks_use = 2,
-        center_ignore_buffer = 15,
-        minSpacingPeaks = 5,
+        num_peaks_search=20,
+        num_peaks_use=2,
+        center_ignore_buffer=15,
+        minSpacingPeaks=5,
     ):
-        diffraction_peaks_list = self.locate_diffraction_spots(num_peaks_search, center_ignore_buffer = center_ignore_buffer, minSpacingPeaks = minSpacingPeaks)
+        diffraction_peaks_list = self.locate_diffraction_spots(
+            num_peaks_search,
+            center_ignore_buffer=center_ignore_buffer,
+            minSpacingPeaks=minSpacingPeaks,
+        )
         if num_peaks_use == 2:
             peakA, peakB = self.locate_first_order_peaks(diffraction_peaks_list)
             diffraction_peaks_list = np.array([peakA, peakB])
         else:
-            diffraction_peaks_list = np.array([[diffraction_peaks_list[i]] for i in range(1,(num_peaks_use+1))])
+            diffraction_peaks_list = np.array(
+                [[diffraction_peaks_list[i]] for i in range(1, (num_peaks_use + 1))]
+            )
         return diffraction_peaks_list
-
 
     def locate_first_order_peaks(
         self,
         peakCoordinates: np.dtype([("x", float), ("y", float), ("intensity", float)]),
-        ):
+    ):
         """
         Locate three low-order linearly independent peaks in k-space.
 
@@ -4943,7 +5120,7 @@ class Lattice(AutoSerialize):
         ----------
         peakCoordinates: (number of peaks) np.ndarrary, np.dtype([("x", float), ("y", float), ("intensity", float)])
             An array of input peaks. This array should contain at least 2 linearly independent Bragg vectors.
-            
+
         Returns
         -------
         peakA: np.dtype([("x", float), ("y", float), ("intensity", float)])
@@ -4951,16 +5128,22 @@ class Lattice(AutoSerialize):
         peakB: np.dtype([("x", float), ("y", float), ("intensity", float)])
             The first peak (second closest to central peak).
         """
-        nx, ny = self._image.shape 
-        midX = nx//2; midY = ny//2
-        peakCoordinatesRespCenter = np.zeros(len(peakCoordinates), dtype=np.dtype([("x", float), ("y", float), ("intensity", float)]))
-        peakCoordinatesRespCenter['x'] = peakCoordinates['x'] - midX
-        peakCoordinatesRespCenter['y'] = peakCoordinates['y'] - midY
-        peakRadialDistCenter = peakCoordinatesRespCenter['x']**2 + peakCoordinatesRespCenter['y']**2
-        
+        nx, ny = self._image.shape
+        midX = nx // 2
+        midY = ny // 2
+        peakCoordinatesRespCenter = np.zeros(
+            len(peakCoordinates),
+            dtype=np.dtype([("x", float), ("y", float), ("intensity", float)]),
+        )
+        peakCoordinatesRespCenter["x"] = peakCoordinates["x"] - midX
+        peakCoordinatesRespCenter["y"] = peakCoordinates["y"] - midY
+        peakRadialDistCenter = (
+            peakCoordinatesRespCenter["x"] ** 2 + peakCoordinatesRespCenter["y"] ** 2
+        )
+
         smallestRadiiIndices = np.argsort(peakRadialDistCenter)
         peakCoordinatesRespCenter = peakCoordinatesRespCenter[smallestRadiiIndices]
-        
+
         # The closest peak should be the zero order peak - not interested in that.
         if peakRadialDistCenter[0] < 5:
             peakAInd = 1
@@ -4969,27 +5152,35 @@ class Lattice(AutoSerialize):
             peakAInd = 0
             peakBInd = None
 
-        crossAWithRest = np.zeros([len(peakCoordinates)-2]) # this 2 comes from the A peak and the central peak that are excluded from consideration for the B and C peaks
+        crossAWithRest = np.zeros(
+            [len(peakCoordinates) - 2]
+        )  # this 2 comes from the A peak and the central peak that are excluded from consideration for the B and C peaks
         peakA_xy = self.get_xy(peakCoordinatesRespCenter[peakAInd])
-        for peakIndex in np.arange(2,len(peakCoordinates)):
+        for peakIndex in np.arange(2, len(peakCoordinates)):
             currentPeak = self.get_xy(peakCoordinatesRespCenter[peakIndex])
-            crossAWithRest[peakIndex-2] = np.cross(peakA_xy, currentPeak)
-        threshold = 5 * (np.min(np.abs(crossAWithRest))+0.1)
+            crossAWithRest[peakIndex - 2] = np.cross(peakA_xy, currentPeak)
+        threshold = 5 * (np.min(np.abs(crossAWithRest)) + 0.1)
 
-        thresholdCondition = np.abs(crossAWithRest)>threshold
+        thresholdCondition = np.abs(crossAWithRest) > threshold
         if np.any(thresholdCondition):
-            peakBInd = np.argmax(thresholdCondition) + 2 # returning the 2 that was subtracted above
+            peakBInd = (
+                np.argmax(thresholdCondition) + 2
+            )  # returning the 2 that was subtracted above
         else:
-            print('Lowering threshold B')
-            threshold = 2 * (np.min(np.abs(crossAWithRest))+0.1)
-            thresholdCondition = np.abs(crossAWithRest)>threshold
+            print("Lowering threshold B")
+            threshold = 2 * (np.min(np.abs(crossAWithRest)) + 0.1)
+            thresholdCondition = np.abs(crossAWithRest) > threshold
             peakBInd = np.argmax(thresholdCondition) + 2
 
         peakA = np.zeros(1, dtype=np.dtype([("x", float), ("y", float), ("intensity", float)]))
         peakB = np.zeros(1, dtype=np.dtype([("x", float), ("y", float), ("intensity", float)]))
 
-        peakA['x'] = peakCoordinates['x'][smallestRadiiIndices[peakAInd]]; peakA['y'] = peakCoordinates['y'][smallestRadiiIndices[peakAInd]]; peakA['intensity'] = peakCoordinates['intensity'][smallestRadiiIndices[peakAInd]]
-        peakB['x'] = peakCoordinates['x'][smallestRadiiIndices[peakBInd]]; peakB['y'] = peakCoordinates['y'][smallestRadiiIndices[peakBInd]]; peakB['intensity'] = peakCoordinates['intensity'][smallestRadiiIndices[peakBInd]]
+        peakA["x"] = peakCoordinates["x"][smallestRadiiIndices[peakAInd]]
+        peakA["y"] = peakCoordinates["y"][smallestRadiiIndices[peakAInd]]
+        peakA["intensity"] = peakCoordinates["intensity"][smallestRadiiIndices[peakAInd]]
+        peakB["x"] = peakCoordinates["x"][smallestRadiiIndices[peakBInd]]
+        peakB["y"] = peakCoordinates["y"][smallestRadiiIndices[peakBInd]]
+        peakB["intensity"] = peakCoordinates["intensity"][smallestRadiiIndices[peakBInd]]
         return peakA, peakB
 
     def locate_diffraction_spots(
@@ -4997,29 +5188,33 @@ class Lattice(AutoSerialize):
         maxNumPeaks_in: int,
         minSpacingPeaks: int = 0,
         center_ignore_buffer: int | None = None,
-        ):
+    ):
         """
         Calls the maxima finder.
-        
+
         Parameters
         ----------
         maxNumPeaks_in: int
-            The number of peaks to return. Noisier data should use a smaller value. For 2D crystals, more than 3 peaks should be sought. 
+            The number of peaks to return. Noisier data should use a smaller value. For 2D crystals, more than 3 peaks should be sought.
         Returns
         -------
         peakList: (maxNumPeaks_in) np.ndarray, np.dtype([("x", float), ("y", float), ("intensity", float)])
             An array of peak coordinates with a custom datatype.
         """
-        nx, ny = self._image.shape 
-        peakList = self.get_maxima_2D(np.abs(np.fft.fftshift(np.fft.fft2(self._image.array))), maxNumPeaks = maxNumPeaks_in, minSpacing = minSpacingPeaks)
-        if center_ignore_buffer != None:
-            x_dist_to_center = peakList['x'] - nx/2
-            y_dist_to_center = peakList['y'] - ny/2
+        nx, ny = self._image.shape
+        peakList = self.get_maxima_2D(
+            np.abs(np.fft.fftshift(np.fft.fft2(self._image.array))),
+            maxNumPeaks=maxNumPeaks_in,
+            minSpacing=minSpacingPeaks,
+        )
+        if center_ignore_buffer is not None:
+            x_dist_to_center = peakList["x"] - nx / 2
+            y_dist_to_center = peakList["y"] - ny / 2
             rad_dist_to_center = np.sqrt(x_dist_to_center**2 + y_dist_to_center**2)
-            peakList = peakList[rad_dist_to_center>center_ignore_buffer]
+            peakList = peakList[rad_dist_to_center > center_ignore_buffer]
             zero_peak = np.zeros(1, np.dtype([("x", float), ("y", float), ("intensity", float)]))
-            zero_peak['x'] = nx/2
-            zero_peak['y'] = ny/2
+            zero_peak["x"] = nx / 2
+            zero_peak["y"] = ny / 2
             peakList = np.append(zero_peak, peakList)
             return peakList
         else:
@@ -5028,43 +5223,42 @@ class Lattice(AutoSerialize):
     def get_xy_2(
         self,
         coords_arr: np.dtype([("x", float), ("y", float), ("intensity", float)]),
-        ):
+    ):
         """
         Converts the custom dtype to an np.ndarray.
-        
+
         Parameters
         ----------
         coords_arr: np.dtype([("x", float), ("y", float), ("intensity", float)])
             A single set of peak coordinates that has not already been indexed.
-        
+
         Returns
         -------
         xyCoords: (2) np.ndarray
             A simple array with two entries giving the x (row) and y (column) coordinates of the input peak.
         """
-        xyCoords = np.array([coords_arr['x'][0], coords_arr['y'][0]])
+        xyCoords = np.array([coords_arr["x"][0], coords_arr["y"][0]])
         return xyCoords
 
     def get_xy(
         self,
         coords_arr: np.dtype([("x", float), ("y", float), ("intensity", float)]),
-        ):
+    ):
         """
         Converts the custom dtype to an np.ndarray.
-        
+
         Parameters
         ----------
         coords_arr: np.dtype([("x", float), ("y", float), ("intensity", float)])
             A single set of peak coordinates.
-            
+
         Returns
         -------
         xyCoords: (2) np.ndarray
             A simple array with three entries giving the x (row) and y (column) coordinates of the input peak.
         """
-        xyCoords = np.array([coords_arr['x'], coords_arr['y']])
+        xyCoords = np.array([coords_arr["x"], coords_arr["y"]])
         return xyCoords
-
 
     def get_maxima_2D(
         self,
@@ -5092,7 +5286,7 @@ class Lattice(AutoSerialize):
             must be in ('pixel','poly','multicorr'), which correspond
             to pixel resolution, subpixel resolution by fitting a
             parabola, and subpixel resultion by Fourier upsampling.
-        upsample_factor: int 
+        upsample_factor: int
             the upsampling factor for the 'multicorr' algorithm
         sigma: float
             If > 0, applies a gaussian filter
@@ -5203,10 +5397,6 @@ class Lattice(AutoSerialize):
         maxima = np.sort(maxima, order="intensity")[::-1]
         return maxima
 
-
-
-
-
     def filter_2D_maxima(
         self,
         maxima,
@@ -5242,8 +5432,7 @@ class Lattice(AutoSerialize):
         if (minRelativeIntensity > 0) & (len(maxima) > relativeToPeak):
             assert isinstance(relativeToPeak, (int, np.integer))
             deletemask = (
-                maxima["intensity"] / maxima["intensity"][relativeToPeak]
-                < minRelativeIntensity
+                maxima["intensity"] / maxima["intensity"][relativeToPeak] < minRelativeIntensity
             )
             maxima = maxima[~deletemask]
 
@@ -5253,8 +5442,7 @@ class Lattice(AutoSerialize):
             for i in range(len(maxima)):
                 if deletemask[i] == False:  # noqa: E712
                     tooClose = (
-                        (maxima["x"] - maxima["x"][i]) ** 2
-                        + (maxima["y"] - maxima["y"][i]) ** 2
+                        (maxima["x"] - maxima["x"][i]) ** 2 + (maxima["y"] - maxima["y"][i]) ** 2
                     ) < minSpacing**2
                     tooClose[: i + 1] = False
                     deletemask[tooClose] = True
@@ -5266,7 +5454,6 @@ class Lattice(AutoSerialize):
                 maxima = maxima[:maxNumPeaks]
 
         return maxima
-
 
     def linear_interpolation_2D(self, ar, x, y):
         """
@@ -5283,8 +5470,6 @@ class Lattice(AutoSerialize):
             + dx * (1 - dy) * ar[x1, y0]
             + dx * dy * ar[x1, y1]
         )
-
-
 
     def upsampled_correlation(self, imageCorr, upsampleFactor, xyShift, device="cpu"):
         """
@@ -5336,8 +5521,6 @@ class Lattice(AutoSerialize):
 
         if device == "cpu":
             xp = np
-        elif device == "gpu":
-            xp = cp
 
         assert upsampleFactor > 2
 
@@ -5366,7 +5549,7 @@ class Lattice(AutoSerialize):
             )
             dx = (icc[2, 1] - icc[0, 1]) / (4 * icc[1, 1] - 2 * icc[2, 1] - 2 * icc[0, 1])
             dy = (icc[1, 2] - icc[1, 0]) / (4 * icc[1, 1] - 2 * icc[1, 2] - 2 * icc[1, 0])
-        except:
+        except (IndexError, TypeError):
             dx, dy = (
                 0,
                 0,
@@ -5377,7 +5560,6 @@ class Lattice(AutoSerialize):
         xyShift = xyShift + (xySubShift + xp.array([dx, dy])) / upsampleFactor
 
         return xyShift
-
 
     def dftUpsample(self, imageCorr, upsampleFactor, xyShift, device="cpu"):
         """
@@ -5409,8 +5591,6 @@ class Lattice(AutoSerialize):
         """
         if device == "cpu":
             xp = np
-        elif device == "gpu":
-            xp = cp
 
         imageSize = imageCorr.shape
         pixelRadius = 1.5
@@ -5435,13 +5615,6 @@ class Lattice(AutoSerialize):
 
         imageUpsample = xp.real(rowKern @ imageCorr @ colKern)
         return imageUpsample
-
-
-
-
-
-
-
 
     def measure_polarization(
         self,
