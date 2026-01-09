@@ -24,7 +24,7 @@ class LoggerPtychography(LoggerBase):
     def __init__(
         self,
         log_dir: os.PathLike | str,
-        run_prefix: str,
+        run_prefix: str = "",
         run_suffix: str = "",
         log_images_every: int = 10,
         log_probe_images: bool = True,
@@ -170,8 +170,8 @@ class LoggerPtychography(LoggerBase):
                 if self._log_probe_images:
                     self.probe_image(probe_model, epoch, logger_cmap)
 
-            # Flush occasionally
-            if epoch % 20 == 0:
+            # Flush occasionally, default is 120 sec
+            if epoch % 50 == 0:
                 self.flush()
 
         except Exception as e:

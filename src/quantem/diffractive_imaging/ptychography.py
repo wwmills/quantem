@@ -1,5 +1,9 @@
+import contextlib
+import copy
+import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Self, Sequence
+from typing import TYPE_CHECKING, Literal, Self, Sequence, cast
+from warnings import warn
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -10,7 +14,7 @@ from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.object_models import ObjectModelType, ObjectPixelated
-from quantem.diffractive_imaging.probe_models import ProbeModelType
+from quantem.diffractive_imaging.probe_models import ProbeModelType, ProbeParametric
 from quantem.diffractive_imaging.ptycho_utils import SimpleBatcher
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
 from quantem.diffractive_imaging.ptychography_opt import PtychographyOpt
@@ -39,7 +43,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         device: str | int = "cpu",  # "gpu" | "cpu" | "cuda:X"
         verbose: int | bool = True,
         rng: np.random.Generator | int | None = None,
-    ):
+    ) -> Self:
         return cls(
             dset=dset,
             obj_model=obj_model,
@@ -51,6 +55,28 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             rng=rng,
             _token=cls._token,
         )
+
+    @classmethod
+    def from_ptychography(
+        cls,
+        ptycho: Self,
+        obj_model: ObjectModelType | None = None,
+        probe_model: ProbeModelType | None = None,
+        logger: LoggerPtychography | None = None,
+    ) -> Self:
+        _tmp_logger = ptycho.logger
+        ptycho.logger = None
+        cloned = ptycho.clone()
+        ptycho.logger = _tmp_logger
+        if obj_model is not None:
+            cloned.obj_model = obj_model
+        if probe_model is not None:
+            cloned.probe_model = probe_model
+        if logger is not None:
+            cloned.logger = logger
+
+        cloned.reset_recon()
+        return cloned
 
     # region --- explicit properties and setters ---
 
@@ -121,7 +147,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         num_iter: int = 0,
         reset: bool = False,
         optimizer_params: dict | None = None,
-        obj_type: Literal["complex", "pure_phase", "potential"] | None = None,
         scheduler_params: dict | None = None,
         constraints: dict = {},
         batch_size: int | None = None,
@@ -142,7 +167,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         # TODO maybe make an "process args" method that handles things like:
         # mode, store_iterations, device,
         self._check_preprocessed()
-        self.set_obj_type(obj_type, force=reset)  # TODO update this or remove, DIPs...
         if device is not None:
             self.to(device)
         self.batch_size = batch_size
@@ -169,8 +193,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         if new_scheduler:
             self.set_schedulers(self.scheduler_params, num_iter=num_iter)
 
-        learn_descan = True if "dataset" in self.optimizer_params.keys() else False
-        self.dset._set_targets(loss_type, learn_descan)
+        self.dset._set_targets(loss_type)
         batcher = SimpleBatcher(self.dset.num_gpts, self.batch_size, rng=self.rng)
         pbar = tqdm(range(num_iter), disable=not self.verbose)
 
@@ -182,7 +205,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             for batch_indices in batcher:
                 self.zero_grad_all()
                 patch_indices, _positions_px, positions_px_fractional, descan_shifts = (
-                    self.dset.forward(batch_indices, self.obj_padding_px, learn_descan)
+                    self.dset.forward(batch_indices, self.obj_padding_px)
                 )
                 shifted_probes = self.probe_model.forward(positions_px_fractional)
                 obj_patches = self.obj_model.forward(patch_indices)
@@ -264,6 +287,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 obj_grad_scale = self.dset.upsample_factor**2 / 2  # factor of 2 from l2 grad
                 self.obj_model._obj.grad.mul_(obj_grad_scale)  # type:ignore
 
+            if isinstance(self.probe_model, ProbeParametric):
+                probe_grad_scale = np.sqrt(self.probe_model._mean_diffraction_intensity)
+                for par in self.probe_model.params:
+                    par.grad.mul_(probe_grad_scale)  # type:ignore
+
         else:
             gradient = self.gradient_step(amplitudes, overlap)
             prop_gradient = self.obj_model.backward(
@@ -301,9 +329,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
     # endregion --- reconstruction ---
 
-    def dummy(self):
-        print("Hi this is a test1")
-
     def save(
         self,
         path: str | Path,
@@ -312,6 +337,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         skip: str | type | Sequence[str | type] = (),
         compression_level: int | None = 4,
         save_raw_data: bool = False,
+        verbose: int | bool = True,
     ):
         """
         Save the ptychography object, optionally excluding raw dataset data.
@@ -380,6 +406,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             self._dataset_metadata = {
                 "file_path": str(self.dset.dset.file_path) if self.dset.dset.file_path else None,
                 "preprocessing_params": self.dset._preprocessing_params,
+                "learned_scan_positions_px": self.dset.scan_positions_px.data.cpu(),
+                "learned_descan_shifts": self.dset.descan_shifts.data.cpu(),
             }
 
         # Add other common skips for ptychography objects
@@ -387,6 +415,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
         current_device = self.device
         self.to("cpu")
+
+        if self.verbose and verbose:
+            print(f"Saving ptychography object to {path}")
 
         super().save(
             path,
@@ -396,7 +427,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             compression_level=compression_level,
         )
 
-        self.to(current_device)
+        self.to(current_device)  # TODO figure out why this isn't working for DDIP sometimes?
 
         # Clean up temporary metadata
         if not save_raw_data and hasattr(self, "_dataset_metadata"):
@@ -482,18 +513,30 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             else:
                 print("Warning: No dataset metadata found in saved object.")
                 dset = None
+        elif dset is not None:
+            dset._set_initial_scan_positions_px(ptycho.obj_padding_px)
+            dset._set_patch_indices(ptycho.obj_padding_px)
+            if hasattr(ptycho, "_dataset_metadata") and ptycho._dataset_metadata:
+                metadata = ptycho._dataset_metadata
+                # preserve learned scan positions and descan shifts
+                if "learned_scan_positions_px" in metadata:
+                    dset.scan_positions_px.data = metadata["learned_scan_positions_px"]
+                if "learned_descan_shifts" in metadata:
+                    dset.descan_shifts.data = metadata["learned_descan_shifts"]
 
         # check if dset was attached to ptycho object
-        if dset is None:
-            if hasattr(ptycho, "_dset") and ptycho._dset is not None:
-                dset = ptycho._dset
-            else:
-                raise ValueError(
-                    "No dataset provided and could not automatically reload dataset. "
-                    "Please provide a dataset parameter or ensure the object was saved with dataset metadata."
-                )
-
-        ptycho.dset = dset
+        if dset is not None:
+            ptycho.dset = dset
+        elif not (hasattr(ptycho, "_dset") and ptycho._dset is not None):
+            warn(
+                "No dataset provided and could not automatically reload dataset.\n"
+                "Please provide a dataset parameter or ensure the object was saved with dataset metadata.\n"
+                "Many functionalities will not work without the dataset attached."
+            )
+            # raise ValueError(
+            #     "No dataset provided and could not automatically reload dataset. "
+            #     "Please provide a dataset parameter or ensure the object was saved with dataset metadata."
+            # )
 
         if device is not None:
             ptycho.to(device)
@@ -504,3 +547,38 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
     def _recursive_load_from_path(cls, path: str | Path):
         """Helper method to load an object from a path using AutoSerialize."""
         return autoserialize_load(path)
+
+    def clone(self, device: str | int = "cpu") -> Self:
+        """
+        Create a deep-copy clone of this Ptychography instance.
+
+        The clone is placed on CPU by default (device="cpu"). You can override
+        the output device by passing a different device string.
+
+        This method first attempts a Python deepcopy for speed. If that fails
+        (e.g., due to non-copyable objects), it falls back to serializing the
+        object to a temporary file and reloading it, which is robust and includes
+        the dataset by default.
+        """
+        try:
+            cloned: Self = copy.deepcopy(self)
+        except Exception:
+            # Robust fallback: save then reload including raw dataset data so that
+            # the in-memory state is fully preserved without relying on external files.
+            tmp_path = (
+                Path(tempfile.gettempdir()) / f"ptycho_clone_{self.rng.integers(int(1e7))}.zip"
+            )
+            try:
+                self.save(tmp_path, mode="o", store="zip", save_raw_data=True, verbose=0)
+                cloned = cast(
+                    Self, Ptychography.from_file(tmp_path, device=None, auto_reload_dataset=False)
+                )
+            finally:
+                with contextlib.suppress(Exception):
+                    tmp_path.unlink()
+
+        if self.logger is not None:
+            cloned.logger = self.logger.clone()
+
+        cloned.to(device)
+        return cloned

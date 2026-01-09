@@ -55,7 +55,7 @@ class OptimizerMixin:
     def scheduler_params(self, params: dict):
         """Set the scheduler parameters."""
         if params:
-            if params["type"] not in ["cyclic", "plateau", "exp", "gamma", "none"]:
+            if params["type"] not in ["cyclic", "plateau", "exp", "gamma", "linear", "none"]:
                 raise ValueError(
                     f"Unknown scheduler type: {params['type']}, expected one of ['cyclic', 'plateau', 'exp', 'gamma', 'none']"
                 )
@@ -87,6 +87,13 @@ class OptimizerMixin:
             self._optimizer = None
             return
 
+        opt_params = self._optimizer_params.copy()
+        opt_type = opt_params.pop("type", self.DEFAULT_OPTIMIZER_TYPE)
+
+        if opt_type == "none":
+            self.remove_optimizer()
+            return
+
         params = self.get_optimization_parameters()
         if isinstance(params, torch.Tensor):
             params = [params]
@@ -97,9 +104,6 @@ class OptimizerMixin:
         for p in params:
             p.requires_grad_(True)
 
-        opt_params = self._optimizer_params.copy()
-        opt_type = opt_params.pop("type", self.DEFAULT_OPTIMIZER_TYPE)
-
         if isinstance(opt_type, type):
             self._optimizer = opt_type(params, **opt_params)
         elif isinstance(opt_type, str):
@@ -109,8 +113,6 @@ class OptimizerMixin:
                 self._optimizer = torch.optim.AdamW(params, **opt_params)
             elif opt_type.lower() == "sgd":
                 self._optimizer = torch.optim.SGD(params, **opt_params)
-            elif opt_type.lower() == "none":
-                self.remove_optimizer()
             else:
                 raise NotImplementedError(f"Unknown optimizer type: {opt_type}")
         else:
@@ -161,8 +163,15 @@ class OptimizerMixin:
                 fac = params.get("factor", 0.01)
                 gamma = fac ** (1.0 / num_iter)
             else:
-                gamma = 0.999
+                gamma = 0.9
             self._scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
+        elif sched_type == "linear":
+            self._scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=params.get("start_factor", 0.1),
+                end_factor=params.get("end_factor", 1.0),
+                total_iters=params.get("total_iters", num_iter),
+            )
         else:
             raise ValueError(f"Unknown scheduler type: {sched_type}")
 

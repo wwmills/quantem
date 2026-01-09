@@ -14,12 +14,10 @@ from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.blocks import reset_weights
 from quantem.core.ml.loss_functions import get_loss_function
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
-from quantem.core.utils.utils import RNGMixin
+from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.validators import (
     validate_arr_gt,
-    validate_array,
     validate_gt,
-    validate_np_len,
     validate_tensor,
 )
 from quantem.core.visualization import show_2d
@@ -51,12 +49,9 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
 
     def __init__(
         self,
-        num_slices: int = 1,
-        slice_thicknesses: float | Sequence | torch.Tensor | None = None,
         device: str = "cpu",
         obj_type: object_type = "complex",
         rng: np.random.Generator | int | None = None,
-        shape: tuple[int, int, int] | None = None,
         _token: object | None = None,
     ):
         if _token is not self._token:
@@ -67,59 +62,25 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         RNGMixin.__init__(self, rng=rng, device=device)
         OptimizerMixin.__init__(self)
 
-        self.shape = shape
         self.register_buffer("_mask", torch.tensor([]))
         self.device = device
         self._obj_type = obj_type
-        self.num_slices = num_slices
-        self.slice_thicknesses = slice_thicknesses
 
     # there is some redundancy with shape, shape_2d, and num_slices, but I think it's okay
     # to just allow things to be set in multiple ways as long as they chain to each other
     @property
     def shape(self) -> tuple[int, int, int]:
-        if None in self._shape:
-            raise ValueError("Shape has not yet been set")
-        return self._shape  # type: ignore ## idk why this is needed
-
-    @shape.setter
-    def shape(self, s: tuple | np.ndarray | None) -> None:
-        if s is None:
-            self._shape = (1, None, None)
-        else:
-            s = tuple(s)
-            if len(s) != 3:
-                raise ValueError(
-                    f"Shape must be a tuple of length 3 (depth, row, col), got {len(s)}: {s}"
-                )
-            self._shape = (int(s[0]), int(s[1]), int(s[2]))
+        return self.obj.shape
 
     @property
+    @abstractmethod
     def num_slices(self) -> int:
-        return self._shape[0]
-
-    @num_slices.setter
-    def num_slices(self, n: int) -> None:
-        validate_gt(n, 0, "num_slices")
-        self._shape = (n, *self._shape[1:])
+        # different for pixelated vs DIP so abstract
+        raise NotImplementedError()
 
     @property
     def shape_2d(self) -> tuple[int, int]:
         return self.shape[1:]
-
-    @shape_2d.setter
-    def shape_2d(self, s: tuple | np.ndarray) -> None:
-        s = tuple(int(x) for x in s)
-        if len(s) != 2:
-            raise ValueError(f"shape_2d must be a tuple of length 2 (row, col), got {len(s)}: {s}")
-        if None not in self._shape:
-            self.shape = (self.num_slices, *s)
-            if self.shape_2d != s:
-                print(f"temp warning -- overrriding shape_2d {self.shape_2d} -> shape_2d")
-                self.initialize_obj()
-        else:
-            self.shape = (self.num_slices, *s)
-            self.initialize_obj()
 
     @property
     def dtype(self) -> "torch.dtype":
@@ -149,11 +110,11 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         if obj_type is None:
             return self.obj_type
         t_str = str(obj_type).lower()
-        if t_str in ["potential", "pot", "potentials"]:
+        if t_str in ["potential", "potentials"]:
             return "potential"
-        elif t_str in ["pure_phase", "purephase", "pure phase", "pure"]:
+        elif t_str in ["pure_phase", "purephase", "pure phase"]:
             return "pure_phase"
-        elif t_str in ["complex", "c"]:
+        elif t_str in ["complex"]:
             return "complex"
         else:
             raise ValueError(
@@ -165,31 +126,37 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         return self._slice_thicknesses
 
     @slice_thicknesses.setter
-    def slice_thicknesses(self, val: float | Sequence | torch.Tensor | None) -> None:
+    def slice_thicknesses(self, val: float | Sequence | torch.Tensor | np.ndarray | None) -> None:
         if val is None:
+            thicknesses = []
+        elif isinstance(val, (float, int)):
+            thicknesses = [val]
+        else:
+            thicknesses = val
+
+        if len(thicknesses) == 0:
             if self.num_slices > 1:
                 raise ValueError(
                     f"num slices = {self.num_slices}, so slice_thicknesses cannot be None"
                 )
-            else:
-                self._slice_thicknesses = torch.tensor([-1])
-        elif isinstance(val, (float, int)):
-            val = validate_gt(float(val), 0, "slice_thicknesses")
-            self._slice_thicknesses = val * torch.ones(self.num_slices - 1)
+            thicknesses = torch.tensor([])
+        elif len(thicknesses) == 1:
+            thk = validate_gt(float(thicknesses[0]), 0, "slice_thicknesses")
+            thicknesses = thk * torch.ones(self.num_slices - 1)
         else:
             if self.num_slices == 1:
                 warn("Single slice reconstruction so not setting slice_thicknesses")
-            arr = validate_array(
-                val,
+            thicknesses = validate_tensor(
+                thicknesses,
                 name="slice_thicknesses",
                 dtype=config.get("dtype_real"),
                 ndim=1,
                 shape=(self.num_slices - 1,),
             )
-            arr = validate_arr_gt(arr, 0, "slice_thicknesses")
-            arr = validate_np_len(arr, self.num_slices - 1, name="slice_thicknesses")
-            dt = getattr(torch, config.get("dtype_real"))
-            self._slice_thicknesses = torch.tensor(arr, dtype=dt, device=self.device)
+            thicknesses = validate_arr_gt(thicknesses, 0, "slice_thicknesses")
+
+        dt = getattr(torch, config.get("dtype_real"))
+        self._slice_thicknesses = thicknesses.type(dt).to(self.device)
 
     @property
     def mask(self) -> torch.Tensor:
@@ -207,10 +174,12 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         self._mask = mask.to(self.device).expand(self.num_slices, -1, -1)
 
     @property
+    @abstractmethod
     def obj(self):
         raise NotImplementedError()
 
     @property
+    @abstractmethod
     def params(self):
         raise NotImplementedError()
 
@@ -223,7 +192,7 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         raise NotImplementedError()
 
     @abstractmethod
-    def initialize_obj(self, *args, **kwargs):
+    def _initialize_obj(self, shape: tuple[int, int, int] | np.ndarray) -> None:
         raise NotImplementedError()
 
     def to(self, *args, **kwargs):
@@ -262,10 +231,18 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         return propagated
 
     def _get_obj_patches(self, obj_array, patch_indices):
-        if not obj_array.is_complex():
-            obj_array = torch.exp(1.0j * obj_array)
-        obj_flat = obj_array.reshape(obj_array.shape[0], -1)
-        patches = obj_flat[:, patch_indices]
+        if not obj_array.is_complex():  # potential or pure_phase DIP -> float
+            obj_array2 = torch.exp(1.0j * obj_array)
+        else:
+            obj_array2 = obj_array
+        obj_flat = obj_array2.reshape(obj_array.shape[0], -1)
+
+        # patches = obj_flat[:, patch_indices]
+        # MPS does not support complex scatter kernel..
+        real = obj_flat.real
+        imag = obj_flat.imag
+        patches = torch.complex(real[:, patch_indices], imag[:, patch_indices])
+
         return patches
 
     def backward(self, *args, **kwargs):
@@ -276,6 +253,7 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
 
 class ObjectConstraints(BaseConstraints, ObjectBase):
     DEFAULT_CONSTRAINTS = {
+        "positivity": True,
         "fix_potential_baseline": False,
         "fix_potential_baseline_factor": 1.0,
         "identical_slices": False,
@@ -298,7 +276,7 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
                 obj2 = amp * mask * torch.exp(1.0j * phase * mask)
             else:
                 obj2 = amp * torch.exp(1.0j * phase)
-        else:
+        else:  # potential
             if self.constraints["fix_potential_baseline"]:
                 if mask is not None:
                     offset = obj[mask < 0.5 * mask.max()].mean()
@@ -307,8 +285,12 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
                 offset *= self.constraints["fix_potential_baseline_factor"]
             else:
                 offset = 0
+            # print("offset: ", offset)
 
-            obj2 = torch.clamp(obj - offset, min=0.0)
+            if self.constraints.get("positivity", True):
+                obj2 = torch.clamp(obj - offset, min=0.0)
+            else:
+                obj2 = obj - offset
 
         if self.constraints["apply_fov_mask"] and mask is not None:
             obj2 *= mask
@@ -402,12 +384,15 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         if array.shape[0] < 3:
             return loss
         if array.is_complex():
-            amp = array.abs()
-            ph = array.angle()
-            loss = loss + weight * (torch.mean(amp[0]) + torch.mean(amp[-1]))
+            ph = array.angle().abs()
+            if self.obj_type == "complex":
+                amp = array.abs()
+                loss = loss + weight * (torch.mean(1.0 - amp[0]) + torch.mean(1.0 - amp[-1]))
             loss = loss + weight * (torch.mean(torch.diff(ph[0])) + torch.mean(torch.diff(ph[-1])))
         else:
-            loss = loss + weight * (torch.mean(array[0]) + torch.mean(array[-1]))
+            loss = loss + weight * (
+                torch.mean(torch.abs(array[0])) + torch.mean(torch.abs(array[-1]))
+            )
         return loss
 
 
@@ -419,48 +404,97 @@ class ObjectPixelated(ObjectConstraints):
     def __init__(
         self,
         num_slices: int = 1,
-        slice_thicknesses: float | Sequence | None = None,
-        device: str = "cpu",
+        slice_thicknesses: float | Sequence | None | np.ndarray = None,
         obj_type: Literal["complex", "pure_phase", "potential"] = "complex",
+        initialize_mode: Literal["uniform", "random", "array"] = "uniform",
+        device: str = "cpu",
         rng: np.random.Generator | int | None = None,
-        shape: tuple[int, int, int] | None = None,
         _token: object | None = None,
     ):
         super().__init__(
-            num_slices=num_slices,
-            slice_thicknesses=slice_thicknesses,
             device=device,
             obj_type=obj_type,
             rng=rng,
-            shape=shape,
             _token=_token,
         )
-        self._obj = nn.Parameter(torch.ones(1), requires_grad=True)
+        self._initialize_mode = initialize_mode
+        self._obj = nn.Parameter(torch.ones(num_slices, 1, 1), requires_grad=True)
+        self.slice_thicknesses = slice_thicknesses
 
     @classmethod
     def from_uniform(
         cls,
         num_slices: int = 1,
-        slice_thicknesses: float | Sequence | None = None,
+        slice_thicknesses: float | Sequence | None | np.ndarray = None,
         device: str = "cpu",
         obj_type: Literal["complex", "pure_phase", "potential"] = "complex",
         rng: np.random.Generator | int | None = None,
-        shape: tuple[int, int, int] | None = None,
     ):
         """
-        Create ObjectPixelated from an array or with uniform initialization.
-        If there's a reason, in the future could change this to from_array and add an
-        initial_obj parameter, though would have to make sure it works with shape being set later,
-        and then just modify reset to set the initial obj to the initial_obj parameter
+        Create ObjectPixelated from a uniform initialization.
         """
         obj_model = cls(
             num_slices=num_slices,
             slice_thicknesses=slice_thicknesses,
             device=device,
             obj_type=obj_type,
+            initialize_mode="uniform",
             rng=rng,
-            shape=shape,
             _token=cls._token,
+        )
+
+        return obj_model
+
+    @classmethod
+    def from_random(
+        cls,
+        num_slices: int = 1,
+        slice_thicknesses: float | Sequence | None | np.ndarray = None,
+        device: str = "cpu",
+        obj_type: Literal["complex", "pure_phase", "potential"] = "complex",
+        rng: np.random.Generator | int | None = None,
+    ):
+        """
+        Create ObjectPixelated from a random initialization.
+        """
+        obj_model = cls(
+            num_slices=num_slices,
+            slice_thicknesses=slice_thicknesses,
+            device=device,
+            obj_type=obj_type,
+            initialize_mode="random",
+            rng=rng,
+            _token=cls._token,
+        )
+
+        return obj_model
+
+    @classmethod
+    def from_array(
+        cls,
+        initial_obj: torch.Tensor | np.ndarray,
+        slice_thicknesses: float | Sequence | None = None,
+        device: str = "cpu",
+        obj_type: Literal["complex", "pure_phase", "potential"] = "complex",
+        rng: np.random.Generator | int | None = None,
+    ):
+        """
+        Create ObjectPixelated from an array. Shape must match the correct recon shape,
+        and so for a demo of this use the pdset.obj_shape_full + padding to confirm is correct.
+        """
+        num_slices = initial_obj.shape[0]
+
+        obj_model = cls(
+            num_slices=num_slices,
+            slice_thicknesses=slice_thicknesses,
+            device=device,
+            obj_type=obj_type,
+            initialize_mode="array",
+            rng=rng,
+            _token=cls._token,
+        )
+        obj_model._initial_obj = torch.tensor(
+            initial_obj, dtype=obj_model.dtype, device=obj_model.device
         )
 
         return obj_model
@@ -470,24 +504,48 @@ class ObjectPixelated(ObjectConstraints):
         return self.apply_hard_constraints(self._obj, mask=self.mask)
 
     @property
+    def num_slices(self) -> int:
+        return self._obj.shape[0]
+
+    @property
     def params(self):
         """optimization parameters"""
         return self._obj
 
-    def forward(self, patch_indices: torch.Tensor):
-        """Get patch indices of the object"""
-        return self._get_obj_patches(self.obj, patch_indices)
+    @property
+    def initial_obj(self):
+        return self._initial_obj
+
+    def _initialize_obj(self, shape: tuple[int, int, int] | np.ndarray) -> None:
+        init_shape = tuple(int(x) for x in shape)
+        if self._initialize_mode == "uniform":
+            if self.obj_type in ["complex", "pure_phase"]:
+                arr = torch.ones(init_shape) * torch.exp(1.0j * torch.zeros(init_shape))
+            else:
+                arr = torch.zeros(init_shape)
+        elif self._initialize_mode == "random":
+            ph = (
+                torch.randn(init_shape, dtype=torch.float32, generator=self._rng_torch) - 0.5
+            ) * 1e-6
+            if self.obj_type == "potential":
+                arr = ph
+            else:
+                arr = torch.exp(1.0j * ph)
+        elif self._initialize_mode == "array":
+            arr = self._initial_obj
+        else:
+            raise ValueError(f"Invalid initialize mode: {self._initialize_mode}")
+
+        self._initial_obj = arr.type(self.dtype)
+        self.reset()
 
     def reset(self):
         """Reset the object model to its initial or pre-trained state"""
-        self._obj = nn.Parameter(
-            torch.ones(self.shape, dtype=self.dtype, device=self.device), requires_grad=True
-        )
+        self._obj = nn.Parameter(self.initial_obj.clone().to(self.device), requires_grad=True)
 
-    def initialize_obj(self, *args, **kwargs):
-        self._obj = nn.Parameter(
-            torch.ones(self.shape, dtype=self.dtype, device=self.device), requires_grad=True
-        )
+    def forward(self, patch_indices: torch.Tensor):
+        """Get patch indices of the object"""
+        return self._get_obj_patches(self.obj, patch_indices)
 
     @property
     def name(self) -> str:
@@ -552,39 +610,41 @@ class ObjectDIP(ObjectConstraints):
         device: str = "cpu",
         obj_type: object_type = "complex",
         rng: np.random.Generator | int | None = None,
-        shape: tuple[int, int, int] | None = None,
         _token: object | None = None,
     ):
         super().__init__(
-            num_slices=num_slices,
-            slice_thicknesses=slice_thicknesses,
             device=device,
             obj_type=obj_type,
             rng=rng,
-            shape=shape,
             _token=_token,
         )
         self.register_buffer("_model_input", torch.tensor([]))
         self.register_buffer("_pretrain_target", torch.tensor([]))
 
+        if num_slices < 1:  # no setter cuz shouldn't change after initialization
+            raise ValueError(f"num_slices must be greater than 0, got {num_slices}")
+        self._num_slices = int(num_slices)
+        self.slice_thicknesses = slice_thicknesses
+
         self._pretrain_losses = []
         self._pretrain_lrs = []
         self._model_input_noise_std = input_noise_std
+        self._model_input = torch.tensor([])
+        self._pretrain_target = torch.tensor([])
 
     @classmethod
     def from_model(
         cls,
         model: "torch.nn.Module",
-        model_input: torch.Tensor | None = None,
+        model_input: torch.Tensor,
         num_slices: int = 1,
         slice_thicknesses: float | Sequence | torch.Tensor | None = None,
         input_noise_std: float = 0.025,
         device: str = "cpu",
         obj_type: object_type = "complex",
         rng: np.random.Generator | int | None = None,
-        shape: tuple[int, int, int] | None = None,
     ):
-        """Create ObjectDIP from a model."""
+        """Create ObjectDIP from a CNN and model input."""
         obj_model = cls(
             num_slices=num_slices,
             slice_thicknesses=slice_thicknesses,
@@ -592,18 +652,61 @@ class ObjectDIP(ObjectConstraints):
             device=device,
             obj_type=obj_type,
             rng=rng,
-            shape=shape,
             _token=cls._token,
         )
         obj_model.model = model.to(device)
-        obj_model.set_pretrained_weights(model)
-
-        if model_input is None:
-            obj_model.model_input = None
-        else:
-            obj_model.model_input = model_input.clone().detach()
+        obj_model.model_input = model_input
+        obj_model._set_pretrained_weights(model)
 
         return obj_model
+
+    @classmethod
+    def from_pixelated(
+        cls,
+        model: "torch.nn.Module",
+        pixelated: "ObjectModelType",  # ObjectPixelated upsets linter when ptycho.obj_model is used
+        input_noise_std: float = 0.025,
+        device: str = "cpu",
+    ) -> "ObjectDIP":
+        """
+        Create ObjectDIP from a pixelated object model.
+        """
+        if not (
+            isinstance(pixelated, ObjectPixelated) or "ObjectPixelated" in str(type(pixelated))
+        ):
+            raise ValueError(f"Pixelated must be an ObjectPixelated, got {type(pixelated)}")
+
+        model_dtype = "complex" if pixelated.obj_type == "complex" else "real"
+        if hasattr(model, "dtype"):  # allow overwriting of dtype based on model
+            if "complex" in str(model.dtype):
+                model_dtype = "complex"
+            else:
+                model_dtype = "real"
+
+        if pixelated.obj_type == "pure_phase" and model_dtype == "real":
+            obj = pixelated.obj.angle().clone().detach()
+        else:
+            obj = pixelated.obj.clone().detach()
+
+        obj_model = cls.from_model(
+            model=model,
+            model_input=obj,
+            num_slices=pixelated.num_slices,
+            slice_thicknesses=pixelated.slice_thicknesses,
+            input_noise_std=input_noise_std,
+            device=pixelated.device,
+            obj_type=pixelated.obj_type,
+            rng=pixelated._rng_seed,
+        )
+        obj_model.pretrain_target = obj
+
+        return obj_model
+
+    @property
+    def num_slices(self) -> int:
+        return self._num_slices
+
+
 
     @property
     def name(self) -> str:
@@ -630,22 +733,22 @@ class ObjectDIP(ObjectConstraints):
         This actually doesn't work -- can't have setters for torch sub modules
         https://github.com/pytorch/pytorch/issues/52664
         """
-        print("\n\n\nsetting model, this is not reachable???\n\n\n")
-        if not isinstance(dip, torch.nn.Module):
-            raise TypeError(f"DIP must be a torch.nn.Module, got {type(dip)}")
-        if hasattr(dip, "dtype"):
-            dt = getattr(dip, "dtype")
-            if self.obj_type in ["complex"] and not dt.is_complex:
-                raise ValueError("DIP model must be a complex-valued model for complex objects")
-        self._model = dip.to(self.device)
-        self.set_pretrained_weights(self._model)
+        raise RuntimeError("\n\n\nsetting model, this shouldn't be reachable???\n\n\n")
+        # if not isinstance(dip, torch.nn.Module):
+        #     raise TypeError(f"DIP must be a torch.nn.Module, got {type(dip)}")
+        # if hasattr(dip, "dtype"):
+        #     dt = getattr(dip, "dtype")
+        #     if self.obj_type in ["complex"] and not dt.is_complex:
+        #         raise ValueError("DIP model must be a complex-valued model for complex objects")
+        # self._model = dip.to(self.device)
+        # self._set_pretrained_weights(self._model)
 
     @property
     def pretrained_weights(self) -> dict[str, torch.Tensor]:
         """get the pretrained weights of the DIP model"""
         return self._pretrained_weights
 
-    def set_pretrained_weights(self, model: torch.nn.Module):
+    def _set_pretrained_weights(self, model: torch.nn.Module):
         """set the pretrained weights of the DIP model"""
         if not isinstance(model, torch.nn.Module):
             raise TypeError(f"Pretrained model must be a torch.nn.Module, got {type(model)}")
@@ -654,29 +757,42 @@ class ObjectDIP(ObjectConstraints):
     @property
     def model_input(self) -> torch.Tensor:
         """get the model input"""
-        if self._model_input.numel() == 0:  # Check for empty tensor instead of None
-            try:
-                self._generate_model_input("random")
-            except ValueError:
-                raise ValueError(
-                    "Model input is not set, likely because the shape has not been defined."
-                )
         return cast(torch.Tensor, self._model_input)
 
     @model_input.setter
-    def model_input(self, input_tensor: torch.Tensor | None):
-        """set the model input"""
-        if input_tensor is None:
-            self._model_input = torch.tensor([])
+    def model_input(self, input_tensor: torch.Tensor | np.ndarray):
+        """set the model input, for a CNN2D should be (1, num_slices, h, w)"""
+        if isinstance(input_tensor, np.ndarray):
+            input_tensor = torch.tensor(input_tensor)
         else:
-            inp = validate_tensor(
-                input_tensor,
-                name="model_input",
-                dtype=self.dtype,
-                ndim=4,
-                expand_dims=True,
+            input_tensor = input_tensor.clone().detach()
+        if input_tensor.shape[-3] != self.num_slices:
+            raise ValueError(
+                f"model_input.shape[-3] {input_tensor.shape[-3]} does not match num_slices {self.num_slices}"
             )
-            self._model_input = inp.to(self.device)
+        if input_tensor.ndim == 3:
+            input_tensor = input_tensor[None]
+        elif input_tensor.ndim != 4:
+            raise ValueError(
+                f"model_input must be a 3D tensor of shape (num_slices, h, w), got {input_tensor.ndim}D of shape {input_tensor.shape}"
+            )
+
+        self._model_input = input_tensor.type(self.dtype).to(self.device)
+
+    # def _generate_model_input(self, mode: Literal["random", "zeros", "ones"]) -> None:
+    #     input_shape = (1, *self.shape)
+    #     # could support for 3D CNN models, single channel 2D with identical slices
+    #     if mode == "random":
+    #         inp = torch.randn(
+    #             input_shape, device=self.device, dtype=self.dtype, generator=self._rng_torch
+    #         )
+    #     elif mode == "zeros":
+    #         inp = torch.zeros(input_shape, device=self.device, dtype=self.dtype)
+    #     elif mode == "ones":
+    #         inp = torch.ones(input_shape, device=self.device, dtype=self.dtype)
+    #     else:
+    #         raise ValueError(f"Invalid mode: {mode} | must be one of: 'random', 'zeros', 'ones'")
+    #     self._model_input = inp
 
     def _generate_model_input(self, mode: Literal["random", "zeros", "ones"]) -> None:
         input_shape = (1, *self.shape)
@@ -779,6 +895,7 @@ class ObjectDIP(ObjectConstraints):
         # Call parent's to() method first to handle PyTorch's internal device management
         # This will automatically move the registered module and buffers
         super().to(*args, **kwargs)
+        self._model = self.model.to(*args, **kwargs)
 
         # Update device property
         device = kwargs.get("device", args[0] if args else None)
@@ -804,8 +921,11 @@ class ObjectDIP(ObjectConstraints):
         """Reset the object model to its initial or pre-trained state"""
         self.model.load_state_dict(self.pretrained_weights.copy())
 
-    def initialize_obj(self, *args, **kwargs):
-        pass
+    def _initialize_obj(self, shape: tuple[int, int, int] | np.ndarray) -> None:
+        if not np.array_equal(shape, self.model_input.shape[1:]):
+            raise ValueError(
+                f"shape {shape} does not match model_input.shape {self.model_input.shape}"
+            )
 
     def pretrain(
         self,
@@ -818,7 +938,11 @@ class ObjectDIP(ObjectConstraints):
         loss_fn: Callable | str = "l2",
         apply_constraints: bool = False,
         show: bool = True,
+        device: str | None = None,  # allow overwriting of device
     ):
+        if device is not None:
+            self.to(device)
+
         if optimizer_params is not None:
             self.set_optimizer(optimizer_params)
 
@@ -838,7 +962,8 @@ class ObjectDIP(ObjectConstraints):
                     f"Model target shape {pretrain_target.shape} does not match model input shape {self.model_input.shape}"
                 )
             self.pretrain_target = pretrain_target.clone().detach().to(self.device)
-        elif self.pretrain_target is None:
+        elif self.pretrain_target.numel() == 0:
+            # self.pretrain_target = self.model_input.clone().detach().to(self.device)
             raise ValueError(
                 "No pretrain target set. Provide pretrain_target or set it beforehand."
             )
@@ -850,7 +975,7 @@ class ObjectDIP(ObjectConstraints):
             apply_constraints=apply_constraints,
             show=show,
         )
-        self.set_pretrained_weights(self.model)
+        self._set_pretrained_weights(self.model)
 
     def _pretrain(
         self,
@@ -889,6 +1014,8 @@ class ObjectDIP(ObjectConstraints):
 
             if apply_constraints:
                 output = self.apply_hard_constraints(self.model(model_input)[0])
+                if self.obj_type == "pure_phase":
+                    output = output.angle()
             else:
                 output = self.model(model_input)[0]
             loss: torch.Tensor = loss_fn(output, self.pretrain_target)

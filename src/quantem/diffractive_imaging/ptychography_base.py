@@ -5,9 +5,9 @@ import numpy as np
 import scipy.ndimage as ndi
 import torch
 
-import quantem.core.utils.array_funcs as arr
 from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.utils import (
     RNGMixin,
     electron_wavelength_angstrom,
@@ -101,8 +101,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             probe_model.rescale_vacuum_probe((dset.amplitudes.shape[1], dset.amplitudes.shape[2]))
 
         # Remove centralized optimizer storage - now managed by individual models
-        self.set_probe_model(probe_model)
-        self.set_obj_model(obj_model)
+        self.probe_model = probe_model
+        self.obj_model = obj_model
         self.detector_model = detector_model
         self._compute_propagator_arrays()
         self.logger = logger
@@ -151,7 +151,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._compute_propagator_arrays()
         self._set_obj_fov_mask(batch_size=batch_size)
         self._preprocessed = True
-        # self.reset_recon()  # force clear losses and everything
+        # if self.num_epochs == 0:
+        #     self.reset_recon()  # if new models, reset to ensure shapes are correct
         return self
 
     def _compute_propagator_arrays(
@@ -331,7 +332,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @property
     def obj(self) -> np.ndarray:
-        return self._to_numpy(self.obj_model.obj)
+        obj = self._to_numpy(self.obj_model.obj)
+        if self.obj_type in ["pure_phase", "complex"]:
+            ph = np.angle(obj)
+            obj = np.abs(obj) * np.exp(1j * (ph - ph.mean()))
+        return obj
 
     @property
     def obj_padding_px(self) -> np.ndarray:
@@ -350,11 +355,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         if self._obj_padding_force_power2_level > 0:
             p2 = adjust_padding_power2(
                 p2,
-                self.dset._obj_shape_full_2d(),
+                self.dset._obj_shape_full_2d((0, 0)),
                 self._obj_padding_force_power2_level,
             )
         self._obj_padding_px = p2
-        self.obj_model.shape = tuple(self.obj_shape_full)
+        self.obj_model._initialize_obj(shape=self.obj_shape_full)
         self.dset._set_initial_scan_positions_px(self.obj_padding_px)
         self.dset._set_patch_indices(self.obj_padding_px)
         self.dset._preprocessing_params["obj_padding_px"] = self.obj_padding_px
@@ -408,7 +413,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         return self._to_numpy(self.probe_model.probe)
 
     @property
-    def store_iterations(self) -> bool:
+    def store_iterations(self) -> bool:  # TODO rename to store_epochs or store_snapshots
         return self._store_iterations
 
     @store_iterations.setter
@@ -429,33 +434,35 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     def epoch_snapshots(self) -> list[dict[str, int | np.ndarray]]:
         return self._epoch_snapshots
 
-    def get_snapshot_by_iter(self, iteration: int):
+    def get_snapshot_by_epoch(self, iteration: int, closest: bool = False):
         iteration = int(iteration)
         for snapshot in self.epoch_snapshots:
             if snapshot["iteration"] == iteration:
                 return snapshot
-        raise ValueError(f"No snapshot found at iteration: {iteration}")
+        if closest:
+            closest_snapshot = min(
+                self.epoch_snapshots, key=lambda s: abs(int(s["iteration"]) - iteration)
+            )
+            return closest_snapshot
+        raise ValueError(
+            f"No snapshot found at iteration: {iteration}, "
+            + "to return the closest snapshot, set closest=True"
+        )
 
-    # TODO overload this to type hint proper object model type
+    # TODO is there a way to type hint proper object model type? probably not...
     @property
     def obj_model(self) -> ObjectModelType:
         return self._obj_model
 
     @obj_model.setter
     def obj_model(self, model: ObjectModelType | type):
-        self.set_obj_model(model)  # redundant
-
-    def set_obj_model(self, model: ObjectModelType | type):
         # Type checking with autoreload bug workaround
         if not (isinstance(model, ObjectBase) or "object" in str(type(model))):
             raise TypeError(f"obj_model must be a ObjectModelType, got {type(model)}")
 
+        # Set object shape
+        model.to(self.device)
         self._obj_model = cast(ObjectModelType, model)
-
-        # Set object shape and reset
-        rotshape = self.dset._obj_shape_full_2d(self.obj_padding_px)
-        self._obj_model.shape_2d = rotshape
-        self._obj_model.to(self.device)
 
     @property
     def probe_model(self) -> ProbeModelType:
@@ -463,14 +470,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @probe_model.setter
     def probe_model(self, model: ProbeModelType | type):
-        self.set_probe_model(model)  # redundant
-
-    def set_probe_model(self, probe_model: ProbeModelType | type):
         # Type checking with autoreload bug workaround
-        if not (isinstance(probe_model, ProbeBase) or "probe" in str(type(probe_model))):
-            raise TypeError(f"probe_model must be a ProbeModelType, got {type(probe_model)}")
+        if not (isinstance(model, ProbeBase) or "probe" in str(type(model))):
+            raise TypeError(f"probe_model must be a ProbeModelType, got {type(model)}")
 
-        self._probe_model = cast(ProbeModelType, probe_model)
+        self._probe_model = cast(
+            ProbeModelType, model
+        )  # have before so that energy available to set initial probe
         self._probe_model.set_initial_probe(
             self.roi_shape,
             self.reciprocal_sampling,
@@ -573,15 +579,17 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @property
     def obj_cropped(self) -> np.ndarray:
-        cropped = self._crop_rotate_obj_fov(self.obj)
+        cropped = self._crop_rotate_obj_fov(self.obj, padding=self.obj_padding_px)
         if self.obj_type == "pure_phase":
             cropped = np.exp(1j * np.angle(cropped))
-        cropped = center_crop_arr(cropped, tuple(self.obj_shape_crop))  # sometimes 1 pixel off
         # TEMP testing for bugs
         if cropped.shape != tuple(self.obj_shape_crop):
             raise ValueError(
                 f"Object shape {cropped.shape} does not match expected shape {self.obj_shape_crop}"
             )
+        if self.obj_type in ["pure_phase", "complex"]:
+            ph = np.angle(cropped)
+            cropped = np.abs(cropped) * np.exp(1j * (ph - ph.mean()))
         return cropped
 
     @property  # FIXME depend on ptychodataset
@@ -737,7 +745,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         positions_px: np.ndarray | None = None,
         com_rotation_rad: float | None = None,
         transpose: bool | None = None,
-        padding: int = 0,
+        padding: np.ndarray | tuple[int, int] | None = None,
     ) -> np.ndarray:
         """
         Crops and rotated object to FOV bounded by current pixel positions.
@@ -747,11 +755,14 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             self.dset.com_rotation_rad if com_rotation_rad is None else com_rotation_rad
         )
         transpose = self.dset.com_transpose if transpose is None else transpose
+        padding = np.array(padding) if padding is not None else self.obj_padding_px
 
         angle = com_rotation_rad if transpose else -1 * com_rotation_rad
 
         if positions_px is None:
-            positions = self.dset.scan_positions_px.cpu().detach().numpy()
+            positions = self.dset.initial_scan_positions_px.cpu().detach().numpy()
+            # if using learned positions potentially need to pad the object in center_crop_arr
+            # positions = self.dset.scan_positions_px.cpu().detach().numpy()
         else:
             positions = positions_px
 
@@ -759,19 +770,25 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         rotated_points = tf(positions, origin=positions.mean(0))
         rotated_points += 1e-9  # avoid pixel perfect errors
 
-        min_x, min_y = np.floor(np.amin(rotated_points, axis=0) - padding).astype("int")
-        min_x = min_x if min_x > 0 else 0
-        min_y = min_y if min_y > 0 else 0
-        max_x, max_y = np.ceil(np.amax(rotated_points, axis=0) + padding).astype("int")
+        min_r, min_c = np.floor(np.min(rotated_points, axis=0)).astype("int")
+        min_r = max(min_r, 0)
+        min_c = max(min_c, 0)
+        max_r, max_c = np.ceil(np.max(rotated_points, axis=0)).astype("int")
+        max_r = min(max_r, array.shape[-2])
+        max_c = min(max_c, array.shape[-1])
+        # print(f"{min_r = }, {min_c = }, {max_r = }, {max_c = }")
 
         rotated_array = ndi.rotate(
             array, np.rad2deg(-angle), order=1, reshape=False, axes=(-2, -1)
-        )[..., min_x:max_x, min_y:max_y]
+        )[..., min_r:max_r, min_c:max_c]
 
         if transpose:
             rotated_array = rotated_array.swapaxes(-2, -1)
 
-        return rotated_array
+        # fixing that is sometimes 1 pixel off
+        cropped = center_crop_arr(rotated_array, tuple(self.obj_shape_crop), pad_if_needed=False)
+
+        return cropped
 
     def _repeat_arr(
         self, arr: "np.ndarray|torch.Tensor", repeats: int, axis: int
@@ -873,11 +890,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
         diff = preds - targets
         if "l1" in loss_type:
-            error = arr.sum(arr.abs(diff)) / (diff.shape[0] / self.dset.num_gpts)
+            error = torch.sum(torch.abs(diff)) / (diff.shape[0] / self.dset.num_gpts)
         elif "l2" in loss_type:
-            error = arr.sum(arr.abs(diff) ** 2) / (diff.shape[0] / self.dset.num_gpts)
+            error = torch.sum(torch.abs(diff) ** 2) / (diff.shape[0] / self.dset.num_gpts)
         elif loss_type == "poisson":
-            error = arr.sum(preds - targets * torch.log(preds + 1e-6))
+            error = torch.sum(preds - targets * torch.log(preds + 1e-6))
         else:
             raise ValueError(f"Unknown loss type {loss_type}, should be 'l1' or 'l2'")
         loss = error / self.dset.mean_diffraction_intensity
@@ -895,7 +912,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             overlap = obj_patches[s] * propagated_probe
             propagated_probes.append(propagated_probe)
 
-        return arr.match_device(propagated_probes, overlap), overlap  # type:ignore
+        propagated_probes = torch.stack(propagated_probes, dim=0).to(overlap.device)
+        return propagated_probes, overlap  # type:ignore
 
     def estimate_amplitudes(
         self, overlap_array: "torch.Tensor", corner_centered: bool = False

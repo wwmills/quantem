@@ -33,7 +33,7 @@ class PtychographyVisualizations(PtychographyBase):
         # else:
         #     raise ValueError(f"Unknown norm type: {norm}")
 
-        ph_cmap = config.get("viz.phase_cmap")
+        ph_cmap = kwargs.pop("cmap", config.get("viz.phase_cmap"))
         if obj.shape[0] > 1:
             t = "Summed "
         else:
@@ -73,11 +73,18 @@ class PtychographyVisualizations(PtychographyBase):
         tukey_alpha: float = 0.5,
         pad: int = 0,
         show_obj: bool = False,
+        snapshot_idx: int | None = None,
         return_fft: bool = False,
         **kwargs,
     ):
         if obj is None:
-            obj_np = self.obj_cropped.sum(0)
+            if snapshot_idx is not None:
+                obj_np = self.epoch_snapshots[snapshot_idx]["obj"]
+                obj_np = self._crop_rotate_obj_fov(obj_np).sum(0)  # type:ignore # FIXME
+                if self.obj_type == "pure_phase":
+                    obj_np = np.exp(1j * np.angle(obj_np))
+            else:
+                obj_np = self.obj_cropped.sum(0)
         else:
             obj_np = self._to_numpy(obj)
             if obj_np.ndim == 3:
@@ -108,6 +115,8 @@ class PtychographyVisualizations(PtychographyBase):
             else:  # self.obj_type == "pure_phase":
                 obj_show = np.angle(obj_pad)
             stitle = kwargs.pop("title", "")
+            if snapshot_idx is not None:
+                stitle += f" epoch {self.epoch_snapshots[snapshot_idx]['iteration']}"
             if len(stitle) > 0:
                 stitle = stitle + " "
             show_2d(
@@ -297,13 +306,17 @@ class PtychographyVisualizations(PtychographyBase):
         lw = 2
         lines = []
         epochs = np.arange(len(self.epoch_losses))
-        colors = plt.cm.Set1.colors  # type:ignore
-        colors = config.get("viz.colors.set")[1:]
+        # colors = plt.cm.Set1.colors  # type:ignore
+        colors = config.get("viz.colors.set")  # [1:]
         lines.extend(ax.semilogy(epochs, self.epoch_losses, c="k", label="loss", lw=lw))
         ax.set_ylabel("Loss", color="k")
         ax.tick_params(axis="y", which="both", colors="k")
         ax.spines["left"].set_color("k")
         ax.set_xlabel("Epochs")
+
+        # check if all lrs are constant and if so, don't plot lr
+        if all(np.all(lr == self.epoch_lrs["object"][0]) for lr in self.epoch_lrs.values()):
+            plot_lrs = False
 
         if plot_lrs and len(self.epoch_lrs) > 0:
             nx = ax.twinx()
@@ -347,8 +360,12 @@ class PtychographyVisualizations(PtychographyBase):
             labs = [lin.get_label() for lin in lines]
             nx.legend(lines, labs, loc="upper right")
         else:
-            # No learning rates to plot, just show loss
-            pass
+            # No learning rates to plot, add to title
+            # set title to each lr type
+            title = ""
+            for lr_type, lr_values in self.epoch_lrs.items():
+                title += f"{lr_type} LR: {lr_values[0]:.1e} | "
+            ax.set_title(title[:-3], fontsize=10)
 
         ax.set_xbound(-2, np.max(epochs if np.any(epochs) else [1]) + 2)
         if figax is None:
@@ -368,7 +385,7 @@ class PtychographyVisualizations(PtychographyBase):
         plt.suptitle(
             f"Final loss: {self.epoch_losses[-1]:.3e} | Epochs: {len(self.epoch_losses)}",
             fontsize=14,
-            y=0.94,
+            y=0.95,
         )
         plt.show()
 
@@ -680,7 +697,38 @@ class PtychographyVisualizations(PtychographyBase):
             **kwargs,
         )
 
-    # def show_epochs(self):
-    #     ## show the object at each .epoch_snapshots
-    #     ## options to show probe as well, defaults to just object
-    #     ## also option to not show every saved epoch, but only select ones or every nth
+    def show_scan_positions(self, plot_radii: bool = True):
+        # for each scan position, sum the intensity of self.probe at that position
+        scan_positions = self.dset.scan_positions_px.cpu().detach().numpy()
+
+        probe_params = self.probe_model.probe_params
+        probe_radius_px = None
+
+        conv_angle = probe_params.get("semiangle_cutoff")
+        defocus = probe_params.get("defocus", 0)
+        energy = probe_params.get("energy")
+
+        if conv_angle is not None and energy is not None:
+            from quantem.core.utils.utils import electron_wavelength_angstrom
+
+            wavelength = electron_wavelength_angstrom(energy)
+            conv_angle_rad = conv_angle * 1e-3
+
+            # For defocused probe: radius ≈ |defocus| * convergence_angle + diffraction_limit
+            diffraction_limit_angstrom = 0.61 * wavelength / conv_angle_rad
+            defocus_blur_angstrom = abs(defocus) * conv_angle_rad
+            probe_radius_angstrom = diffraction_limit_angstrom + defocus_blur_angstrom
+            probe_radius_px = probe_radius_angstrom / self.sampling[0]
+
+        _fig, ax = show_2d(self._get_probe_overlap(), title="probe overlap")
+        if probe_radius_px is not None and plot_radii:
+            # plot a circle with the probe radius for each probe position
+            ax.scatter(
+                scan_positions[:, 1],
+                scan_positions[:, 0],
+                s=probe_radius_px**2,
+                edgecolors="red",
+                c="none",
+                linestyle="--",
+            )
+        plt.show()
