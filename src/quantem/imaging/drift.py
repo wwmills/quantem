@@ -1,9 +1,10 @@
+import warnings
 from collections.abc import Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import warnings
+from matplotlib.ticker import FormatStrFormatter, MaxNLocator
 from numpy.typing import NDArray
 from scipy.interpolate import interp1d
 from scipy.ndimage import distance_transform_edt, gaussian_filter
@@ -11,7 +12,6 @@ from scipy.optimize import minimize
 from tqdm import tqdm
 
 from quantem.core.config import get_device
-
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.io.serialize import AutoSerialize
@@ -197,6 +197,7 @@ class DriftCorrection(AutoSerialize):
         pad_value: float | str | list[float] = "median",
         kde_sigma: float = 0.5,
         number_knots: int = 1,
+        generate_validity_mask: bool = True,
         show_merged: bool = False,
         show_images: bool = False,
         show_knots: bool = True,
@@ -210,6 +211,8 @@ class DriftCorrection(AutoSerialize):
         self._pad_value = validated_pad_value
         self.kde_sigma = kde_sigma
         self.number_knots = number_knots
+
+        self.generate_validity_mask = generate_validity_mask
 
         # Derived data
         self.scan_direction = np.deg2rad(self.scan_direction_degrees)
@@ -279,6 +282,34 @@ class DriftCorrection(AutoSerialize):
                 self.knots[ind],
             )
 
+        if self.generate_validity_mask:
+            # Precompute the validity mask interpolator for all images
+            self.validity_mask_interpolator = []
+            for a0 in range(self.shape[0]):
+                self.validity_mask_interpolator.append(
+                    DriftInterpolator(
+                        input_shape=self.images[a0].shape,
+                        output_shape=self.shape[1:],
+                        scan_fast=self.scan_fast[a0],
+                        scan_slow=self.scan_slow[a0],
+                        pad_value=0,
+                        kde_sigma=self.kde_sigma,
+                    )
+                )
+
+            # Generate the validity masks
+            self.validity_mask = []
+            for ind in range(self.shape[0]):
+                self.validity_mask.append(np.ones_like(self.images[ind].array))
+
+            # Generate initial resampled masks
+            self.validity_mask_warped = Dataset3d.from_shape(self.shape)
+            for ind in range(self.shape[0]):
+                self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
+                    self.validity_mask[ind],
+                    self.knots[ind],
+                )
+
         # Error tracking
         self.calculate_error(0)
 
@@ -325,6 +356,7 @@ class DriftCorrection(AutoSerialize):
                 np.fft.fft2(self.images_warped.array[ind]),
                 upsample_factor=upsample_factor,
                 max_shift=max_image_shift,
+                # min_shift=min_image_shift,
                 fft_input=True,
                 fft_output=True,
                 return_shifted_image=True,
@@ -354,6 +386,20 @@ class DriftCorrection(AutoSerialize):
                 self.images[ind].array,
                 self.knots[ind],
             )
+
+        if self.generate_validity_mask:
+            # Regenerate validity masks
+            for ind in range(self.shape[0]):
+                self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
+                    self.validity_mask[ind],
+                    self.knots[ind],
+                )
+
+            for ind in range(self.shape[0]):
+                plt.figure()
+                plt.imshow(self.validity_mask_warped[ind].array)
+                plt.title("Validity mask warped in align translation" + str(ind))
+                plt.axis("off")
 
         # Plots
         kwargs.pop("title", None)
@@ -456,6 +502,20 @@ class DriftCorrection(AutoSerialize):
                 self.knots[ind],
             )
 
+        if self.generate_validity_mask:
+            # Regenerate validity masks
+            for ind in range(self.shape[0]):
+                self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
+                    self.validity_mask[ind],
+                    self.knots[ind],
+                )
+
+            for ind in range(self.shape[0]):
+                plt.figure()
+                plt.imshow(self.validity_mask_warped[ind].array)
+                plt.title("Validity mask warped in align affine" + str(ind))
+                plt.axis("off")
+
         # Translation alignment
         self.align_translation(
             max_image_shift=max_image_shift,
@@ -523,6 +583,20 @@ class DriftCorrection(AutoSerialize):
                 self.knots[ind],
             )
 
+        if self.generate_validity_mask:
+            # Regenerate validity masks
+            for ind in range(self.shape[0]):
+                self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
+                    self.validity_mask[ind],
+                    self.knots[ind],
+                )
+
+            for ind in range(self.shape[0]):
+                plt.figure()
+                plt.imshow(self.validity_mask_warped[ind].array)
+                plt.title("Validity mask warped in align affine" + str(ind))
+                plt.axis("off")
+
         # Translation alignment
         self.align_translation(
             max_image_shift=max_image_shift,
@@ -534,6 +608,153 @@ class DriftCorrection(AutoSerialize):
         # Error tracking
         self.calculate_error(1)
 
+        # Plots
+        kwargs.pop("title", None)
+        if show_merged:
+            self.plot_merged_images(
+                show_knots=show_knots,
+                title="Merged: affine",
+                **kwargs,
+            )
+        if show_images:
+            self.plot_transformed_images(
+                show_knots=show_knots,
+                title=[f"Image {i}: affine" for i in range(self.shape[0])],
+                **kwargs,
+            )
+
+        return self
+
+    # Affine alignment
+    def align_affine_3(
+        self,
+        step: float = 0.01,
+        num_tests: int = 9,
+        refine: bool = True,
+        upsample_factor: int = 8,
+        max_image_shift: float | None = 32,
+        show_merged: bool = True,
+        show_images: bool = False,
+        show_knots: bool = True,
+        **kwargs,
+    ):
+        """
+        Estimate affine drift from the first 2 images.
+        """
+
+        if not hasattr(self, "knots"):
+            print("\033[91mNo knots found — running .preprocess() with default settings.\033[0m")
+            self.preprocess()
+
+        if num_tests % 2 == 0:
+            raise ValueError("num_tests should be odd.")
+
+        # Potential drift vectors
+        vec = np.arange(-(num_tests - 1) / 2, (num_tests + 1) / 2)
+        xx, yy = np.meshgrid(vec, vec, indexing="ij")
+        keep = xx**2 + yy**2 <= (num_tests / 2) ** 2
+        dxy = (
+            np.vstack(
+                (
+                    xx[keep],
+                    yy[keep],
+                )
+            ).T
+            * step
+        )
+
+        # Affine drift refinement
+        self.affine_cost_list = []
+
+        # with WorkerPool(n_jobs = 2) as pool:
+        def cost_affine(dxy):
+            def interpolate_one_image(image_index):
+                knot = self.knots[image_index].copy()
+                u = np.arange(knot.shape[1]) - (knot.shape[1] - 1) / 2
+                knot[0] += dxy[0] * u[:, None]
+                knot[1] += dxy[1] * u[:, None]
+                im0, w0 = self.interpolator[image_index].warp_image(
+                    self.images[image_index].array,
+                    knot,
+                )
+                return im0
+
+            # mpire_result = pool.map(interpolate_one_image, [0,1])
+            # im0, im1 = mpire_result[:self.shape[1],:], mpire_result[self.shape[1]:,:]
+            im0 = interpolate_one_image(0)
+            im1 = interpolate_one_image(1)
+            shifts, image_shift = cross_correlation_shift(
+                im0,
+                im1,
+                upsample_factor=upsample_factor,
+                fft_input=False,
+                fft_output=False,
+                return_shifted_image=True,
+                max_shift=max_image_shift,
+            )
+            affine_cost = np.mean(np.abs(im0 - image_shift))
+            self.affine_cost_list.append(affine_cost)
+            return affine_cost
+
+        import time
+
+        tic = time.time()
+        optimization_result = minimize(
+            cost_affine,
+            x0=[0.0, 0.0],
+            method="Powell",
+            options={
+                "maxiter": 50,
+                "maxfev": 100,
+                "xtol": 1e-3,
+                "ftol": 1e-3,
+            },
+        )
+        toc = time.time()
+        print(f"Affine elapsed time: {toc - tic:.3f} seconds")
+        if not optimization_result.success:
+            raise RuntimeError(f"Affine optimization failed: {optimization_result.message}")
+        dxy = optimization_result.x
+        print("Affine dxy:", dxy)
+        # update all knots
+        for a0 in range(self.shape[0]):
+            u = np.arange(self.knots[a0].shape[1]) - (self.knots[a0].shape[1] - 1) / 2
+            self.knots[a0][0] += dxy[0] * u[:, None]
+            self.knots[a0][1] += dxy[1] * u[:, None]
+
+        # Regenerate images
+        for ind in range(self.shape[0]):
+            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
+                ind
+            ].warp_image(
+                self.images[ind].array,
+                self.knots[ind],
+            )
+
+        if self.generate_validity_mask:
+            # Regenerate validity masks
+            for ind in range(self.shape[0]):
+                self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
+                    self.validity_mask[ind],
+                    self.knots[ind],
+                )
+
+            for ind in range(self.shape[0]):
+                plt.figure()
+                plt.imshow(self.validity_mask_warped[ind].array)
+                plt.title("Validity mask warped in align affine 3" + str(ind))
+                plt.axis("off")
+
+        # Translation alignment
+        self.align_translation(
+            max_image_shift=max_image_shift,
+            show_images=False,
+            show_merged=False,
+            show_knots=False,
+        )
+
+        # Error tracking
+        self.calculate_error(1)
         # Plots
         kwargs.pop("title", None)
         if show_merged:
@@ -569,6 +790,9 @@ class DriftCorrection(AutoSerialize):
         regularization_poly_order: int = 1,
         regularization_max_image_shift_px: float | None = None,
         solve_individual_rows: bool = True,
+        carpet_unwrinkling: bool = True,
+        alpha: float = 0.4,
+        running_average_regularizer: float = 1,
         # Display parameters
         show_merged: bool = True,
         show_images: bool = False,
@@ -614,6 +838,18 @@ class DriftCorrection(AutoSerialize):
             Maximum allowed shift per iteration.
         solve_individual_rows : bool, default True
             If True, optimize each row independently.
+        carpet_unwrinkling: bool, default False
+            If True, optimize each row independently, starting from the
+            middle and moving outwards. The shifts found for previous rows
+            influence the starting guess of the optimizer on subsequent rows.
+        alpha: float, default 0.4
+            Only used if carpet_unwrinkling is True. In an exponential moving
+            average (ema), the weight given to the previous datum:
+            ema_shift = alpha * prev_shift + (1-alpha) * ema_shift
+        running_average_regularizer: float, default 1
+            Only used if carpet_unwrinkling is True. The coefficient that controls
+            how much of the ema update is applied to the initial guess. Nominally
+            this should be one, but lowering this value will improve stability.
 
         Display Parameters
         ------------------
@@ -635,21 +871,32 @@ class DriftCorrection(AutoSerialize):
                 # Optimize knots
                 if backend == "pytorch":
                     knots_updated = self._optimize_knots_pytorch(
-                        ind, image_ref, knots_init, adam_steps=adam_steps, lr=lr)
+                        ind, image_ref, knots_init, adam_steps=adam_steps, lr=lr
+                    )
                 else:
                     knots_updated = self._optimize_knots_scipy(
-                        ind, image_ref, knots_init,
+                        ind,
+                        image_ref,
+                        knots_init,
                         max_optimize_iterations=max_optimize_iterations,
-                        solve_individual_rows=solve_individual_rows)
+                        solve_individual_rows=solve_individual_rows,
+                        carpet_unwrinkling=carpet_unwrinkling,
+                        alpha=alpha,
+                        running_average_regularizer=running_average_regularizer,
+                    )
                 # Max shift regularization
                 if regularization_max_image_shift_px is not None:
                     knots_shift = knots_updated - self.knots[ind]
                     knots_dist = np.sqrt(np.sum(knots_shift**2, axis=0))
                     sub = knots_dist > regularization_max_image_shift_px
-                    knots_updated[0][sub] = (self.knots[ind][0][sub]
-                        + knots_shift[0][sub] * regularization_max_image_shift_px / knots_dist[sub])
-                    knots_updated[1][sub] = (self.knots[ind][1][sub]
-                        + knots_shift[1][sub] * regularization_max_image_shift_px / knots_dist[sub])
+                    knots_updated[0][sub] = (
+                        self.knots[ind][0][sub]
+                        + knots_shift[0][sub] * regularization_max_image_shift_px / knots_dist[sub]
+                    )
+                    knots_updated[1][sub] = (
+                        self.knots[ind][1][sub]
+                        + knots_shift[1][sub] * regularization_max_image_shift_px / knots_dist[sub]
+                    )
                 # Smoothness regularization
                 if regularization_sigma_px is not None and regularization_sigma_px > 0:
                     knots_smoothed = knots_updated.copy()
@@ -660,22 +907,44 @@ class DriftCorrection(AutoSerialize):
                             coefs = np.polyfit(x, y, deg=regularization_poly_order)
                             trend = np.polyval(coefs, x)
                             residual = y - trend
-                            residual_smooth = gaussian_filter(residual, sigma=regularization_sigma_px)
+                            residual_smooth = gaussian_filter(
+                                residual, sigma=regularization_sigma_px
+                            )
                             knots_smoothed[dim, :, knot_ind] = residual_smooth + trend
                     knots_updated = knots_smoothed
                 # Step size
                 if regularization_update_step_size is not None:
-                    knots_updated = (self.knots[ind]
-                        + (knots_updated - self.knots[ind]) * regularization_update_step_size)
+                    knots_updated = (
+                        self.knots[ind]
+                        + (knots_updated - self.knots[ind]) * regularization_update_step_size
+                    )
                 self.knots[ind] = knots_updated
             # Update warped images
             for ind in range(self.shape[0]):
-                self.images_warped.array[ind], self.weights_warped.array[ind] = (
-                    self.interpolator[ind].warp_image(self.images[ind].array, self.knots[ind]))
+                self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
+                    ind
+                ].warp_image(self.images[ind].array, self.knots[ind])
+            if self.generate_validity_mask:
+                # Regenerate validity masks
+                for ind in range(self.shape[0]):
+                    self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
+                        self.validity_mask[ind],
+                        self.knots[ind],
+                    )
+
+                for ind in range(self.shape[0]):
+                    plt.figure()
+                    plt.imshow(self.validity_mask_warped[ind].array)
+                    plt.title("Validity mask warped in align nonrigid" + str(ind))
+                    plt.axis("off")
             # Translation alignment
             self.align_translation(
-                min_image_shift=min_image_shift, max_image_shift=max_image_shift,
-                show_images=False, show_merged=False, show_knots=False)
+                min_image_shift=min_image_shift,
+                max_image_shift=max_image_shift,
+                show_images=False,
+                show_merged=False,
+                show_knots=False,
+            )
             self.calculate_error(2)
 
         if show_merged:
@@ -695,15 +964,23 @@ class DriftCorrection(AutoSerialize):
         return self
 
     def _optimize_knots_pytorch(
-        self, idx: int, image_ref: np.ndarray, knots_init: np.ndarray,
-        adam_steps: int = 5, lr: float = 0.02,
+        self,
+        idx: int,
+        image_ref: np.ndarray,
+        knots_init: np.ndarray,
+        adam_steps: int = 5,
+        lr: float = 0.02,
     ) -> np.ndarray:
-        """PyTorch Adam batched optimization for one image (single knot only)."""
+        """
+        PyTorch Adam batched optimization for one image (single knot only).
+        For parameter descriptions, see align_nonrigid.
+        """
         # TODO: support multiple knots (requires differentiable spline interpolation)
         if knots_init.shape[2] != 1:
             raise NotImplementedError(
                 f"PyTorch backend only supports single knot (got {knots_init.shape[2]}). "
-                "Use backend='scipy' for multiple knots.")
+                "Use backend='scipy' for multiple knots."
+            )
         device = get_device()
         H, W = self.images[idx].array.shape
         # Convert to tensors
@@ -714,7 +991,9 @@ class DriftCorrection(AutoSerialize):
         scale_x = scan_fast[0] * (H - 1)
         scale_y = scan_fast[1] * (W - 1)
         # Initialize knots as trainable tensor: shape (2, num_rows)
-        knots = torch.tensor(knots_init[:, :, 0], dtype=torch.float32, device=device, requires_grad=True)
+        knots = torch.tensor(
+            knots_init[:, :, 0], dtype=torch.float32, device=device, requires_grad=True
+        )
         optimizer = torch.optim.Adam([knots], lr=lr)
         # Adam optimization (batched over all rows)
         for _ in range(adam_steps):
@@ -725,56 +1004,154 @@ class DriftCorrection(AutoSerialize):
             # Bilinear interpolation (boundary clamp critical for lower RMSE than scipy's L-BFGS)
             xa_c = xa.clamp(0, H - 1.001)
             ya_c = ya.clamp(0, W - 1.001)
-            # Guarantee xf+1 ≤ H-1 
+            # Guarantee xf+1 ≤ H-1
             xf = xa_c.floor().long().clamp(0, H - 2)
             yf = ya_c.floor().long().clamp(0, W - 2)
             dx, dy = xa_c - xf.float(), ya_c - yf.float()
-            warped = (ref_image[xf, yf] * (1 - dx) * (1 - dy)
-                      + ref_image[xf + 1, yf] * dx * (1 - dy)
-                      + ref_image[xf, yf + 1] * (1 - dx) * dy
-                      + ref_image[xf + 1, yf + 1] * dx * dy)
+            warped = (
+                ref_image[xf, yf] * (1 - dx) * (1 - dy)
+                + ref_image[xf + 1, yf] * dx * (1 - dy)
+                + ref_image[xf, yf + 1] * (1 - dx) * dy
+                + ref_image[xf + 1, yf + 1] * dx * dy
+            )
             loss = ((warped - target_image) ** 2).mean()
             loss.backward()
             optimizer.step()
         return knots.detach().cpu().numpy()[:, :, None]
 
     def _optimize_knots_scipy(
-        self, idx: int, image_ref: np.ndarray, knots_init: np.ndarray,
-        max_optimize_iterations: int = 10, solve_individual_rows: bool = True,
+        self,
+        idx: int,
+        image_ref: np.ndarray,
+        knots_init: np.ndarray,
+        max_optimize_iterations: int = 10,
+        solve_individual_rows: bool = True,
+        carpet_unwrinkling: bool = True,
+        alpha: float = 0.4,
+        running_average_regularizer: float = 1,
     ) -> np.ndarray:
-        """SciPy L-BFGS optimization for one image."""
+        """
+        SciPy L-BFGS optimization for one image.
+        For parameter descriptions, see align_nonrigid.
+        """
         shape_knots = knots_init.shape
+        H, W = self.shape[1], self.shape[2]
         options = {"maxiter": max_optimize_iterations} if max_optimize_iterations else {}
+
+        # def exponential_moving_average(prev_ema, x, alpha=0.4):
+        #     if prev_ema is None:
+        #         return alpha * x
+        #     return alpha * x + (1 - alpha) * prev_ema
+        def exponential_moving_average(prev_ema, x, t, alpha=0.4):
+            if prev_ema is None:
+                prev_ema = 0
+            ema = alpha * x + (1 - alpha) * prev_ema
+            ema_hat = ema / (1 - (1 - alpha) ** (t + 1))
+            return ema_hat
+
         if solve_individual_rows:
-            knots_updated = np.zeros_like(knots_init)
+            if carpet_unwrinkling:
+                prev_prev_row_ind = knots_init.shape[1] // 2 + ((0 + 1) // 2)
+                prev_row_ind = knots_init.shape[1] // 2 + ((0 + 1) // 2)
+                pm_row_ind = 1
+                knots_updated = knots_init.copy()  # new
+                running_average_left = None
+                running_average_right = None
+                t_left = 0
+                t_right = 0
+            else:
+                knots_updated = np.zeros_like(knots_init)  # old
             for row_ind in range(knots_init.shape[1]):
+                if carpet_unwrinkling:
+                    row_ind_carpet = knots_init.shape[1] // 2 + ((row_ind + 1) // 2) * pm_row_ind
+                    pm_row_ind *= -1
+                    row_ind = row_ind_carpet
+                    # handle mismatches:
+                    if row_ind < 0:
+                        row_ind = knots_init.shape[1]
+                    if row_ind > knots_init.shape[1]:
+                        row_ind = 0
                 x0 = knots_init[:, row_ind, :].ravel()
+
                 def cost_function(x):
                     knots_row = x.reshape(shape_knots[0], shape_knots[2])
                     xa, ya = self.interpolator[idx].transform_rows(knots_row)
-                    xf = np.clip(np.floor(xa).astype(int), 0, self.shape[1] - 2)
-                    yf = np.clip(np.floor(ya).astype(int), 0, self.shape[2] - 2)
-                    dx, dy = xa - xf, ya - yf
-                    warped = (image_ref[xf, yf] * (1 - dx) * (1 - dy)
-                              + image_ref[xf + 1, yf] * dx * (1 - dy)
-                              + image_ref[xf, yf + 1] * (1 - dx) * dy
-                              + image_ref[xf + 1, yf + 1] * dx * dy)
+                    xa_c = np.clip(xa, 0, H - 1.001)
+                    ya_c = np.clip(ya, 0, W - 1.001)
+                    xf = np.floor(xa_c).astype(int)
+                    yf = np.floor(ya_c).astype(int)
+                    dx = xa_c - xf
+                    dy = ya_c - yf
+                    # old implementation
+                    # xf = np.clip(np.floor(xa).astype(int), 0, self.shape[1] - 2)
+                    # yf = np.clip(np.floor(ya).astype(int), 0, self.shape[2] - 2)
+                    # dx, dy = xa - xf, ya - yf
+                    warped = (
+                        image_ref[xf, yf] * (1 - dx) * (1 - dy)
+                        + image_ref[xf + 1, yf] * dx * (1 - dy)
+                        + image_ref[xf, yf + 1] * (1 - dx) * dy
+                        + image_ref[xf + 1, yf + 1] * dx * dy
+                    )
                     return np.sum((warped - self.images[idx].array[row_ind, :]) ** 2)
+
+                if carpet_unwrinkling:
+                    delta = (
+                        knots_updated[:, prev_prev_row_ind, :]
+                        - knots_init[:, prev_prev_row_ind, :]
+                    )
+                    if pm_row_ind == -1:
+                        running_average_left = exponential_moving_average(
+                            running_average_left, delta, t_left, alpha=alpha
+                        )
+                        t_left += 1
+                        x0 = (running_average_left) * running_average_regularizer + knots_init[
+                            :, row_ind, :
+                        ]
+                    if pm_row_ind == 1:
+                        running_average_right = exponential_moving_average(
+                            running_average_right, delta, t_right, alpha=alpha
+                        )
+                        t_right += 1
+                        x0 = (running_average_right) * running_average_regularizer + knots_init[
+                            :, row_ind, :
+                        ]
+                    # x0 = (knots_updated[:, prev_prev_row_ind, :] - knots_init[:, prev_prev_row_ind, :]) + knots_init[:, row_ind, :] - knots_updated[:, prev_prev_row_ind, :]
+                    # running_average_left = (running_average_left + knots_updated[:, prev_prev_row_ind, :] - knots_init[:, prev_prev_row_ind, :])/2
+                    # running_average_right = (running_average_right + knots_updated[:, prev_prev_row_ind, :] - knots_init[:, prev_prev_row_ind, :])/2
+                    # x0 = (knots_updated[:, prev_prev_row_ind, :] - knots_init[:, prev_prev_row_ind, :]) * 2 + knots_init[:, row_ind, :] # colin's suggestion for the unrolling
+                    # x0 = (knots_updated[:, prev_prev_row_ind, :] - knots_init[:, prev_prev_row_ind, :])*0.7 + knots_init[:, row_ind, :] # my current working method, overwrites the
+                    x0 = x0.ravel()
+                else:
+                    x0 = knots_init[:, row_ind, :].ravel()
                 result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
                 knots_updated[:, row_ind, :] = result.x.reshape((2, -1))
+                if carpet_unwrinkling:
+                    prev_prev_row_ind = prev_row_ind
+                    prev_row_ind = row_ind
         else:
             x0 = knots_init.ravel()
+
             def cost_function(x):
                 knots = x.reshape(shape_knots)
                 xa, ya = self.interpolator[idx].transform_coordinates(knots)
-                xf = np.clip(np.floor(xa).astype(int), 0, self.shape[1] - 2)
-                yf = np.clip(np.floor(ya).astype(int), 0, self.shape[2] - 2)
-                dx, dy = xa - xf, ya - yf
-                warped = (image_ref[xf, yf] * (1 - dx) * (1 - dy)
-                          + image_ref[xf + 1, yf] * dx * (1 - dy)
-                          + image_ref[xf, yf + 1] * (1 - dx) * dy
-                          + image_ref[xf + 1, yf + 1] * dx * dy)
+                xa_c = np.clip(xa, 0, H - 1.001)
+                ya_c = np.clip(ya, 0, W - 1.001)
+                xf = np.floor(xa_c).astype(int)
+                yf = np.floor(ya_c).astype(int)
+                dx = xa_c - xf
+                dy = ya_c - yf
+                # old implementation
+                # xf = np.clip(np.floor(xa).astype(int), 0, self.shape[1] - 2)
+                # yf = np.clip(np.floor(ya).astype(int), 0, self.shape[2] - 2)
+                # dx, dy = xa - xf, ya - yf
+                warped = (
+                    image_ref[xf, yf] * (1 - dx) * (1 - dy)
+                    + image_ref[xf + 1, yf] * dx * (1 - dy)
+                    + image_ref[xf, yf + 1] * (1 - dx) * dy
+                    + image_ref[xf + 1, yf + 1] * dx * dy
+                )
                 return np.sum((warped - self.images[idx].array) ** 2)
+
             result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
             knots_updated = result.x.reshape(shape_knots)
         return knots_updated
@@ -865,6 +1242,25 @@ class DriftCorrection(AutoSerialize):
                 upsample_factor=upsample_factor,
             )
 
+        if self.generate_validity_mask:
+            # Regenerate validity masks
+            for ind in range(self.shape[0]):
+                self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
+                    self.validity_mask[ind],
+                    self.knots[ind],
+                )
+
+            for ind in range(self.shape[0]):
+                plt.figure()
+                plt.imshow(self.validity_mask_warped[ind].array)
+                plt.title("Validity mask warped in generate corrected image" + str(ind))
+                plt.axis("off")
+
+            plt.figure()
+            plt.imshow(self.validity_mask_warped[0].array + self.validity_mask_warped[1].array)
+            plt.axis("off")
+            plt.title("Validity mask warped sum in generate corrected image" + str(ind))
+
         if fourier_filter:
             # Apply fourier filtering
             kx = np.fft.fftfreq(stack_corr.shape[1])[:, None]
@@ -932,6 +1328,11 @@ class DriftCorrection(AutoSerialize):
             image_corr_fft = np.fft.fft2(
                 np.fft.ifft2(image_corr_fft) * mask + pad_value_mean * (1 - mask)
             )
+
+            plt.figure()
+            plt.imshow(mask)
+            plt.title("mask_output")
+            plt.axis("off")
 
         if output_original_shape:
             image_corr_fft = fourier_cropping(image_corr_fft, self.shape[-2:]) / upsample_factor**2
@@ -1008,8 +1409,6 @@ class DriftCorrection(AutoSerialize):
         sub = np.abs(self.error_track[:, 0] - 2) < 0.1
         error = self.error_track[:, 1]
         it = np.arange(error.shape[0])
-
-        from matplotlib.ticker import FormatStrFormatter, MaxNLocator
 
         fig, ax = plt.subplots(1, 2, figsize=figsize)
         color = (1, 0, 0)  # red
