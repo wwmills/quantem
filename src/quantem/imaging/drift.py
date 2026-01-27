@@ -198,6 +198,7 @@ class DriftCorrection(AutoSerialize):
         kde_sigma: float = 0.5,
         number_knots: int = 1,
         generate_validity_mask: bool = True,
+        mask_edge_dist: int | None = 8,
         show_merged: bool = False,
         show_images: bool = False,
         show_knots: bool = True,
@@ -213,6 +214,7 @@ class DriftCorrection(AutoSerialize):
         self.number_knots = number_knots
 
         self.generate_validity_mask = generate_validity_mask
+        self.mask_edge_dist = mask_edge_dist
 
         # Derived data
         self.scan_direction = np.deg2rad(self.scan_direction_degrees)
@@ -425,6 +427,8 @@ class DriftCorrection(AutoSerialize):
         show_knots: bool = True,
         return_images_warped=False,
         return_images_shift=False,
+        generate_validity_mask: bool | None = None,
+        mask_edge_dist: bool = 8.0,
         **kwargs,
     ):
         """
@@ -437,27 +441,65 @@ class DriftCorrection(AutoSerialize):
 
         # init
         dxy = np.zeros((self.shape[0], 2))
+        if generate_validity_mask is None:
+            generate_validity_mask = self.generate_validity_mask
+        if self.generate_validity_mask:
+            # Regenerate validity masks
+            if mask_edge_dist is None:
+                mask_edge_dist = self.mask_edge_dist
+            for ind in range(self.shape[0]):
+                self.validity_mask_warped.array[ind], _ = self.validity_mask_interpolator[
+                    ind
+                ].warp_image(
+                    self.validity_mask[ind],
+                    self.knots[ind],
+                )
+                # Set outermost pixels to False to define the boundary for edge blending
+                bool_validity_mask = self.validity_mask_warped.array[ind].astype(bool)
+                bool_validity_mask[:, 0] = False
+                bool_validity_mask[:, -1] = False
+                bool_validity_mask[0, :] = False
+                bool_validity_mask[-1, :] = False
+                # Find inner boundary mask
+                if mask_edge_dist is None:
+                    mask_inner = distance_transform_edt(bool_validity_mask)
+                    mask = np.sin(0.5 * np.pi * mask_inner / mask_inner.max()) ** 2
+                else:
+                    mask_inner = distance_transform_edt(bool_validity_mask) > mask_edge_dist
+                    mask = (
+                        np.sin(
+                            0.5
+                            * np.pi
+                            * np.clip(
+                                distance_transform_edt(mask_inner) / mask_edge_dist, 0.0, 1.0
+                            )
+                        )
+                        ** 2
+                    )
+                im_mean = np.sum(self.images_warped.array[ind] * mask) / np.sum(mask)
+                self.images_warped.array[ind] = (self.images_warped.array[ind] - im_mean) * mask
 
         # loop over images
         # crop and pad images warped
         # im_w_0_original = self.images_warped.array[0].copy()
 
-        buff_r = (
-            int(
-                int(np.round(self.images[0].shape[0] * (1 + self.pad_fraction) / 2) * 2)
-                - self.images[0].shape[0]
-            )
-            // 2
-        )
-        buff_c = (
-            int(
-                int(np.round(self.images[1].shape[1] * (1 + self.pad_fraction) / 2) * 2)
-                - self.images[0].shape[0]
-            )
-            // 2
-        )
-        self.buff_r = buff_r
-        self.buff_c = buff_c
+        # buff_r = (
+        #     int(
+        #         int(np.round(self.images[0].shape[0] * (1 + self.pad_fraction) / 2) * 2)
+        #         - self.images[0].shape[0]
+        #     )
+        #     // 2
+        # )
+        # buff_c = (
+        #     int(
+        #         int(np.round(self.images[1].shape[1] * (1 + self.pad_fraction) / 2) * 2)
+        #         - self.images[0].shape[0]
+        #     )
+        #     // 2
+        # )
+        # self.buff_r = buff_r
+        # self.buff_c = buff_c
+
         # print('buff_r:',buff_r)
         # print('buff_c:',buff_c)
         # buff = self.images_warped.array[0].shape[0]//8
@@ -469,16 +511,16 @@ class DriftCorrection(AutoSerialize):
         # padded_1 = np.pad(cropped_1, ((buff_r, buff_r), (buff_c, buff_c)), mode = 'constant', constant_values=np.median(cropped_1))
         # self.images_warped.array[1] = padded_1
 
-        for a0 in range(self.shape[0]):
-            cropped = self.images_warped.array[a0].copy()[buff_r:-buff_r, buff_c:-buff_c]
-            padded = np.pad(
-                cropped,
-                ((buff_r, buff_r), (buff_c, buff_c)),
-                mode="constant",
-                constant_values=np.median(cropped),
-            )
-            self.images_warped.array[a0] = padded
-            self.interpolator[a0].set_pad_value(np.median(cropped))
+        # for a0 in range(self.shape[0]):
+        #     cropped = self.images_warped.array[a0].copy()[buff_r:-buff_r, buff_c:-buff_c]
+        #     padded = np.pad(
+        #         cropped,
+        #         ((buff_r, buff_r), (buff_c, buff_c)),
+        #         mode="constant",
+        #         constant_values=np.median(cropped),
+        #     )
+        #     self.images_warped.array[a0] = padded
+        #     self.interpolator[a0].set_pad_value(np.median(cropped))
 
         # plt.figure(figsize = (15,5), dpi = 300)
         # plt.subplot(131)
@@ -592,6 +634,8 @@ class DriftCorrection(AutoSerialize):
         show_merged: bool = True,
         show_images: bool = False,
         show_knots: bool = True,
+        generate_validity_mask: bool | None = None,
+        mask_edge_dist: float | None = None,
         **kwargs,
     ):
         """
@@ -642,6 +686,47 @@ class DriftCorrection(AutoSerialize):
                 knot_1,
             )
             # Cross correlation alignment
+
+            if generate_validity_mask is None:
+                generate_validity_mask = self.generate_validity_mask
+            if generate_validity_mask:
+                images = [im0, im1]
+                # Regenerate validity masks
+                if mask_edge_dist is None:
+                    mask_edge_dist = self.mask_edge_dist
+                for ind in range(self.shape[0]):
+                    self.validity_mask_warped.array[ind], _ = self.validity_mask_interpolator[
+                        ind
+                    ].warp_image(
+                        self.validity_mask[ind],
+                        self.knots[ind],
+                    )
+                    # Set outermost pixels to False to define the boundary for edge blending
+                    bool_validity_mask = self.validity_mask_warped.array[ind].astype(bool)
+                    bool_validity_mask[:, 0] = False
+                    bool_validity_mask[:, -1] = False
+                    bool_validity_mask[0, :] = False
+                    bool_validity_mask[-1, :] = False
+                    # Find inner boundary mask
+                    if mask_edge_dist is None:
+                        mask_inner = distance_transform_edt(bool_validity_mask)
+                        mask = np.sin(0.5 * np.pi * mask_inner / mask_inner.max()) ** 2
+                    else:
+                        mask_inner = distance_transform_edt(bool_validity_mask) > mask_edge_dist
+                        mask = (
+                            np.sin(
+                                0.5
+                                * np.pi
+                                * np.clip(
+                                    distance_transform_edt(mask_inner) / mask_edge_dist, 0.0, 1.0
+                                )
+                            )
+                            ** 2
+                        )
+                    im_mean = np.sum(images[ind] * mask) / np.sum(mask)
+                    images[ind] = (images[ind] - im_mean) * mask
+                im0, im1 = images
+
             shifts, image_shift = cross_correlation_shift(
                 im0,
                 im1,
@@ -723,6 +808,47 @@ class DriftCorrection(AutoSerialize):
                     knot_1,
                 )
                 # Cross correlation alignment
+
+                if generate_validity_mask:
+                    # Regenerate validity masks
+                    images = [im0, im1]
+                    for ind in range(self.shape[0]):
+                        self.validity_mask_warped.array[ind], _ = self.validity_mask_interpolator[
+                            ind
+                        ].warp_image(
+                            self.validity_mask[ind],
+                            self.knots[ind],
+                        )
+                        # Set outermost pixels to False to define the boundary for edge blending
+                        bool_validity_mask = self.validity_mask_warped.array[ind].astype(bool)
+                        bool_validity_mask[:, 0] = False
+                        bool_validity_mask[:, -1] = False
+                        bool_validity_mask[0, :] = False
+                        bool_validity_mask[-1, :] = False
+                        # Find inner boundary mask
+                        if mask_edge_dist is None:
+                            mask_inner = distance_transform_edt(bool_validity_mask)
+                            mask = np.sin(0.5 * np.pi * mask_inner / mask_inner.max()) ** 2
+                        else:
+                            mask_inner = (
+                                distance_transform_edt(bool_validity_mask) > mask_edge_dist
+                            )
+                            mask = (
+                                np.sin(
+                                    0.5
+                                    * np.pi
+                                    * np.clip(
+                                        distance_transform_edt(mask_inner) / mask_edge_dist,
+                                        0.0,
+                                        1.0,
+                                    )
+                                )
+                                ** 2
+                            )
+                        im_mean = np.sum(images[ind] * mask) / np.sum(mask)
+                        images[ind] = (images[ind] - im_mean) * mask
+                    im0, im1 = images
+
                 shifts, image_shift = cross_correlation_shift(
                     im0,
                     im1,
@@ -959,7 +1085,7 @@ class DriftCorrection(AutoSerialize):
         solve_individual_rows: bool = True,
         carpet_unwrinkling: bool = True,
         alpha: float = 0.4,
-        running_average_regularizer: float = 1,
+        running_average_regularizer: float = 0.8,
         # Display parameters
         show_merged: bool = True,
         show_images: bool = False,
@@ -1333,6 +1459,7 @@ class DriftCorrection(AutoSerialize):
         filter_midpoint: float = 0.5,
         kde_sigma: float = 0.5,
         weight_thresh=0.1,
+        return_validity_mask: bool = False,
         show_image: bool = True,
         **kwargs,
     ):
@@ -1463,7 +1590,7 @@ class DriftCorrection(AutoSerialize):
         else:
             image_corr_fft = np.fft.fft2(np.mean(stack_corr, axis=0))
 
-        if mask_output:
+        if mask_output or return_validity_mask:
             # Note that we compute 2 boolean masks to round off the corners of image blending
 
             # calculate mask from product of individual image masks
@@ -1503,6 +1630,11 @@ class DriftCorrection(AutoSerialize):
 
         if output_original_shape:
             image_corr_fft = fourier_cropping(image_corr_fft, self.shape[-2:]) / upsample_factor**2
+            mask = np.real(
+                np.fft.ifft2(
+                    fourier_cropping(np.fft.fft2(mask), self.shape[-2:]) / upsample_factor**2
+                )
+            )
 
         # TODO - adjust origin / sampling if output sampling is different from input
         # i.e. if output_original_shape is False, and upsample_factor > 1
@@ -1530,6 +1662,9 @@ class DriftCorrection(AutoSerialize):
 
         # if show_image:
         #     fig, ax = image_corr.show(**kwargs)
+
+        if return_validity_mask:
+            return image_corr, mask
 
         return image_corr
 
