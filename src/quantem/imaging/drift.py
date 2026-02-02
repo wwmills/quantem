@@ -981,6 +981,10 @@ class DriftCorrection(AutoSerialize):
                 mask_edge_dist=mask_edge_dist,
             )
 
+        print("=" * 90)
+        print(backend + ", dxy_opt = " + str(dxy_opt))
+        print("=" * 90)
+
         for a0 in range(self.shape[0]):
             u = np.arange(self.knots[a0].shape[1]) - (self.knots[a0].shape[1] - 1) / 2
             self.knots[a0][0] += dxy_opt[0] * u[:, None]
@@ -1155,7 +1159,6 @@ class DriftCorrection(AutoSerialize):
 
             # Backward pass
             loss.backward()
-            print("dxy grad:", dxy_opt.grad)
             # Gradient step
             optimizer.step()
 
@@ -1264,43 +1267,50 @@ class DriftCorrection(AutoSerialize):
             )
             cost[a0] = np.mean(np.abs(im0 - image_shift))
 
+        fig, ax = plt.subplots()
+        ax.scatter(dxy[:, 1], dxy[:, 0], c=cost, marker="s", s=500)
+        ax.set_aspect("equal")
+
         # update all knots
         ind = np.argmin(cost)
-        for a0 in range(self.shape[0]):
-            u = np.arange(self.knots[a0].shape[1]) - (self.knots[a0].shape[1] - 1) / 2
-            self.knots[a0][0] += dxy[ind, 0] * u[:, None]
-            self.knots[a0][1] += dxy[ind, 1] * u[:, None]
 
-        # Regenerate images
-        for ind in range(self.shape[0]):
-            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
-                ind
-            ].warp_image(
-                self.images[ind].array,
-                self.knots[ind],
-            )
+        if refine:
+            affine_grid_initial_sol = dxy[ind].copy()
+            print("affine grid init sol:", str(affine_grid_initial_sol))
+            for a0 in range(self.shape[0]):
+                u = np.arange(self.knots[a0].shape[1]) - (self.knots[a0].shape[1] - 1) / 2
+                self.knots[a0][0] += dxy[ind, 0] * u[:, None]
+                self.knots[a0][1] += dxy[ind, 1] * u[:, None]
 
-        if self.generate_validity_mask:
-            # Regenerate validity masks
+            # Regenerate images
             for ind in range(self.shape[0]):
-                self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
-                    self.validity_mask[ind],
+                self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
+                    ind
+                ].warp_image(
+                    self.images[ind].array,
                     self.knots[ind],
                 )
 
-        # Translation alignment
-        self.align_translation(
-            max_image_shift=max_image_shift,
-            show_images=False,
-            show_merged=False,
-            show_knots=False,
-        )
+            if self.generate_validity_mask:
+                # Regenerate validity masks
+                for ind in range(self.shape[0]):
+                    self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
+                        self.validity_mask[ind],
+                        self.knots[ind],
+                    )
 
-        # Error tracking
-        self.calculate_error(1)
+            # Translation alignment
+            self.align_translation(
+                max_image_shift=max_image_shift,
+                show_images=False,
+                show_merged=False,
+                show_knots=False,
+            )
 
-        # Affine drift refinement
-        if refine:
+            # Error tracking
+            self.calculate_error(1)
+
+            # Affine drift refinement
             # Potential drift vectors
             dxy /= num_tests - 1
 
@@ -1380,9 +1390,15 @@ class DriftCorrection(AutoSerialize):
                 )
                 cost[a0] = np.mean(np.abs(im0 - image_shift))
 
-            # update all knots
             ind = np.argmin(cost)
-        return dxy[ind]
+            print("=" * 90)
+            print("Affine grid init solution:", str(affine_grid_initial_sol))
+            print("Affine grid refine solution:", str(dxy[ind]))
+            print("=" * 90)
+            return dxy[ind]
+
+        else:
+            return dxy[ind]
 
     # Affine alignment
     def _optimize_affine_scipy(
@@ -1482,8 +1498,6 @@ class DriftCorrection(AutoSerialize):
             method="L-BFGS-B",
             options={
                 "maxiter": 50,
-                "maxfev": 100,
-                "xtol": 1e-3,
                 "ftol": 1e-3,
             },
         )
