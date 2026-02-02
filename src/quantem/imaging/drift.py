@@ -1,6 +1,7 @@
 import warnings
 from collections.abc import Sequence
 
+import kornia as K
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -21,7 +22,9 @@ from quantem.core.utils.compound_validators import (
 )
 from quantem.core.utils.imaging_utils import (
     bilinear_kde,
+    bilinear_kde_torch,
     cross_correlation_shift,
+    cross_correlation_shift_torch,
     fourier_cropping,
 )
 from quantem.core.utils.validators import ensure_valid_array
@@ -441,19 +444,500 @@ class DriftCorrection(AutoSerialize):
 
         return self
 
+    # # Affine alignment
+    # def align_affine(
+    #     self,
+    #     step: float = 0.01,
+    #     num_tests: int = 9,
+    #     refine: bool = True,
+    #     upsample_factor: int = 8,
+    #     max_image_shift: float | None = 32,
+    #     show_merged: bool = True,
+    #     show_images: bool = False,
+    #     show_knots: bool = True,
+    #     generate_validity_mask: bool | None = None,
+    #     mask_edge_dist: float | None = None,
+    #     **kwargs,
+    # ):
+    #     """
+    #     Estimate affine drift from the first 2 images.
+    #     """
+
+    #     if not hasattr(self, "knots"):
+    #         print("\033[91mNo knots found — running .preprocess() with default settings.\033[0m")
+    #         self.preprocess()
+
+    #     if num_tests % 2 == 0:
+    #         raise ValueError("num_tests should be odd.")
+
+    #     # Potential drift vectors
+    #     vec = np.arange(-(num_tests - 1) / 2, (num_tests + 1) / 2)
+    #     xx, yy = np.meshgrid(vec, vec, indexing="ij")
+    #     keep = xx**2 + yy**2 <= (num_tests / 2) ** 2
+    #     dxy = (
+    #         np.vstack(
+    #             (
+    #                 xx[keep],
+    #                 yy[keep],
+    #             )
+    #         ).T
+    #         * step
+    #     )
+
+    #     # Measure cost function for linear drift vectors
+    #     cost = np.zeros(dxy.shape[0])
+    #     for a0 in tqdm(range(dxy.shape[0]), desc="Solving affine drift"):
+    #         # updated knots
+    #         knot_0 = self.knots[0].copy()
+    #         u = np.arange(knot_0.shape[1]) - (knot_0.shape[1] - 1) / 2
+    #         knot_0[0] += dxy[a0, 0] * u[:, None]
+    #         knot_0[1] += dxy[a0, 1] * u[:, None]
+
+    #         knot_1 = self.knots[1].copy()
+    #         u = np.arange(knot_1.shape[1]) - (knot_1.shape[1] - 1) / 2
+    #         knot_1[0] += dxy[a0, 0] * u[:, None]
+    #         knot_1[1] += dxy[a0, 1] * u[:, None]
+
+    #         im0, w0 = self.interpolator[0].warp_image(
+    #             self.images[0].array,
+    #             knot_0,
+    #         )
+    #         im1, w1 = self.interpolator[1].warp_image(
+    #             self.images[1].array,
+    #             knot_1,
+    #         )
+    #         # Cross correlation alignment
+    #         if generate_validity_mask is None:
+    #             generate_validity_mask = self.generate_validity_mask
+    #         if generate_validity_mask:
+    #             images = [im0, im1]
+    #             # Regenerate validity masks
+    #             if mask_edge_dist is None:
+    #                 mask_edge_dist = self.mask_edge_dist
+    #             for ind in range(self.shape[0]):
+    #                 self.validity_mask_warped.array[ind], _ = self.validity_mask_interpolator[
+    #                     ind
+    #                 ].warp_image(
+    #                     self.validity_mask[ind],
+    #                     self.knots[ind],
+    #                 )
+    #                 # Set outermost pixels to False to define the boundary for edge blending
+    #                 bool_validity_mask = self.validity_mask_warped.array[ind].astype(bool)
+    #                 bool_validity_mask[:, 0] = False
+    #                 bool_validity_mask[:, -1] = False
+    #                 bool_validity_mask[0, :] = False
+    #                 bool_validity_mask[-1, :] = False
+    #                 # Find inner boundary mask
+    #                 if mask_edge_dist is None:
+    #                     mask_inner = distance_transform_edt(bool_validity_mask)
+    #                     mask = np.sin(0.5 * np.pi * mask_inner / mask_inner.max()) ** 2
+    #                 else:
+    #                     mask_inner = distance_transform_edt(bool_validity_mask) > mask_edge_dist
+    #                     mask = (
+    #                         np.sin(
+    #                             0.5
+    #                             * np.pi
+    #                             * np.clip(
+    #                                 distance_transform_edt(mask_inner) / mask_edge_dist, 0.0, 1.0
+    #                             )
+    #                         )
+    #                         ** 2
+    #                     )
+    #                 im_mean = np.sum(images[ind] * mask) / np.sum(mask)
+    #                 images[ind] = (images[ind] - im_mean) * mask
+    #             im0, im1 = images
+    #         shifts, image_shift = cross_correlation_shift(
+    #             im0,
+    #             im1,
+    #             upsample_factor=upsample_factor,
+    #             fft_input=False,
+    #             fft_output=False,
+    #             return_shifted_image=True,
+    #             max_shift=max_image_shift,
+    #         )
+    #         cost[a0] = np.mean(np.abs(im0 - image_shift))
+
+    #     # update all knots
+    #     ind = np.argmin(cost)
+    #     for a0 in range(self.shape[0]):
+    #         u = np.arange(self.knots[a0].shape[1]) - (self.knots[a0].shape[1] - 1) / 2
+    #         self.knots[a0][0] += dxy[ind, 0] * u[:, None]
+    #         self.knots[a0][1] += dxy[ind, 1] * u[:, None]
+
+    #     # Regenerate images
+    #     for ind in range(self.shape[0]):
+    #         self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
+    #             ind
+    #         ].warp_image(
+    #             self.images[ind].array,
+    #             self.knots[ind],
+    #         )
+
+    #     if self.generate_validity_mask:
+    #         # Regenerate validity masks
+    #         for ind in range(self.shape[0]):
+    #             self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
+    #                 self.validity_mask[ind],
+    #                 self.knots[ind],
+    #             )
+
+    #         # for ind in range(self.shape[0]):
+    #         #     plt.figure()
+    #         #     plt.imshow(self.validity_mask_warped[ind].array)
+    #         #     plt.title("Validity mask warped in align affine" + str(ind))
+    #         #     plt.axis("off")
+
+    #     # Translation alignment
+    #     self.align_translation(
+    #         max_image_shift=max_image_shift,
+    #         show_images=False,
+    #         show_merged=False,
+    #         show_knots=False,
+    #     )
+
+    #     # Error tracking
+    #     self.calculate_error(1)
+
+    #     # Affine drift refinement
+    #     if refine:
+    #         # Potential drift vectors
+    #         dxy /= num_tests - 1
+
+    #         # Measure cost function
+    #         cost = np.zeros(dxy.shape[0])
+    #         for a0 in tqdm(range(dxy.shape[0]), desc="Refining affine drift"):
+    #             # updated knots
+
+    #             knot_0 = self.knots[0].copy()
+    #             u = np.arange(knot_0.shape[1]) - (knot_0.shape[1] - 1) / 2
+    #             knot_0[0] += dxy[a0, 0] * u[:, None]
+    #             knot_0[1] += dxy[a0, 1] * u[:, None]
+
+    #             knot_1 = self.knots[1].copy()
+    #             u = np.arange(knot_1.shape[1]) - (knot_1.shape[1] - 1) / 2
+    #             knot_1[0] += dxy[a0, 0] * u[:, None]
+    #             knot_1[1] += dxy[a0, 1] * u[:, None]
+
+    #             im0, w0 = self.interpolator[0].warp_image(
+    #                 self.images[0].array,
+    #                 knot_0,
+    #             )
+    #             im1, w1 = self.interpolator[1].warp_image(
+    #                 self.images[1].array,
+    #                 knot_1,
+    #             )
+    #             # Cross correlation alignment
+    #             if generate_validity_mask:
+    #                 # Regenerate validity masks
+    #                 images = [im0, im1]
+    #                 for ind in range(self.shape[0]):
+    #                     self.validity_mask_warped.array[ind], _ = self.validity_mask_interpolator[
+    #                         ind
+    #                     ].warp_image(
+    #                         self.validity_mask[ind],
+    #                         self.knots[ind],
+    #                     )
+    #                     # Set outermost pixels to False to define the boundary for edge blending
+    #                     bool_validity_mask = self.validity_mask_warped.array[ind].astype(bool)
+    #                     bool_validity_mask[:, 0] = False
+    #                     bool_validity_mask[:, -1] = False
+    #                     bool_validity_mask[0, :] = False
+    #                     bool_validity_mask[-1, :] = False
+    #                     # Find inner boundary mask
+    #                     if mask_edge_dist is None:
+    #                         mask_inner = distance_transform_edt(bool_validity_mask)
+    #                         mask = np.sin(0.5 * np.pi * mask_inner / mask_inner.max()) ** 2
+    #                     else:
+    #                         mask_inner = (
+    #                             distance_transform_edt(bool_validity_mask) > mask_edge_dist
+    #                         )
+    #                         mask = (
+    #                             np.sin(
+    #                                 0.5
+    #                                 * np.pi
+    #                                 * np.clip(
+    #                                     distance_transform_edt(mask_inner) / mask_edge_dist,
+    #                                     0.0,
+    #                                     1.0,
+    #                                 )
+    #                             )
+    #                             ** 2
+    #                         )
+    #                     im_mean = np.sum(images[ind] * mask) / np.sum(mask)
+    #                     images[ind] = (images[ind] - im_mean) * mask
+    #                 im0, im1 = images
+    #             shifts, image_shift = cross_correlation_shift(
+    #                 im0,
+    #                 im1,
+    #                 upsample_factor=upsample_factor,
+    #                 fft_input=False,
+    #                 fft_output=False,
+    #                 return_shifted_image=True,
+    #                 max_shift=max_image_shift,
+    #             )
+    #             cost[a0] = np.mean(np.abs(im0 - image_shift))
+
+    #         # update all knots
+    #         ind = np.argmin(cost)
+    #         for a0 in range(self.shape[0]):
+    #             u = np.arange(self.knots[a0].shape[1]) - (self.knots[a0].shape[1] - 1) / 2
+    #             self.knots[a0][0] += dxy[ind, 0] * u[:, None]
+    #             self.knots[a0][1] += dxy[ind, 1] * u[:, None]
+
+    #     # Regenerate images
+    #     for ind in range(self.shape[0]):
+    #         self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
+    #             ind
+    #         ].warp_image(
+    #             self.images[ind].array,
+    #             self.knots[ind],
+    #         )
+
+    #     if self.generate_validity_mask:
+    #         # Regenerate validity masks
+    #         for ind in range(self.shape[0]):
+    #             self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
+    #                 self.validity_mask[ind],
+    #                 self.knots[ind],
+    #             )
+
+    #         # for ind in range(self.shape[0]):
+    #         #     plt.figure()
+    #         #     plt.imshow(self.validity_mask_warped[ind].array)
+    #         #     plt.title("Validity mask warped in align affine" + str(ind))
+    #         #     plt.axis("off")
+
+    #     # Translation alignment
+    #     self.align_translation(
+    #         max_image_shift=max_image_shift,
+    #         show_images=False,
+    #         show_merged=False,
+    #         show_knots=False,
+    #     )
+
+    #     # Error tracking
+    #     self.calculate_error(1)
+
+    #     # Plots
+    #     kwargs.pop("title", None)
+    #     if show_merged:
+    #         self.plot_merged_images(
+    #             show_knots=show_knots,
+    #             title="Merged: affine",
+    #             **kwargs,
+    #         )
+    #     if show_images:
+    #         self.plot_transformed_images(
+    #             show_knots=show_knots,
+    #             title=[f"Image {i}: affine" for i in range(self.shape[0])],
+    #             **kwargs,
+    #         )
+
+    #     return self
+
+    # # Affine alignment
+    # def align_affine_3(
+    #     self,
+    #     step: float = 0.01,
+    #     num_tests: int = 9,
+    #     refine: bool = True,
+    #     upsample_factor: int = 8,
+    #     max_image_shift: float | None = 32,
+    #     show_merged: bool = True,
+    #     show_images: bool = False,
+    #     show_knots: bool = True,
+    #     **kwargs,
+    # ):
+    #     """
+    #     Estimate affine drift from the first 2 images.
+    #     """
+
+    #     if not hasattr(self, "knots"):
+    #         print("\033[91mNo knots found — running .preprocess() with default settings.\033[0m")
+    #         self.preprocess()
+
+    #     if num_tests % 2 == 0:
+    #         raise ValueError("num_tests should be odd.")
+
+    #     # Potential drift vectors
+    #     vec = np.arange(-(num_tests - 1) / 2, (num_tests + 1) / 2)
+    #     xx, yy = np.meshgrid(vec, vec, indexing="ij")
+    #     keep = xx**2 + yy**2 <= (num_tests / 2) ** 2
+    #     dxy = (
+    #         np.vstack(
+    #             (
+    #                 xx[keep],
+    #                 yy[keep],
+    #             )
+    #         ).T
+    #         * step
+    #     )
+
+    #     # Affine drift refinement
+    #     self.affine_cost_list = []
+
+    #     # with WorkerPool(n_jobs = 2) as pool:
+    #     def cost_affine(dxy):
+    #         def interpolate_one_image(image_index):
+    #             knot = self.knots[image_index].copy()
+    #             u = np.arange(knot.shape[1]) - (knot.shape[1] - 1) / 2
+    #             knot[0] += dxy[0] * u[:, None]
+    #             knot[1] += dxy[1] * u[:, None]
+    #             im0, w0 = self.interpolator[image_index].warp_image(
+    #                 self.images[image_index].array,
+    #                 knot,
+    #             )
+    #             return im0
+
+    #         # mpire_result = pool.map(interpolate_one_image, [0,1])
+    #         # im0, im1 = mpire_result[:self.shape[1],:], mpire_result[self.shape[1]:,:]
+    #         im0 = interpolate_one_image(0)
+    #         im1 = interpolate_one_image(1)
+
+    #         # if generate_validity_mask is None:
+    #         #     generate_validity_mask = self.generate_validity_mask
+    #         # if generate_validity_mask:
+    #         #     images = [im0, im1]
+    #         #     # Regenerate validity masks
+    #         #     if mask_edge_dist is None:
+    #         #         mask_edge_dist = self.mask_edge_dist
+    #         #     for ind in range(self.shape[0]):
+    #         #         self.validity_mask_warped.array[ind], _ = self.validity_mask_interpolator[ind].warp_image(
+    #         #             self.validity_mask[ind],
+    #         #             self.knots[ind],
+    #         #         )
+    #         #         # Set outermost pixels to False to define the boundary for edge blending
+    #         #         bool_validity_mask = self.validity_mask_warped.array[ind].astype(bool)
+    #         #         bool_validity_mask[:, 0] = False
+    #         #         bool_validity_mask[:, -1] = False
+    #         #         bool_validity_mask[0, :] = False
+    #         #         bool_validity_mask[-1, :] = False
+    #         #         # Find inner boundary mask
+    #         #         if mask_edge_dist is None:
+    #         #             mask_inner = distance_transform_edt(bool_validity_mask)
+    #         #             mask = np.sin(0.5 * np.pi * mask_inner / mask_inner.max()) ** 2
+    #         #         else:
+    #         #             mask_inner = distance_transform_edt(bool_validity_mask) > mask_edge_dist
+    #         #             mask = np.sin(
+    #         #                 0.5 * np.pi * np.clip(distance_transform_edt(mask_inner) / mask_edge_dist, 0.0, 1.0)
+    #         #             ) ** 2
+    #         #         im_mean = np.sum(images[ind] * mask) / np.sum(mask)
+    #         #         images[ind] = (images[ind] - im_mean) * mask
+    #         #     im0, im1 = images
+
+    #         shifts, image_shift = cross_correlation_shift(
+    #             im0,
+    #             im1,
+    #             upsample_factor=upsample_factor,
+    #             fft_input=False,
+    #             fft_output=False,
+    #             return_shifted_image=True,
+    #             max_shift=max_image_shift,
+    #         )
+    #         affine_cost = np.mean(np.abs(im0 - image_shift))
+    #         self.affine_cost_list.append(affine_cost)
+    #         return affine_cost
+
+    #     import time
+
+    #     tic = time.time()
+    #     optimization_result = minimize(
+    #         cost_affine,
+    #         x0=[0.0, 0.0],
+    #         method="Powell",
+    #         options={
+    #             "maxiter": 50,
+    #             "maxfev": 100,
+    #             "xtol": 1e-3,
+    #             "ftol": 1e-3,
+    #         },
+    #     )
+    #     toc = time.time()
+    #     print(f"Affine elapsed time: {toc - tic:.3f} seconds")
+    #     if not optimization_result.success:
+    #         raise RuntimeError(f"Affine optimization failed: {optimization_result.message}")
+    #     dxy = optimization_result.x
+    #     print("Affine dxy:", dxy)
+    #     # update all knots
+    #     for a0 in range(self.shape[0]):
+    #         u = np.arange(self.knots[a0].shape[1]) - (self.knots[a0].shape[1] - 1) / 2
+    #         self.knots[a0][0] += dxy[0] * u[:, None]
+    #         self.knots[a0][1] += dxy[1] * u[:, None]
+
+    #     # Regenerate images
+    #     for ind in range(self.shape[0]):
+    #         self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
+    #             ind
+    #         ].warp_image(
+    #             self.images[ind].array,
+    #             self.knots[ind],
+    #         )
+
+    #     if self.generate_validity_mask:
+    #         # Regenerate validity masks
+    #         for ind in range(self.shape[0]):
+    #             self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
+    #                 self.validity_mask[ind],
+    #                 self.knots[ind],
+    #             )
+
+    #         # for ind in range(self.shape[0]):
+    #         #     plt.figure()
+    #         #     plt.imshow(self.validity_mask_warped[ind].array)
+    #         #     plt.title("Validity mask warped in align affine 3" + str(ind))
+    #         #     plt.axis("off")
+
+    #     # Translation alignment
+    #     self.align_translation(
+    #         max_image_shift=max_image_shift,
+    #         show_images=False,
+    #         show_merged=False,
+    #         show_knots=False,
+    #     )
+
+    #     # Error tracking
+    #     self.calculate_error(1)
+    #     # Plots
+    #     kwargs.pop("title", None)
+    #     if show_merged:
+    #         self.plot_merged_images(
+    #             show_knots=show_knots,
+    #             title="Merged: affine",
+    #             **kwargs,
+    #         )
+    #     if show_images:
+    #         self.plot_transformed_images(
+    #             show_knots=show_knots,
+    #             title=[f"Image {i}: affine" for i in range(self.shape[0])],
+    #             **kwargs,
+    #         )
+
+    #     return self
+
     # Affine alignment
     def align_affine(
         self,
+        backend: str = "pytorch",
+        # Shared parameters
+        min_image_shift: float | None = None,
+        max_image_shift: float | None = 32.0,
+        upsample_factor: int = 8,
+        generate_validity_mask: bool | None = None,
+        mask_edge_dist: float | None = None,
+        # PyTorch parameters
+        adam_steps: int = 5,
+        lr: float = 0.02,
+        kernel_size: int = 5,
+        # SciPy parameters
+        dxy_init: NDArray = np.array((0.0, 0.0)),
+        # Grid Search parameters
         step: float = 0.01,
         num_tests: int = 9,
         refine: bool = True,
-        upsample_factor: int = 8,
-        max_image_shift: float | None = 32,
+        # Display parameters
         show_merged: bool = True,
         show_images: bool = False,
         show_knots: bool = True,
-        generate_validity_mask: bool | None = None,
-        mask_edge_dist: float | None = None,
         **kwargs,
     ):
         """
@@ -464,6 +948,230 @@ class DriftCorrection(AutoSerialize):
             print("\033[91mNo knots found — running .preprocess() with default settings.\033[0m")
             self.preprocess()
 
+        backend = str(backend)
+
+        if backend.lower() in ["grid", "manual"]:
+            dxy_opt = self._optimize_affine_grid_search(
+                num_tests=num_tests,
+                step=step,
+                upsample_factor=upsample_factor,
+                max_image_shift=max_image_shift,
+                refine=refine,
+                generate_validity_mask=generate_validity_mask,
+                mask_edge_dist=mask_edge_dist,
+            )
+
+        if backend.lower() in ["pytorch", "torch"]:
+            dxy_opt = self._optimize_affine_pytorch(
+                adam_steps=adam_steps,
+                lr=lr,
+                kernel_size=kernel_size,
+                upsample_factor=upsample_factor,
+                max_image_shift=max_image_shift,
+                generate_validity_mask=generate_validity_mask,
+                mask_edge_dist=mask_edge_dist,
+            )
+
+        if backend.lower() in ["scipy", "sp"]:
+            dxy_opt = self._optimize_affine_scipy(
+                upsample_factor=upsample_factor,
+                max_image_shift=max_image_shift,
+                dxy_init=dxy_init,
+                generate_validity_mask=generate_validity_mask,
+                mask_edge_dist=mask_edge_dist,
+            )
+
+        for a0 in range(self.shape[0]):
+            u = np.arange(self.knots[a0].shape[1]) - (self.knots[a0].shape[1] - 1) / 2
+            self.knots[a0][0] += dxy_opt[0] * u[:, None]
+            self.knots[a0][1] += dxy_opt[1] * u[:, None]
+
+        # Regenerate images
+        for ind in range(self.shape[0]):
+            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
+                ind
+            ].warp_image(
+                self.images[ind].array,
+                self.knots[ind],
+            )
+
+        if self.generate_validity_mask:
+            # Regenerate validity masks
+            for ind in range(self.shape[0]):
+                self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
+                    self.validity_mask[ind],
+                    self.knots[ind],
+                )
+
+        # Translation alignment
+        self.align_translation(
+            max_image_shift=max_image_shift,
+            show_images=False,
+            show_merged=False,
+            show_knots=False,
+        )
+
+        # Error tracking
+        self.calculate_error(1)
+
+        # Plots
+        kwargs.pop("title", None)
+        if show_merged:
+            self.plot_merged_images(
+                show_knots=show_knots,
+                title="Merged: affine",
+                **kwargs,
+            )
+        if show_images:
+            self.plot_transformed_images(
+                show_knots=show_knots,
+                title=[f"Image {i}: affine" for i in range(self.shape[0])],
+                **kwargs,
+            )
+
+        return self
+
+    def _optimize_affine_pytorch(
+        self,
+        adam_steps: int = 5,
+        lr: float = 0.02,
+        kernel_size: int = 5,
+        upsample_factor: int = 8,
+        max_image_shift: float = 32.0,
+        min_image_shift: float | None = None,
+        generate_validity_mask: bool | None = None,
+        mask_edge_dist: float | None = None,
+    ) -> np.ndarray:
+        """
+        PyTorch Adam batched optimization for affine alignment of image pairs.
+        For parameter descriptions, see align_affine.
+        """
+        device = get_device()
+
+        # Generate the torch interpolator for all images
+        interpolator_torch = []
+        for a0 in range(self.shape[0]):
+            interpolator_torch.append(
+                DriftInterpolatorTorch(
+                    input_shape=self.images[a0].shape,
+                    output_shape=self.shape[1:],
+                    scan_fast=self.scan_fast[a0],
+                    scan_slow=self.scan_slow[a0],
+                    pad_value=self.pad_value[a0],
+                    kde_sigma=self.kde_sigma,
+                )
+            )
+
+        if generate_validity_mask is None:
+            generate_validity_mask = self.generate_validity_mask
+        if generate_validity_mask:
+            # Precompute the validity mask torch interpolator for all images
+            validity_mask_interpolator_torch = []
+            for a0 in range(self.shape[0]):
+                validity_mask_interpolator_torch.append(
+                    DriftInterpolatorTorch(
+                        input_shape=self.images[a0].shape,
+                        output_shape=self.shape[1:],
+                        scan_fast=self.scan_fast[a0],
+                        scan_slow=self.scan_slow[a0],
+                        pad_value=0,
+                        kde_sigma=self.kde_sigma,
+                    )
+                )
+
+        image_0 = torch.tensor(self.images[0].array, dtype=torch.float32, device=device)
+        image_1 = torch.tensor(self.images[1].array, dtype=torch.float32, device=device)
+        if generate_validity_mask:
+            vm0 = torch.tensor(self.validity_mask[0], dtype=torch.float32, device=device)
+            vm1 = torch.tensor(self.validity_mask[1], dtype=torch.float32, device=device)
+            validity_mask = [vm0, vm1]
+
+        knot_0 = torch.tensor(self.knots[0], dtype=torch.float32, device=device)
+        knot_1 = torch.tensor(self.knots[1], dtype=torch.float32, device=device)
+        dxy_opt = torch.zeros(2, dtype=torch.float32, device=device, requires_grad=True)
+        optimizer = torch.optim.Adam([dxy_opt], lr=lr)
+
+        for _ in range(adam_steps):
+            optimizer.zero_grad()
+            u0 = (
+                torch.arange(knot_0.shape[1], dtype=torch.float32, device=device)
+                - (knot_0.shape[1] - 1) / 2
+            )
+            u1 = (
+                torch.arange(knot_1.shape[1], dtype=torch.float32, device=device)
+                - (knot_1.shape[1] - 1) / 2
+            )
+            knot_0_t = knot_0.clone()
+            knot_1_t = knot_1.clone()
+            knot_0_t[0] += dxy_opt[0] * u0[:, None]
+            knot_0_t[1] += dxy_opt[1] * u0[:, None]
+            knot_1_t[0] += dxy_opt[0] * u1[:, None]
+            knot_1_t[1] += dxy_opt[1] * u1[:, None]
+            im0, _ = interpolator_torch[0].warp_image(image_0, knot_0_t)
+            im1, _ = interpolator_torch[1].warp_image(image_1, knot_1_t)
+            # Cross correlation alignment
+            if generate_validity_mask:
+                images = [im0, im1]
+                knots = [knot_0, knot_1]
+                # Regenerate validity masks
+                if mask_edge_dist is None:
+                    mask_edge_dist = self.mask_edge_dist
+                mask_edge_dist = torch.tensor(mask_edge_dist, device=device)
+                for ind in range(self.shape[0]):
+                    validity_mask_warped, _ = validity_mask_interpolator_torch[ind].warp_image(
+                        validity_mask[ind], knots[ind]
+                    )
+                    # Set outermost pixels to False to define the boundary for edge blending
+                    bool_validity_mask = torch.tensor(
+                        validity_mask_warped, dtype=torch.bool, device=device
+                    )
+                    bool_validity_mask[:, 0] = False
+                    bool_validity_mask[:, -1] = False
+                    bool_validity_mask[0, :] = False
+                    bool_validity_mask[-1, :] = False
+                    # Find inner boundary mask
+                    dt = K.contrib.DistanceTransform(kernel_size=kernel_size)
+                    if mask_edge_dist is None:
+                        mask_inner = dt(bool_validity_mask[None, None].float())[0, 0]
+                        mask = torch.sin(0.5 * torch.pi * mask_inner / mask_inner.max()) ** 2
+                    else:
+                        dt_init = dt(bool_validity_mask[None, None].float())[0, 0]
+                        tau = 1.0  # input variable?
+                        mask_inner = torch.sigmoid((dt_init - mask_edge_dist) / tau)
+                        dt_edge_dist = dt(mask_inner[None, None])[0, 0]
+                        norm = (dt_edge_dist / mask_edge_dist).clamp(0.0, 1.0)
+                        mask = torch.sin(0.5 * torch.pi * norm).square()
+                    im_mean = (images[ind] * mask).sum() / mask.sum()
+                    images[ind] = (images[ind] - im_mean) * mask
+                im0, im1 = images
+
+            shifts, image_shift = cross_correlation_shift_torch(
+                im0,
+                im1,
+                upsample_factor=upsample_factor,
+                return_shifted_image=True,
+            )
+            loss = (im0 - image_shift).abs().mean()
+
+            # Backward pass
+            loss.backward()
+            print("dxy grad:", dxy_opt.grad)
+            # Gradient step
+            optimizer.step()
+
+        return dxy_opt.detach().cpu().numpy()[:, None]
+
+    def _optimize_affine_grid_search(
+        self,
+        num_tests: int = 9,
+        step: float = 0.01,
+        upsample_factor: int = 8,
+        max_image_shift: float | None = 32.0,
+        min_image_shift: float | None = None,
+        refine: bool = True,
+        generate_validity_mask: bool | None = None,
+        mask_edge_dist: float | None = None,
+    ):
         if num_tests % 2 == 0:
             raise ValueError("num_tests should be odd.")
 
@@ -503,6 +1211,7 @@ class DriftCorrection(AutoSerialize):
                 self.images[1].array,
                 knot_1,
             )
+
             # Cross correlation alignment
             if generate_validity_mask is None:
                 generate_validity_mask = self.generate_validity_mask
@@ -543,6 +1252,7 @@ class DriftCorrection(AutoSerialize):
                     im_mean = np.sum(images[ind] * mask) / np.sum(mask)
                     images[ind] = (images[ind] - im_mean) * mask
                 im0, im1 = images
+
             shifts, image_shift = cross_correlation_shift(
                 im0,
                 im1,
@@ -577,12 +1287,6 @@ class DriftCorrection(AutoSerialize):
                     self.validity_mask[ind],
                     self.knots[ind],
                 )
-
-            # for ind in range(self.shape[0]):
-            #     plt.figure()
-            #     plt.imshow(self.validity_mask_warped[ind].array)
-            #     plt.title("Validity mask warped in align affine" + str(ind))
-            #     plt.axis("off")
 
         # Translation alignment
         self.align_translation(
@@ -624,6 +1328,7 @@ class DriftCorrection(AutoSerialize):
                     knot_1,
                 )
                 # Cross correlation alignment
+
                 if generate_validity_mask:
                     # Regenerate validity masks
                     images = [im0, im1]
@@ -663,6 +1368,7 @@ class DriftCorrection(AutoSerialize):
                         im_mean = np.sum(images[ind] * mask) / np.sum(mask)
                         images[ind] = (images[ind] - im_mean) * mask
                     im0, im1 = images
+
                 shifts, image_shift = cross_correlation_shift(
                     im0,
                     im1,
@@ -676,151 +1382,86 @@ class DriftCorrection(AutoSerialize):
 
             # update all knots
             ind = np.argmin(cost)
-            for a0 in range(self.shape[0]):
-                u = np.arange(self.knots[a0].shape[1]) - (self.knots[a0].shape[1] - 1) / 2
-                self.knots[a0][0] += dxy[ind, 0] * u[:, None]
-                self.knots[a0][1] += dxy[ind, 1] * u[:, None]
-
-        # Regenerate images
-        for ind in range(self.shape[0]):
-            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
-                ind
-            ].warp_image(
-                self.images[ind].array,
-                self.knots[ind],
-            )
-
-        if self.generate_validity_mask:
-            # Regenerate validity masks
-            for ind in range(self.shape[0]):
-                self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
-                    self.validity_mask[ind],
-                    self.knots[ind],
-                )
-
-            # for ind in range(self.shape[0]):
-            #     plt.figure()
-            #     plt.imshow(self.validity_mask_warped[ind].array)
-            #     plt.title("Validity mask warped in align affine" + str(ind))
-            #     plt.axis("off")
-
-        # Translation alignment
-        self.align_translation(
-            max_image_shift=max_image_shift,
-            show_images=False,
-            show_merged=False,
-            show_knots=False,
-        )
-
-        # Error tracking
-        self.calculate_error(1)
-
-        # Plots
-        kwargs.pop("title", None)
-        if show_merged:
-            self.plot_merged_images(
-                show_knots=show_knots,
-                title="Merged: affine",
-                **kwargs,
-            )
-        if show_images:
-            self.plot_transformed_images(
-                show_knots=show_knots,
-                title=[f"Image {i}: affine" for i in range(self.shape[0])],
-                **kwargs,
-            )
-
-        return self
+        return dxy[ind]
 
     # Affine alignment
-    def align_affine_3(
+    def _optimize_affine_scipy(
         self,
-        step: float = 0.01,
-        num_tests: int = 9,
-        refine: bool = True,
         upsample_factor: int = 8,
         max_image_shift: float | None = 32,
-        show_merged: bool = True,
-        show_images: bool = False,
-        show_knots: bool = True,
-        **kwargs,
+        min_image_shift: float | None = None,
+        dxy_init: NDArray = np.array((0.0, 0.0)),
+        generate_validity_mask: bool | None = None,
+        mask_edge_dist: float | None = None,
     ):
-        """
-        Estimate affine drift from the first 2 images.
-        """
-
-        if not hasattr(self, "knots"):
-            print("\033[91mNo knots found — running .preprocess() with default settings.\033[0m")
-            self.preprocess()
-
-        if num_tests % 2 == 0:
-            raise ValueError("num_tests should be odd.")
-
-        # Potential drift vectors
-        vec = np.arange(-(num_tests - 1) / 2, (num_tests + 1) / 2)
-        xx, yy = np.meshgrid(vec, vec, indexing="ij")
-        keep = xx**2 + yy**2 <= (num_tests / 2) ** 2
-        dxy = (
-            np.vstack(
-                (
-                    xx[keep],
-                    yy[keep],
-                )
-            ).T
-            * step
-        )
-
         # Affine drift refinement
         self.affine_cost_list = []
 
-        # with WorkerPool(n_jobs = 2) as pool:
+        # quick hacky solution to scope issue
+        if generate_validity_mask is None:
+            generate_validity_mask = self.generate_validity_mask
+        gvm_store = self.generate_validity_mask
+        self.generate_validity_mask = generate_validity_mask
+        if mask_edge_dist is None:
+            mask_edge_dist = self.mask_edge_dist
+        med_store = self.mask_edge_dist
+        self.mask_edge_dist = mask_edge_dist
+
         def cost_affine(dxy):
-            def interpolate_one_image(image_index):
-                knot = self.knots[image_index].copy()
-                u = np.arange(knot.shape[1]) - (knot.shape[1] - 1) / 2
-                knot[0] += dxy[0] * u[:, None]
-                knot[1] += dxy[1] * u[:, None]
-                im0, w0 = self.interpolator[image_index].warp_image(
-                    self.images[image_index].array,
-                    knot,
-                )
-                return im0
+            knot_0 = self.knots[0].copy()
+            u = np.arange(knot_0.shape[1]) - (knot_0.shape[1] - 1) / 2
+            knot_0[0] += dxy[0] * u[:, None]
+            knot_0[1] += dxy[1] * u[:, None]
+            im0, w0 = self.interpolator[0].warp_image(
+                self.images[0].array,
+                knot_0,
+            )
+            knot_1 = self.knots[1].copy()
+            u = np.arange(knot_1.shape[1]) - (knot_1.shape[1] - 1) / 2
+            knot_1[0] += dxy[0] * u[:, None]
+            knot_1[1] += dxy[1] * u[:, None]
+            im1, w1 = self.interpolator[1].warp_image(
+                self.images[1].array,
+                knot_1,
+            )
 
-            # mpire_result = pool.map(interpolate_one_image, [0,1])
-            # im0, im1 = mpire_result[:self.shape[1],:], mpire_result[self.shape[1]:,:]
-            im0 = interpolate_one_image(0)
-            im1 = interpolate_one_image(1)
-
-            # if generate_validity_mask is None:
-            #     generate_validity_mask = self.generate_validity_mask
-            # if generate_validity_mask:
-            #     images = [im0, im1]
-            #     # Regenerate validity masks
-            #     if mask_edge_dist is None:
-            #         mask_edge_dist = self.mask_edge_dist
-            #     for ind in range(self.shape[0]):
-            #         self.validity_mask_warped.array[ind], _ = self.validity_mask_interpolator[ind].warp_image(
-            #             self.validity_mask[ind],
-            #             self.knots[ind],
-            #         )
-            #         # Set outermost pixels to False to define the boundary for edge blending
-            #         bool_validity_mask = self.validity_mask_warped.array[ind].astype(bool)
-            #         bool_validity_mask[:, 0] = False
-            #         bool_validity_mask[:, -1] = False
-            #         bool_validity_mask[0, :] = False
-            #         bool_validity_mask[-1, :] = False
-            #         # Find inner boundary mask
-            #         if mask_edge_dist is None:
-            #             mask_inner = distance_transform_edt(bool_validity_mask)
-            #             mask = np.sin(0.5 * np.pi * mask_inner / mask_inner.max()) ** 2
-            #         else:
-            #             mask_inner = distance_transform_edt(bool_validity_mask) > mask_edge_dist
-            #             mask = np.sin(
-            #                 0.5 * np.pi * np.clip(distance_transform_edt(mask_inner) / mask_edge_dist, 0.0, 1.0)
-            #             ) ** 2
-            #         im_mean = np.sum(images[ind] * mask) / np.sum(mask)
-            #         images[ind] = (images[ind] - im_mean) * mask
-            #     im0, im1 = images
+            # Cross correlation alignment
+            if self.generate_validity_mask:
+                images = [im0, im1]
+                # Regenerate validity masks
+                mask_edge_dist = self.mask_edge_dist
+                for ind in range(self.shape[0]):
+                    self.validity_mask_warped.array[ind], _ = self.validity_mask_interpolator[
+                        ind
+                    ].warp_image(
+                        self.validity_mask[ind],
+                        self.knots[ind],
+                    )
+                    # Set outermost pixels to False to define the boundary for edge blending
+                    bool_validity_mask = self.validity_mask_warped.array[ind].astype(bool)
+                    bool_validity_mask[:, 0] = False
+                    bool_validity_mask[:, -1] = False
+                    bool_validity_mask[0, :] = False
+                    bool_validity_mask[-1, :] = False
+                    # Find inner boundary mask
+                    if mask_edge_dist is None:
+                        mask_inner = distance_transform_edt(bool_validity_mask)
+                        mask = np.sin(0.5 * np.pi * mask_inner / mask_inner.max()) ** 2
+                    else:
+                        mask_inner = distance_transform_edt(bool_validity_mask) > mask_edge_dist
+                        mask = (
+                            np.sin(
+                                0.5
+                                * np.pi
+                                * np.clip(
+                                    distance_transform_edt(mask_inner) / mask_edge_dist, 0.0, 1.0
+                                )
+                            )
+                            ** 2
+                        )
+                    im_mean = np.sum(images[ind] * mask) / np.sum(mask)
+                    images[ind] = (images[ind] - im_mean) * mask
+                im0, im1 = images
 
             shifts, image_shift = cross_correlation_shift(
                 im0,
@@ -835,13 +1476,10 @@ class DriftCorrection(AutoSerialize):
             self.affine_cost_list.append(affine_cost)
             return affine_cost
 
-        import time
-
-        tic = time.time()
         optimization_result = minimize(
             cost_affine,
-            x0=[0.0, 0.0],
-            method="Powell",
+            x0=np.asarray(dxy_init, dtype=float).copy(),
+            method="L-BFGS-B",
             options={
                 "maxiter": 50,
                 "maxfev": 100,
@@ -849,67 +1487,13 @@ class DriftCorrection(AutoSerialize):
                 "ftol": 1e-3,
             },
         )
-        toc = time.time()
-        print(f"Affine elapsed time: {toc - tic:.3f} seconds")
+
+        self.generate_validity_mask = gvm_store
+        self.mask_edge_dist = med_store
         if not optimization_result.success:
-            raise RuntimeError(f"Affine optimization failed: {optimization_result.message}")
+            raise RuntimeError(f"Scipy Affine optimization failed: {optimization_result.message}")
         dxy = optimization_result.x
-        print("Affine dxy:", dxy)
-        # update all knots
-        for a0 in range(self.shape[0]):
-            u = np.arange(self.knots[a0].shape[1]) - (self.knots[a0].shape[1] - 1) / 2
-            self.knots[a0][0] += dxy[0] * u[:, None]
-            self.knots[a0][1] += dxy[1] * u[:, None]
-
-        # Regenerate images
-        for ind in range(self.shape[0]):
-            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
-                ind
-            ].warp_image(
-                self.images[ind].array,
-                self.knots[ind],
-            )
-
-        if self.generate_validity_mask:
-            # Regenerate validity masks
-            for ind in range(self.shape[0]):
-                self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
-                    self.validity_mask[ind],
-                    self.knots[ind],
-                )
-
-            # for ind in range(self.shape[0]):
-            #     plt.figure()
-            #     plt.imshow(self.validity_mask_warped[ind].array)
-            #     plt.title("Validity mask warped in align affine 3" + str(ind))
-            #     plt.axis("off")
-
-        # Translation alignment
-        self.align_translation(
-            max_image_shift=max_image_shift,
-            show_images=False,
-            show_merged=False,
-            show_knots=False,
-        )
-
-        # Error tracking
-        self.calculate_error(1)
-        # Plots
-        kwargs.pop("title", None)
-        if show_merged:
-            self.plot_merged_images(
-                show_knots=show_knots,
-                title="Merged: affine",
-                **kwargs,
-            )
-        if show_images:
-            self.plot_transformed_images(
-                show_knots=show_knots,
-                title=[f"Image {i}: affine" for i in range(self.shape[0])],
-                **kwargs,
-            )
-
-        return self
+        return dxy
 
     # non-rigid alignment
     def align_nonrigid(
@@ -1395,10 +1979,10 @@ class DriftCorrection(AutoSerialize):
             #     plt.title("Validity mask warped in generate corrected image" + str(ind))
             #     plt.axis("off")
 
-            plt.figure()
-            plt.imshow(self.validity_mask_warped[0].array + self.validity_mask_warped[1].array)
-            plt.axis("off")
-            plt.title("Validity mask warped sum in generate corrected image" + str(ind))
+            # plt.figure()
+            # plt.imshow(self.validity_mask_warped[0].array + self.validity_mask_warped[1].array)
+            # plt.axis("off")
+            # plt.title("Validity mask warped sum in generate corrected image" + str(ind))
 
         if fourier_filter:
             # Apply fourier filtering
@@ -1468,10 +2052,10 @@ class DriftCorrection(AutoSerialize):
                 np.fft.ifft2(image_corr_fft) * mask + pad_value_mean * (1 - mask)
             )
 
-            plt.figure()
-            plt.imshow(mask)
-            plt.title("mask_output")
-            plt.axis("off")
+            # plt.figure()
+            # plt.imshow(mask)
+            # plt.title("mask_output")
+            # plt.axis("off")
 
         if output_original_shape:
             image_corr_fft = fourier_cropping(image_corr_fft, self.shape[-2:]) / upsample_factor**2
@@ -1719,6 +2303,126 @@ class DriftInterpolator:
         )
 
         return image_interp, weight_interp
+
+
+class DriftInterpolatorTorch:
+    def __init__(
+        self,
+        input_shape,
+        output_shape,
+        scan_fast,
+        scan_slow,
+        pad_value,
+        kde_sigma,
+    ):
+        self.input_shape = input_shape
+        self.output_shape = output_shape
+        self.scan_fast = scan_fast
+        self.scan_slow = scan_slow
+        self.pad_value = pad_value
+        self.kde_sigma = kde_sigma
+        self.device = get_device()
+        self.rows_input = torch.arange(input_shape[0], device=self.device)
+        self.cols_input = torch.arange(input_shape[1], device=self.device)
+        self.u = torch.linspace(0, 1, input_shape[1], device=self.device)
+
+    def transform_rows(
+        self,
+        knots_row: torch.Tensor,
+    ):
+        num_knots = knots_row.shape[-1]
+        # basis = torch.linspace(0, 1, num_knots, device=self.device)
+
+        if num_knots == 1:
+            xa = knots_row[0] + self.u[None, :] * self.scan_fast[0] * (self.input_shape[0] - 1)
+            ya = knots_row[1] + self.u[None, :] * self.scan_fast[1] * (self.input_shape[1] - 1)
+        else:
+            raise NotImplementedError(
+                f"PyTorch backend only supports single knot (got {num_knots}). "
+                "Use backend='scipy' for multiple knots."
+            )
+        # elif num_knots == 2:
+        #     xa = torch.interp(basis, knots_row[0], kind="linear", assume_sorted=True)(self.u)
+        #     ya = interp1d(basis, knots_row[1], kind="linear", assume_sorted=True)(self.u)
+        # else:
+        #     kind = "quadratic" if num_knots == 3 else "cubic"
+        #     xa = interp1d(
+        #         basis,
+        #         knots_row[0],
+        #         kind=kind,
+        #         fill_value="extrapolate",
+        #         assume_sorted=True,
+        #     )(self.u)
+        #     ya = interp1d(
+        #         basis,
+        #         knots_row[1],
+        #         kind=kind,
+        #         fill_value="extrapolate",
+        #         assume_sorted=True,
+        #     )(self.u)
+
+        return xa, ya
+
+    def transform_coordinates(
+        self,
+        knots: torch.Tensor,
+    ):
+        num_knots = knots.shape[-1]
+
+        if num_knots == 1:
+            # vectorized version for speed
+            xa, ya = self.transform_rows(knots)
+        else:
+            xa = torch.zeros(self.input_shape, device=self.device)
+            ya = torch.zeros(self.input_shape, device=self.device)
+            for i in range(self.input_shape[0]):
+                xa[i], ya[i] = self.transform_rows(knots[:, i])
+
+        return xa, ya
+
+    def warp_image(
+        self,
+        image: torch.Tensor,
+        knots: torch.Tensor,  # shape: (2, rows, num_knots)
+        kde_sigma=None,
+        output_shape=None,
+        pad_value=None,
+        upsample_factor=None,
+    ) -> torch.Tensor:
+        xa, ya = self.transform_coordinates(
+            knots,
+        )
+
+        if kde_sigma is None:
+            kde_sigma = self.kde_sigma
+
+        if output_shape is None:
+            output_shape = self.output_shape
+
+        if pad_value is None:
+            pad_value = self.pad_value
+
+        if upsample_factor is None:
+            upsample_factor = 1.0
+
+        image_interp, weight_interp = bilinear_kde_torch(
+            xa=xa * upsample_factor,  # rows
+            ya=ya * upsample_factor,  # cols
+            values=image,
+            output_shape=tuple(np.round(np.array(output_shape) * upsample_factor).astype("int")),
+            kde_sigma=kde_sigma * upsample_factor,
+            device=self.device,
+            pad_value=pad_value,
+            return_pix_count=True,
+        )
+
+        return image_interp, weight_interp
+
+    def set_pad_value(
+        self,
+        pad_value,
+    ):
+        self.pad_value = pad_value
 
 
 def bounded_sine_sigmoid(x, midpoint=0.5, width=1.0):
