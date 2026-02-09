@@ -3106,6 +3106,17 @@ class Lattice(AutoSerialize):
         plt.title("Gaussian fit of ∆Intensity")
         plt.grid("on")
 
+        plt.figure(figsize=(6, 7), dpi=300)
+        plt.hist(self.delta_assume[:, 0], bins=hist_bins)
+        plt.xlabel(
+            r"$I_{site}-\mathrm{median}(I_{A\,\mathrm{neighbors}})$ $(\Delta I)$", fontsize=15
+        )
+        plt.ylabel("A-site count", fontsize=15)
+        # plt.title("Histogram of ∆Intensity")
+        plt.xticks(fontsize=15)
+        plt.yticks(fontsize=15)
+        plt.grid("on")
+
         # use the estimates to retrieve the sites
         # positions_b = self.bsites_assume[:,1:]
         # b_int = self.bsites_assume[:,0]
