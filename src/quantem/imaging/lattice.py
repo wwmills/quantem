@@ -3109,12 +3109,14 @@ class Lattice(AutoSerialize):
         plt.figure(figsize=(6, 7), dpi=300)
         plt.hist(self.delta_assume[:, 0], bins=hist_bins)
         plt.xlabel(
-            r"$I_{site}-\mathrm{median}(I_{A\,\mathrm{neighbors}})$ $(\Delta I)$", fontsize=15
+            r"$I_{site}-\mathrm{median}(I_{A\,\mathrm{neighbors}})$ $(\Delta I)$",
+            fontsize=15,
+            family="Arial",
         )
-        plt.ylabel("A-site count", fontsize=15)
+        plt.ylabel("A-site count", fontsize=15, family="Arial")
         # plt.title("Histogram of ∆Intensity")
-        plt.xticks(fontsize=15)
-        plt.yticks(fontsize=15)
+        plt.xticks(fontsize=15, family="Arial")
+        plt.yticks(fontsize=15, family="Arial")
         plt.grid("on")
 
         # use the estimates to retrieve the sites
