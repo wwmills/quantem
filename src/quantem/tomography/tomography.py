@@ -128,7 +128,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 print("num_samples_per_ray schedule provided.")
 
         print(f"N: {N}, num_samples_per_ray: {num_samples_per_ray}")
-        for a0 in range(num_iter):
+        for a0 in tqdm(range(num_iter), desc="Epochs"):
             with nvtx_range(profiling_mode, f"Epoch {a0}"):
                 consistency_loss = 0.0
                 total_loss = 0.0
