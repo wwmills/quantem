@@ -333,8 +333,6 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
             return shifts, torch.zeros_like(z1), torch.zeros_like(z3)
         elif self.learn_tilt_axis:
             return torch.zeros_like(shifts), z1, z3
-        elif self.learn_shift and self.learn_tilt_axis:
-            return shifts, z1, z3
         else:
             return torch.zeros_like(shifts), torch.zeros_like(z1), torch.zeros_like(z3)
 
@@ -543,6 +541,7 @@ class TomographyINRPretrainDataset(Dataset):
     def __getitem__(self, idx):
         return {"coords": self.coords[idx], "target": self.targets[idx]}
 
+
 class TomographyThroughFocalINRDataset(TomographyINRDataset):
     """
     Dataset class for INR-based tomography that assumes non-parallel illumination condition.
@@ -571,13 +570,36 @@ class TomographyThroughFocalINRDataset(TomographyINRDataset):
         self._convergence_angle = convergence_angle
         self._random_rays = random_rays
 
-        if not isinstance(z_focus, torch.Tensor):
-            z_focus = torch.tensor(z_focus, dtype=torch.float32)
+        self.print_thing = True
 
-        if learn_z_focus:
-            self._z_focus = torch.nn.Parameter(z_focus)
-        else:
-            self._z_focus = z_focus
+        if not random_rays:
+            theta, phi = self.get_theta_phi(
+                convergence_angle=convergence_angle,
+                num_rays=num_rays,
+                random_rays=random_rays,
+            )
+
+            self.phis = phi
+            self.thetas = theta
+
+            w = torch.sinc(self.phis / (2 * self.convergence_angle)) ** 2
+            w = w / w.sum()
+            self._ray_weights = w.view(1, 1, -1)
+
+        # if not isinstance(z_focus, torch.Tensor):
+        #     z_focus = torch.tensor(z_focus, dtype=torch.float32)
+
+        # if learn_z_focus:
+        #     self._z_focus = torch.nn.Parameter(z_focus)
+        # else:
+        #     self._z_focus = z_focus
+
+        # TODO: The parameters won't be initialized unless .to(device) is called.
+        # Fixed zeros for reference tilt
+        self._z_focuses = torch.zeros(self.learnable_tilts)
+
+        # Fixed zeros for reference tilt
+        self._z_focus_ref = torch.zeros(1)
 
     @property
     def convergence_angle(self) -> float:
@@ -588,11 +610,52 @@ class TomographyThroughFocalINRDataset(TomographyINRDataset):
         return self._random_rays
 
     @property
-    def z_focus(self) -> torch.Tensor:
-        return self._z_focus
+    def z_focus_params(self) -> torch.nn.Parameter:
+        return self._z_focus_params
+
+    @z_focus_params.setter
+    def z_focus_params(self, z_focus_angles: torch.Tensor, device: str):
+        self._z_focus_params = nn.Parameter(z_focus_angles.to(device))
+
+    # --- Forward Pass w/ Params Method for OptimizerMixin ---
+    def forward(self, dummy_input: Any = None):
+        """
+        Forward pass for INR-based through focal tomography. In the forward pass, the only parameters that
+        are passed will be the shifts, focal plane, z1 and z3 Euler angles.
+        """
+
+        first_half_shifts = self.shifts_params[: self.reference_tilt_idx]
+        second_half_shifts = self.shifts_params[self.reference_tilt_idx :]
+        shifts = torch.cat([first_half_shifts, self._shifts_ref, second_half_shifts], dim=0)
+
+        first_half_z1 = self.z1_params[: self.reference_tilt_idx]
+        second_half_z1 = self.z1_params[self.reference_tilt_idx :]
+        z1 = torch.cat([first_half_z1, self._z1_ref, second_half_z1], dim=0)
+
+        first_half_z3 = self.z3_params[: self.reference_tilt_idx]
+        second_half_z3 = self.z3_params[self.reference_tilt_idx :]
+        z3 = torch.cat([first_half_z3, self._z3_ref, second_half_z3], dim=0)
+
+        first_half_z_focus = self.z_focus_params[: self.reference_tilt_idx]
+        second_half_z_focus = self.z_focus_params[self.reference_tilt_idx :]
+        z_focus = torch.cat([first_half_z_focus, self._z_focus_ref, second_half_z_focus], dim=0)
+
+        if self.learn_shift and self.learn_tilt_axis:
+            return shifts, z1, z3, z_focus
+        elif self.learn_shift:
+            return shifts, torch.zeros_like(z1), torch.zeros_like(z3), z_focus
+        elif self.learn_tilt_axis:
+            return torch.zeros_like(shifts), z1, z3, z_focus
+        elif self.learn_shift and self.learn_tilt_axis:
+            return shifts, z1, z3, z_focus
+        else:
+            return torch.zeros_like(shifts), torch.zeros_like(z1), torch.zeros_like(z3), z_focus
 
     def get_coords(
-        self, batch: dict[str, torch.Tensor], N: int, num_samples_per_ray: int,
+        self,
+        batch: dict[str, torch.Tensor],
+        N: int,
+        num_samples_per_ray: int,
     ) -> torch.Tensor:
         num_rays = self.num_rays
         convergence_angle = self._convergence_angle
@@ -602,21 +665,22 @@ class TomographyThroughFocalINRDataset(TomographyINRDataset):
         # target_values = batch["target_value"].to(self.device, non_blocking=True)
         phis = batch["phi"].to(self.device, non_blocking=True)
         projection_indices = batch["projection_idx"].to(self.device, non_blocking=True)
-        with torch.no_grad():
-            batch_ray_coords = self.create_batch_rays(
-                pixel_i,
-                pixel_j,
-                N,
-                num_samples_per_ray,
-                num_rays,
-                convergence_angle,
-                random_rays,
-                )
-
-        shifts, z1_params, z3_params = self.forward(None)
+        shifts, z1_params, z3_params, z_focus_params = self.forward(None)
         batch_shifts = torch.index_select(shifts, 0, projection_indices)
         batch_z1 = torch.index_select(z1_params, 0, projection_indices)
         batch_z3 = torch.index_select(z3_params, 0, projection_indices)
+        batch_z_focus = torch.index_select(z_focus_params, 0, projection_indices)
+        # with torch.no_grad():
+        batch_ray_coords = self.create_batch_rays(
+            pixel_i,
+            pixel_j,
+            N,
+            num_samples_per_ray,
+            num_rays,
+            convergence_angle,
+            random_rays,
+            z_focus=batch_z_focus,
+        )
 
         transformed_rays = self.transform_batch_rays(
             batch_ray_coords,
@@ -632,142 +696,133 @@ class TomographyThroughFocalINRDataset(TomographyINRDataset):
         all_coords = all_coords.to(self.device, dtype=torch.float32, non_blocking=True)
         return all_coords
 
+    def get_theta_phi(
+        self,
+        convergence_angle: float,
+        num_rays: int,
+        device: torch.device | str | None = None,
+        random_rays: bool = False,
+    ):
+        if device is None:
+            device = torch.device("cpu")
+
+        num_rays = int(num_rays)
+
+        # random_rays sampling method
+        if random_rays:
+            theta = torch.rand(num_rays, device=device) * 2 * torch.pi
+            phi = torch.rand(num_rays, device=device) * convergence_angle
+
+        else:
+            # 1 ray: single central ray
+            if num_rays == 1:
+                theta = torch.zeros(1, device=device)
+                phi = torch.zeros(1, device=device)
+
+            # 2 or 3 rays: single ring
+            elif num_rays == 2 or num_rays == 3:
+                rand_offset = torch.rand(1, device=device) * 2 * torch.pi
+                theta = (
+                    torch.linspace(0, 2 * torch.pi, num_rays + 1, device=device)[:-1] + rand_offset
+                )
+                phi = torch.full(
+                    (num_rays,), 0.5 * convergence_angle, device=device
+                )  # for the case where there is no center ray, use half of the convergence angle.
+
+            # 4–8 rays: central + ring
+            elif 3 < num_rays < 9:
+                rand_offset = torch.rand(1, device=device) * 2 * torch.pi
+                theta0 = torch.zeros(1, device=device)
+                phi0 = torch.zeros(1, device=device)
+                theta_ring = (
+                    torch.linspace(0, 2 * torch.pi, num_rays, device=device)[:-1] + rand_offset
+                )
+                phi_ring = torch.full((num_rays - 1,), 1 * convergence_angle, device=device)
+                theta = torch.cat((theta0, theta_ring))
+                phi = torch.cat((phi0, phi_ring))
+
+            # 9 rays: two rings. Rays at 1/3 and 2/3 * convergence angle
+            elif num_rays == 9:
+                rand_offset = torch.rand(1, device=device) * 2 * torch.pi
+                theta_inner = torch.linspace(0, 2 * torch.pi, 4, device=device)[:-1] + rand_offset
+                phi_inner = torch.full((3,), convergence_angle / 3, device=device)
+                theta_outer = torch.linspace(0, 2 * torch.pi, 7, device=device)[:-1] + rand_offset
+                phi_outer = torch.full((6,), 2 * convergence_angle / 3, device=device)
+                theta = torch.cat((theta_inner, theta_outer))
+                phi = torch.cat((phi_inner, phi_outer))
+
+            # 10 rays: two rings, one central ray. Rays at 0, 1/2 and 1 * convergence angle
+            elif num_rays == 10:
+                rand_offset = torch.rand(1, device=device) * 2 * torch.pi
+                theta0 = torch.zeros(1, device=device)
+                phi0 = torch.zeros(1, device=device)
+
+                theta_inner = torch.linspace(0, 2 * torch.pi, 4, device=device)[:-1] + rand_offset
+                phi_inner = torch.full((3,), convergence_angle / 3, device=device)
+                theta_outer = torch.linspace(0, 2 * torch.pi, 7, device=device)[:-1] + rand_offset
+                phi_outer = torch.full((6,), 2 * convergence_angle / 3, device=device)
+                theta = torch.cat((theta0, theta_inner, theta_outer))
+                phi = torch.cat((phi0, phi_inner, phi_outer))
+
+            # 19 rays: central + two rings. Rays at 0, 1/2 and 1 * convergence angle
+            elif num_rays == 19:
+                rand_offset = torch.rand(1, device=device) * 2 * torch.pi
+                theta0 = torch.zeros(1, device=device)
+                phi0 = torch.zeros(1, device=device)
+                theta_inner = torch.linspace(0, 2 * torch.pi, 7, device=device)[:-1] + rand_offset
+                phi_inner = torch.full((6,), convergence_angle / 2, device=device)
+                theta_outer = torch.linspace(0, 2 * torch.pi, 13, device=device)[:-1] + rand_offset
+                phi_outer = torch.full((12,), 1 * convergence_angle, device=device)
+                theta = torch.cat((theta0, theta_inner, theta_outer))
+                phi = torch.cat((phi0, phi_inner, phi_outer))
+
+            # Unsupported ray counts
+            else:
+                raise ValueError(
+                    f"Unsupported num_rays={num_rays}. "
+                    "Supported values are: 1, 2, 3, 4–8, 9, 10, 19."
+                )
+
+        return theta, phi
+
     # @staticmethod
-    @torch.compile(mode="reduce-overhead")
+    # @torch.compile(mode="reduce-overhead")
     def create_batch_rays(
         self,
-        pixel_i: torch.Tensor, pixel_j: torch.Tensor, N: int, num_samples_per_ray: int,
-        num_rays: int, convergence_angle: float, random_rays: bool,
+        pixel_i: torch.Tensor,
+        pixel_j: torch.Tensor,
+        N: int,
+        num_samples_per_ray: int,
+        num_rays: int,
+        convergence_angle: float,
+        random_rays: bool,
+        z_focus: torch.Tensor,
     ) -> torch.Tensor:
         batch_size = len(pixel_i)
         x_coords_0 = (pixel_j / (N - 1)) * 2 - 1
         y_coords_0 = (pixel_i / (N - 1)) * 2 - 1
         z_coords = torch.linspace(-1, 1, num_samples_per_ray, device=pixel_i.device)
 
-        def get_theta_phi(
-            convergence_angle: float,
-            num_rays: int,
-            device: torch.device | None = None,
-            random_rays: bool = False,
-        ):
-            if device is None:
-                device = torch.device("cpu")
+        if self._random_rays:
+            thetas, phis = self.get_theta_phi(
+                convergence_angle=convergence_angle,
+                num_rays=num_rays,
+                device=self.device,
+                random_rays=random_rays,
+            )
+            self.phis = phis
+            self.thetas = thetas
+        else:
+            phis = self.phis
+            thetas = self.thetas
 
-            num_rays = int(num_rays)
-
-            # random_rays sampling method
-            if random_rays:
-                theta = torch.rand(num_rays, device = device) * 2 * torch.pi
-                phi = torch.rand(num_rays, device = device) * convergence_angle
-
-            else:
-                # 1 ray: single central ray
-                if num_rays == 1:
-                    theta = torch.zeros(1, device=device)
-                    phi = torch.zeros(1, device=device)
-
-                # 2 or 3 rays: single ring
-                elif num_rays == 2 or num_rays == 3:
-                    rand_offset = torch.rand(1, device=device) * 2 * torch.pi
-                    theta = (
-                        torch.linspace(0, 2 * torch.pi, num_rays + 1, device=device)[:-1]
-                        + rand_offset
-                    )
-                    phi = torch.full((num_rays,), 0.5 * convergence_angle, device=device) # for the case where there is no center ray, use half of the convergence angle.
-
-                # 4–8 rays: central + ring
-                elif 3 < num_rays < 9:
-                    rand_offset = torch.rand(1, device=device) * 2 * torch.pi
-                    theta0 = torch.zeros(1, device=device)
-                    phi0 = torch.zeros(1, device=device)
-                    theta_ring = (
-                        torch.linspace(0, 2 * torch.pi, num_rays, device=device)[:-1]
-                        + rand_offset
-                    )
-                    phi_ring = torch.full(
-                        (num_rays - 1,), 1 * convergence_angle, device=device
-                    )
-                    theta = torch.cat((theta0, theta_ring))
-                    phi = torch.cat((phi0, phi_ring))
-
-                # 9 rays: two rings. Rays at 1/3 and 2/3 * convergence angle
-                elif num_rays == 9:
-                    rand_offset = torch.rand(1, device=device) * 2 * torch.pi
-                    theta_inner = (
-                        torch.linspace(0, 2 * torch.pi, 4, device=device)[:-1]
-                        + rand_offset
-                    )
-                    phi_inner = torch.full((3,), convergence_angle / 3, device=device)
-                    theta_outer = (
-                        torch.linspace(0, 2 * torch.pi, 7, device=device)[:-1]
-                        + rand_offset
-                    )
-                    phi_outer = torch.full((6,), 2 * convergence_angle / 3, device=device)
-                    theta = torch.cat((theta_inner, theta_outer))
-                    phi = torch.cat((phi_inner, phi_outer))
-
-                # 10 rays: two rings, one central ray. Rays at 0, 1/2 and 1 * convergence angle
-                elif num_rays == 10:
-                    rand_offset = torch.rand(1, device=device) * 2 * torch.pi
-                    theta0 = torch.zeros(1, device=device)
-                    phi0 = torch.zeros(1, device=device)
-
-                    theta_inner = (
-                        torch.linspace(0, 2 * torch.pi, 4, device=device)[:-1]
-                        + rand_offset
-                    )
-                    phi_inner = torch.full((3,), convergence_angle / 3, device=device)
-                    theta_outer = (
-                        torch.linspace(0, 2 * torch.pi, 7, device=device)[:-1]
-                        + rand_offset
-                    )
-                    phi_outer = torch.full((6,), 2 * convergence_angle / 3, device=device)
-                    theta = torch.cat((theta0, theta_inner, theta_outer))
-                    phi = torch.cat((phi0, phi_inner, phi_outer))
-
-                # 19 rays: central + two rings. Rays at 0, 1/2 and 1 * convergence angle
-                elif num_rays == 19:
-                    rand_offset = torch.rand(1, device=device) * 2 * torch.pi
-                    theta0 = torch.zeros(1, device=device)
-                    phi0 = torch.zeros(1, device=device)
-                    theta_inner = (
-                        torch.linspace(0, 2 * torch.pi, 7, device=device)[:-1]
-                        + rand_offset
-                    )
-                    phi_inner = torch.full((6,), convergence_angle / 2, device=device)
-                    theta_outer = (
-                        torch.linspace(0, 2 * torch.pi, 13, device=device)[:-1]
-                        + rand_offset
-                    )
-                    phi_outer = torch.full((12,), 1 * convergence_angle, device=device)
-                    theta = torch.cat((theta0, theta_inner, theta_outer))
-                    phi = torch.cat((phi0, phi_inner, phi_outer))
-
-                # Unsupported ray counts
-                else:
-                    raise ValueError(
-                        f"Unsupported num_rays={num_rays}. "
-                        "Supported values are: 1, 2, 3, 4–8, 9, 10, 19."
-                    )
-
-            return theta, phi
-
-        theta, phi = get_theta_phi(
-            convergence_angle = convergence_angle,
-            num_rays = num_rays,
-            device = pixel_i.device,
-            random_rays = random_rays,
-        )
-
-        dz = z_coords[None, :] - self._z_focus
-        dx = torch.tan(phi)[:, None] * torch.cos(theta)[:, None] * dz
-        dy = torch.tan(phi)[:, None] * torch.sin(theta)[:, None] * dz
+        dz = z_coords[None, None, :] - z_focus[:, None, None]
+        dx = torch.tan(phis)[:, None] * torch.cos(thetas)[:, None] * dz
+        dy = torch.tan(phis)[:, None] * torch.sin(thetas)[:, None] * dz
 
         x_coords = x_coords_0[:, None, None] + dx[None, :, :]
         y_coords = y_coords_0[:, None, None] + dy[None, :, :]
-        z_coords = z_coords[None, None, :].expand(
-            batch_size, num_rays, num_samples_per_ray
-        )
+        z_coords = z_coords[None, None, :].expand(batch_size, num_rays, num_samples_per_ray)
 
         x_coords = x_coords.reshape(batch_size, num_rays * num_samples_per_ray)
         y_coords = y_coords.reshape(batch_size, num_rays * num_samples_per_ray)
@@ -790,17 +845,31 @@ class TomographyThroughFocalINRDataset(TomographyINRDataset):
     @torch.compile(mode="reduce-overhead")
     def integrate_rays(
         self,
-        rays: torch.Tensor, num_samples_per_ray: int, target_values_len: int,
+        rays: torch.Tensor,
+        num_samples_per_ray: int,
+        target_values_len: int,
     ) -> torch.Tensor:
         num_rays = self.num_rays
         ray_densities = rays.view(
             target_values_len,
-            # num_samples_per_ray,
-            num_samples_per_ray * num_rays,
+            num_samples_per_ray,
+            num_rays,
         )
+        if self._random_rays:
+            w = torch.sinc(self.phis / self.convergence_angle) ** 2
+            w = w / w.sum()
+            self._ray_weights = w.view(1, 1, -1)
+
+        predicted_values_all_rays = (ray_densities @ self._ray_weights.view(-1, 1)).squeeze(-1)
+
+        if self.print_thing:
+            print(self._ray_weights)
+            print(self.phis)
+            self.print_thing = False
+
         step_size = 2.0 / (num_samples_per_ray - 1)
 
-        predicted_values = ray_densities.sum(dim=1) * step_size
+        predicted_values = predicted_values_all_rays.sum(dim=1) * step_size
 
         return predicted_values
 
@@ -814,7 +883,6 @@ class TomographyThroughFocalINRDataset(TomographyINRDataset):
         N: int,
         sampling_rate: float,
     ) -> torch.Tensor:
-
         shift_x_norm = (shifts[:, 0:1] * sampling_rate * 2) / (N - 1)
         shift_y_norm = (shifts[:, 1:2] * sampling_rate * 2) / (N - 1)
 
@@ -852,6 +920,25 @@ class TomographyThroughFocalINRDataset(TomographyINRDataset):
         transformed_rays = torch.stack([rays_x_final, rays_y_final, rays_z_final], dim=2)
 
         return transformed_rays
+
+    def to(self, device: str):
+        self._z1_params = nn.Parameter(self._z1_angles.to(device))
+        self._z3_params = nn.Parameter(self._z3_angles.to(device))
+        self._shifts_params = nn.Parameter(self._shifts.to(device))
+        self._z_focus_params = nn.Parameter(self._z_focuses.to(device))
+
+        self._z1_ref = self._z1_ref.to(device)
+        self._z3_ref = self._z3_ref.to(device)
+        self._shifts_ref = self._shifts_ref.to(device)
+        self._z_focus_ref = self._z_focus_ref.to(device)
+
+        if hasattr(self, "_ray_weights"):
+            self._ray_weights = self._ray_weights.to(device)
+            self.phis = self.phis.to(device)
+            self.thetas = self.thetas.to(device)
+
+        self.device = device
+        self.reconnect_optimizer_to_parameters()
 
 
 DatasetModelType = TomographyINRDataset | TomographyPixDataset | TomographyThroughFocalINRDataset
