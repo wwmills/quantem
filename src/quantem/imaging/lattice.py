@@ -3263,7 +3263,7 @@ class Lattice(AutoSerialize):
     ):
         import ipywidgets as widgets
         import matplotlib.patches as patches
-        from ipywidgets import interactive_output
+        from ipywidgets import HBox, VBox, interactive_output
 
         if init_threshold_low is None:
             init_threshold_low = np.min(self.delta_assume[:, 0]) + 0.01
@@ -3409,11 +3409,14 @@ class Lattice(AutoSerialize):
                     plt.title("Histogram of ∆Intensity")
                     plt.grid("on")
 
-        interactive_output(
+        ui = VBox([HBox([thresh_slider_l, thresh_slider_h])])
+        out_plot = interactive_output(
             circle_defects, {"delta_low": thresh_slider_l, "delta_high": thresh_slider_h}
         )
+        from IPython.display import display
 
-        # display(ui, out_plot)
+        display(ui, out_plot)
+
         return self
 
     def delta_intensities_input(
