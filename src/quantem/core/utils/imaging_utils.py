@@ -3,6 +3,7 @@
 import math
 from typing import Optional, Tuple
 
+import kornia as K
 import numpy as np
 import torch
 from numpy.typing import NDArray
@@ -30,25 +31,6 @@ def dft_upsample(
         xp = cp
     else:
         xp = np
-
-    F = xp.asarray(F)
-    if F.ndim != 2:
-        raise ValueError(f"F must be 2D, got shape {F.shape}")
-
-    M, N = int(F.shape[0]), int(F.shape[1])
-    if M == 0 or N == 0:
-        raise ValueError(f"F has empty dimension: M={M}, N={N}")
-
-    if xp.any(xp.isnan(F)) or xp.any(xp.isinf(F)):
-        n_nan = int(xp.sum(xp.isnan(F)).item())
-        n_inf = int(xp.sum(xp.isinf(F)).item())
-        raise ValueError(
-            f"Input F contains NaN/Inf (n_nan={n_nan}, n_inf={n_inf}). "
-            "Trace this back to earlier processing (masking / divisions)."
-        )
-
-    # print(shift)
-    # print(up)
 
     M, N = F.shape
     du = np.ceil(1.5 * up).astype(int)
@@ -117,16 +99,22 @@ def cross_correlation_shift(
     cc = F_ref * xp.conj(F_im)
     cc_real = xp.real(xp.fft.ifft2(cc))
 
-    if max_shift is not None:
+    # if max_shift is not None:
+    #     x = np.fft.fftfreq(cc.shape[0], 1 / cc.shape[0])
+    #     y = np.fft.fftfreq(cc.shape[1], 1 / cc.shape[1])
+    #     mask = x[:, None] ** 2 + y[None, :] ** 2 >= max_shift**2
+    #     cc_real[mask] = 0.0
+
+    if max_shift is not None or min_shift is not None:
         x = np.fft.fftfreq(cc.shape[0], 1 / cc.shape[0])
         y = np.fft.fftfreq(cc.shape[1], 1 / cc.shape[1])
-        mask = x[:, None] ** 2 + y[None, :] ** 2 >= max_shift**2
-        cc_real[mask] = 0.0
-    if min_shift is not None:
-        x = np.fft.fftfreq(cc.shape[0], 1 / cc.shape[0])
-        y = np.fft.fftfreq(cc.shape[1], 1 / cc.shape[1])
-        mask = x[:, None] ** 2 + y[None, :] ** 2 <= min_shift**2
-        cc_real[mask] = -1
+        r2 = x[:, None] ** 2 + y[None, :] ** 2
+
+        if max_shift is not None:
+            cc_real[r2 > max_shift**2] = 0.0
+
+        if min_shift is not None:
+            cc_real[r2 < min_shift**2] = 0.0
 
     # Coarse peak
     peak = xp.unravel_index(xp.argmax(cc_real), cc_real.shape)
@@ -140,12 +128,6 @@ def cross_correlation_shift(
     vy = cc_real[x0, y_inds]
 
     def parabolic_peak(v):
-        if 4 * v[1] - 2 * v[2] - 2 * v[0] < 1e-9:
-            # print(v)
-            # print(v[2] - v[0])
-            # print(4 * v[1] - 2 * v[2] - 2 * v[0])
-            # print((v[2] - v[0]) / (4 * v[1] - 2 * v[2] - 2 * v[0]))
-            print("nan encountered")
         return (v[2] - v[0]) / (4 * v[1] - 2 * v[2] - 2 * v[0])
 
     dx = parabolic_peak(vx)
@@ -158,6 +140,7 @@ def cross_correlation_shift(
         shifts = (x0, y0)
     else:
         # Local DFT upsampling
+
         local = dft_upsample(cc, upsample_factor, (x0, y0), device=device)
         peak = np.unravel_index(xp.argmax(local), local.shape)
 
@@ -194,7 +177,10 @@ def cross_correlation_shift(
 
 
 def cross_correlation_shift_torch(
-    im_ref: torch.Tensor, im: torch.Tensor, upsample_factor: int = 2
+    im_ref: torch.Tensor,
+    im: torch.Tensor,
+    upsample_factor: int = 2,
+    return_shifted_image: bool = False,
 ) -> torch.Tensor:
     """
     Align two real images using Fourier cross-correlation and DFT upsampling.
@@ -210,7 +196,17 @@ def cross_correlation_shift_torch(
     dx = ((xy_shift[0] + M / 2) % M) - M / 2
     dy = ((xy_shift[1] + N / 2) % N) - N / 2
 
-    return torch.tensor([dx, dy], device=G1.device)
+    if not return_shifted_image:
+        return torch.tensor([dx, dy], device=G1.device)
+
+    # Fourier shift image (F_im assumed to be FFT)
+    kx = torch.fft.fftfreq(G2.shape[0])[:, None]
+    ky = torch.fft.fftfreq(G2.shape[1])[None, :]
+    phase_ramp = torch.exp(-2j * np.pi * (kx * dx + ky * dy))
+    G2_shifted = G2 * phase_ramp
+    image_shifted = torch.real(torch.fft.ifft2(G2_shifted))
+
+    return torch.tensor([dx, dy], device=G1.device), image_shifted.detach().clone()
 
 
 def align_images_fourier_torch(
@@ -475,6 +471,138 @@ def bilinear_kde(
         return image, pix_count
     else:
         return image
+
+
+def bilinear_kde_torch(
+    xa: torch.Tensor,
+    ya: torch.Tensor,
+    values: torch.Tensor,
+    output_shape: Tuple[int, int],
+    kde_sigma: float,
+    device: torch.device,
+    pad_value: float = 0.0,
+    threshold: float = 1e-3,
+    lowpass_filter: bool = False,
+    max_batch_size: Optional[int] = None,
+    return_pix_count: bool = False,
+) -> torch.Tensor:
+    """
+    Compute a bilinear kernel density estimate (KDE) with smooth threshold masking.
+
+    Parameters
+    ----------
+    xa : NDArray
+        Vertical (row) coordinates of input points.
+    ya : NDArray
+        Horizontal (col) coordinates of input points.
+    values : NDArray
+        Weights for each (xa, ya) point.
+    output_shape : tuple of int
+        Output image shape (rows, cols).
+    kde_sigma : float
+        Standard deviation of Gaussian KDE smoothing.
+    pad_value : float, default = 1.0
+        Value to return when KDE support is too low.
+    threshold : float, default = 1e-3
+        Minimum counts_KDE value for trusting the output signal.
+    lowpass_filter : bool, optional
+        If True, apply sinc-based inverse filtering to deconvolve the kernel.
+    max_batch_size : int or None, optional
+        Max number of points to process in one batch.
+
+    Returns
+    -------
+    NDArray
+        The estimated KDE image with threshold-masked output.
+    """
+    rows, cols = output_shape
+    xF = torch.floor(xa.ravel()).long()
+    yF = torch.floor(ya.ravel()).long()
+    dx = xa.ravel() - xF
+    dy = ya.ravel() - yF
+    w = values.ravel()
+
+    pix_count = torch.zeros(rows * cols, dtype=torch.float32, device=device)
+    pix_output = torch.zeros(rows * cols, dtype=torch.float32, device=device)
+
+    if max_batch_size is None:
+        max_batch_size = xF.shape[0]
+
+    for start, end in generate_batches(xF.shape[0], max_batch=max_batch_size):
+        for dx_off, dy_off, weights in [
+            (0, 0, (1 - dx[start:end]) * (1 - dy[start:end])),
+            (1, 0, dx[start:end] * (1 - dy[start:end])),
+            (0, 1, (1 - dx[start:end]) * dy[start:end]),
+            (1, 1, dx[start:end] * dy[start:end]),
+        ]:
+            # inds = [xF[start:end] + dx_off, yF[start:end] + dy_off]
+            # inds_1D = ravel_multi_index_torch(inds, dims=output_shape).long()
+            xi = (xF[start:end] + dx_off) % rows
+            yi = (yF[start:end] + dy_off) % cols
+            inds_1D = xi * cols + yi
+
+            # pix_count += torch.bincount(inds_1D, weights=weights, minlength=rows * cols)
+            # pix_output += torch.bincount(
+            #     inds_1D, weights=weights * w[start:end], minlength=rows * cols
+            # )
+            pix_count.scatter_add_(0, inds_1D, weights)
+            pix_output.scatter_add_(0, inds_1D, weights * w[start:end])
+
+    # Reshape to 2D and apply Gaussian KDE
+    # print('output shape', output_shape)
+
+    # pix_count = pix_count.reshape(output_shape)
+    # pix_output = pix_output.reshape(output_shape)
+    pix_count = torch.reshape(pix_count, output_shape)
+    pix_output = torch.reshape(pix_output, output_shape)
+
+    kernel_size = 5
+
+    pix_count = K.filters.gaussian_blur2d(
+        pix_count[None, None], (kernel_size, kernel_size), (kde_sigma, kde_sigma)
+    )[0, 0]
+    pix_output = K.filters.gaussian_blur2d(
+        pix_output[None, None], (kernel_size, kernel_size), (kde_sigma, kde_sigma)
+    )[0, 0]
+
+    # pix_count = gaussian_filter(pix_count, kde_sigma)
+    # pix_output = gaussian_filter(pix_output, kde_sigma)
+
+    # Final image
+    weight = torch.clamp(pix_count / threshold, max=1.0)
+    image = pad_value * (1.0 - weight) + weight * (pix_output / torch.clamp(pix_count, min=1e-8))
+
+    if lowpass_filter:
+        f_img = torch.fft.fft2(image)
+        fx = torch.fft.fftfreq(rows)
+        fy = torch.fft.fftfreq(cols)
+        f_img /= torch.sinc(fx)[:, None]  # type: ignore
+        f_img /= torch.sinc(fy)[None, :]  # type: ignore
+        image = torch.real(torch.fft.ifft2(f_img))
+
+        if return_pix_count:
+            f_img = torch.fft.fft2(pix_count)
+            f_img /= torch.sinc(fx)[:, None]  # type: ignore
+            f_img /= torch.sinc(fy)[None, :]  # type: ignore
+            pix_count = torch.real(torch.fft.ifft2(f_img))
+
+    if return_pix_count:
+        return image, pix_count
+    else:
+        return image
+
+
+def ravel_multi_index_torch(inds, dims):
+    """
+    inds: tuple of N 1D tensors
+    dims: tuple of N ints
+    returns: 1D tensor of flat indices
+    """
+    N = len(dims)
+    dims = torch.tensor(dims, device=inds[0].device)
+    strides = torch.cumprod(torch.cat([dims[1:], torch.ones(1, device=dims.device)]), dim=0)
+    flat = sum((inds[i] % dims[i]) * strides[i] for i in range(N))
+    return flat
 
 
 def bilinear_array_interpolation(
