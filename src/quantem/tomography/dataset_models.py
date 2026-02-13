@@ -702,6 +702,7 @@ class TomographyThroughFocalINRDataset(TomographyINRDataset):
         num_rays: int,
         device: torch.device | str | None = None,
         random_rays: bool = False,
+        random_method: str = 'g',
     ):
         if device is None:
             device = torch.device("cpu")
@@ -710,8 +711,25 @@ class TomographyThroughFocalINRDataset(TomographyINRDataset):
 
         # random_rays sampling method
         if random_rays:
-            theta = torch.rand(num_rays, device=device) * 2 * torch.pi
-            phi = torch.rand(num_rays, device=device) * convergence_angle
+            theta = torch.rand(num_rays, device=device) * 2 * torch.pi # this can stay as uniform sampling
+            # phi = torch.rand(num_rays, device=device) * convergence_angle # the original uniform sampling of phi
+            if random_method.lower() in ['gaussian','g']:
+                phi = torch.normal(mean = 0.0, std = convergence_angle, size = (num_rays,), device=device)
+
+            # let's also do the sinc squared, which might be slower?
+            # essentially, torch doesn't have a sinc**2 distribution built in, but we can just make a discrete one ourselves
+            elif random_method.lower() in ['sinc','s']:
+                x = torch.linspace(-0.5, 0.5, 5000) # in radians
+                pdf = torch.sinc(x)**2 # 
+                pdf = pdf/pdf.sum() # normalize to 1
+                indices = torch.multinomial(pdf, num_rays, replacement=True)
+                phi = x[indices]
+            else:
+                raise ValueError(
+                    f"Unsupported random_method={random_method}. "
+                    "Supported values are: gaussian, g, sinc, s. .lower() is applied internally."
+                )
+
 
         else:
             # 1 ray: single central ray
@@ -856,14 +874,19 @@ class TomographyThroughFocalINRDataset(TomographyINRDataset):
             num_rays,
         )
         if self._random_rays:
-            w = torch.sinc(self.phis / self.convergence_angle) ** 2
-            w = w / w.sum()
-            self._ray_weights = w.view(1, 1, -1)
+            # original weight generation for uniformly sampled rays
+            # w = torch.sinc(self.phis / self.convergence_angle) ** 2
+            # w = w / w.sum()
+            # self._ray_weights = w.view(1, 1, -1)
+            # now we want to use equal weights
+            predicted_values_all_rays = ray_densities.view(target_values_len, -1) # this will just be equal weights
 
-        predicted_values_all_rays = (ray_densities @ self._ray_weights.view(-1, 1)).squeeze(-1)
+        else:
+            predicted_values_all_rays = (ray_densities @ self._ray_weights.view(-1, 1)).squeeze(-1)
 
         if self.print_thing:
-            print(self._ray_weights)
+            if not self._random_rays:
+                print(self._ray_weights)
             print(self.phis)
             self.print_thing = False
 
