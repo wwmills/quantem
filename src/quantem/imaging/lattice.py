@@ -1812,6 +1812,7 @@ class Lattice(AutoSerialize):
     ):
         self.check_for_dislocations = check_for_dislocations and check_uv_duplication
         # find all candidates above threshold
+        # print('a-1')
         maxima_candidates = self.get_maxima_2D(
             self.image.array,
             subpixel=subpixel,
@@ -1825,6 +1826,7 @@ class Lattice(AutoSerialize):
             maxNumPeaks=maxNumPeaks,
         )
 
+        # print('a0')
         H, W = self._image.shape  # x=rows, y=cols
 
         fig, ax = plt.subplots(figsize=(5, 5), dpi=300)
@@ -1849,6 +1851,7 @@ class Lattice(AutoSerialize):
             origin_y = maxima_candidates[max_intensity_index]["y"]
             origin = np.array([origin_x, origin_y])
 
+        # print('a00')
         if u is None or v is None:
             uv_result_inv = self.auto_peak_finder(
                 num_peaks_search=num_peaks_search,
@@ -1872,6 +1875,8 @@ class Lattice(AutoSerialize):
             v = np.array([a_transpose[1, 0], a_transpose[1, 1]])
             self.u = u
             self.v = v
+
+        # print('a1')
 
         if positions_frac is None:
             positions_frac = np.atleast_2d(np.array((0, 0)))  # 1, 1
@@ -1996,6 +2001,7 @@ class Lattice(AutoSerialize):
         self.tolerance_uv = tolerance_uvw
         x = maxima_candidates_x
         y = maxima_candidates_y
+        # print('a2')
 
         in_bounds = (x >= 0.0) & (x <= H - 1) & (y >= 0.0) & (y <= W - 1)
         border_ok = (
@@ -2047,6 +2053,7 @@ class Lattice(AutoSerialize):
         unique_ids[4, :] = -1 * np.arange(1, 1 + len(maxima_candidates))
         unique_ids[5, :] -= 1
 
+        # print('a3')
         if plot_atoms:
             fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
             if ax.images:
@@ -2090,6 +2097,7 @@ class Lattice(AutoSerialize):
             ).T
             self.atoms.set_data(arr, 0)
             return self
+        # print('a4')
 
         radial_dist = (
             (maxima_candidates_x - origin[0]) ** 2 + (maxima_candidates_y - origin[1]) ** 2
@@ -2156,6 +2164,7 @@ class Lattice(AutoSerialize):
                 ).T
                 return arr
 
+        # print('a5')
         # first, a loop that finds all of the A sites
         a0 = 0  # here we are just doing a0
         while found_atoms_in_prev_iteration is True:
@@ -2251,6 +2260,7 @@ class Lattice(AutoSerialize):
             self.atoms_dislocation.set_data(atom_arr, 0)
 
         # add interactive bit here
+        # print('a6')
 
         maxima_accepted_x = maxima_candidates_x[unique_ids[1, :] == 1]
         maxima_accepted_y = maxima_candidates_y[unique_ids[1, :] == 1]
@@ -2297,6 +2307,7 @@ class Lattice(AutoSerialize):
             ).T
             self.atoms.set_data(arr, 0)
 
+        # print('a7')
         # second, a loop that uses these A sites to find all other sites
         found_atoms_in_prev_iteration = True
         while found_atoms_in_prev_iteration is True:
@@ -2349,6 +2360,7 @@ class Lattice(AutoSerialize):
             atoms_found_this_iteration = np.zeros(len(maxima_candidates))
             iteration_while += 1
 
+        # print('a8')
         # if plot_atoms:
         #     fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
         #     if ax.images:
@@ -2407,7 +2419,7 @@ class Lattice(AutoSerialize):
                 ax.scatter(
                     ys,
                     xs,
-                    s=200 * (a0 + 1),
+                    s=50 * (a0 + 1),
                     facecolor=(rgb[0], rgb[1], rgb[2], 0.85),
                     edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
                     linewidths=0.75,
@@ -2685,7 +2697,7 @@ class Lattice(AutoSerialize):
             ax.scatter(
                 ys,
                 xs,
-                s=200,
+                s=50,
                 facecolor=(rgb[0], rgb[1], rgb[2], 0.85),
                 edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
                 linewidths=0.75,
@@ -2697,7 +2709,7 @@ class Lattice(AutoSerialize):
             ax.scatter(
                 unique_data[:, 2],
                 unique_data[:, 1],
-                s=200,
+                s=50,
                 facecolor=(rgb[0], rgb[1], rgb[2], 0.05),
                 edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
                 linewidths=0.75,
@@ -2879,7 +2891,7 @@ class Lattice(AutoSerialize):
             ax.scatter(
                 a_y,
                 a_x,
-                s=200,
+                s=50,
                 facecolor=(rgb[0], rgb[1], rgb[2], 0.85),
                 edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
                 linewidths=0.75,
@@ -3015,11 +3027,11 @@ class Lattice(AutoSerialize):
             all_neighbor_intensities = np.concatenate(
                 [a_neighbor_intensities, b_neighbor_intensities]
             )
-            median_all_intensity = np.median(all_neighbor_intensities)
+            mean_all_intensity = np.mean(all_neighbor_intensities)
 
             delta_data[i, 0] = b_int[i] - median_a_intensity  # the delta intensity
             delta_data[i, 1] = b_int[i] - median_b_intensity  # the delta intensity
-            delta_data[i, 2] = b_int[i] - median_all_intensity  # the delta intensity
+            delta_data[i, 2] = b_int[i] - mean_all_intensity  # the delta intensity
             delta_data[i, 3] = idxs_a.shape[0]  # number of neighbors used
             delta_data[i, 4] = idxs_b.shape[0]  # number of neighbors used
 
@@ -5146,6 +5158,9 @@ class Lattice(AutoSerialize):
         nx, ny = self._image.shape
         midX = nx // 2
         midY = ny // 2
+        # print('midX', midX)
+        # print('midY', midY)
+        # print('fo0')
         peakCoordinatesRespCenter = np.zeros(
             len(peakCoordinates),
             dtype=np.dtype([("x", float), ("y", float), ("intensity", float)]),
@@ -5175,7 +5190,13 @@ class Lattice(AutoSerialize):
             currentPeak = self.get_xy(peakCoordinatesRespCenter[peakIndex])
             crossAWithRest[peakIndex - 2] = np.cross(peakA_xy, currentPeak)
         threshold = 5 * (np.min(np.abs(crossAWithRest)) + 0.1)
+        # print(np.min(np.abs(crossAWithRest)))
+        # print(threshold)
+        # print(crossAWithRest)
+        # plt.figure()
+        # plt.scatter()
 
+        # print('fo1')
         thresholdCondition = np.abs(crossAWithRest) > threshold
         if np.any(thresholdCondition):
             peakBInd = (
@@ -5187,6 +5208,7 @@ class Lattice(AutoSerialize):
             thresholdCondition = np.abs(crossAWithRest) > threshold
             peakBInd = np.argmax(thresholdCondition) + 2
 
+        # print('fo1')
         peakA = np.zeros(1, dtype=np.dtype([("x", float), ("y", float), ("intensity", float)]))
         peakB = np.zeros(1, dtype=np.dtype([("x", float), ("y", float), ("intensity", float)]))
 
@@ -5196,6 +5218,19 @@ class Lattice(AutoSerialize):
         peakB["x"] = peakCoordinates["x"][smallestRadiiIndices[peakBInd]]
         peakB["y"] = peakCoordinates["y"][smallestRadiiIndices[peakBInd]]
         peakB["intensity"] = peakCoordinates["intensity"][smallestRadiiIndices[peakBInd]]
+
+        # # plotting for sanity check
+        # plt.figure()
+        # plt.title('first order peak finding')
+        # abs_fft_im = np.abs(np.fft.fftshift(np.fft.fft2(self._image.array)))
+        # x_peak_locations = peakCoordinates["x"]
+        # y_peak_locations = peakCoordinates["y"]
+        # plt.imshow(abs_fft_im, cmap = 'turbo')
+        # plt.scatter(y_peak_locations, x_peak_locations, color = 'red')
+        # plt.scatter(peakA['y'], peakA['x'], c = 'blue')
+        # plt.scatter(peakB['y'], peakB['x'], c = 'blue')
+        # plt.axis('off')
+
         return peakA, peakB
 
     def locate_diffraction_spots(
@@ -5203,6 +5238,7 @@ class Lattice(AutoSerialize):
         maxNumPeaks_in: int,
         minSpacingPeaks: int = 0,
         center_ignore_buffer: int | None = None,
+        crop_to_1024: bool = False,
     ):
         """
         Calls the maxima finder.
@@ -5217,11 +5253,43 @@ class Lattice(AutoSerialize):
             An array of peak coordinates with a custom datatype.
         """
         nx, ny = self._image.shape
-        peakList = self.get_maxima_2D(
-            np.abs(np.fft.fftshift(np.fft.fft2(self._image.array))),
-            maxNumPeaks=maxNumPeaks_in,
-            minSpacing=minSpacingPeaks,
-        )
+        # print('fft0')
+        abs_fft_im = np.abs(np.fft.fftshift(np.fft.fft2(self._image.array)))
+        # print('fft00')
+
+        # could do some downsampling and find the peaks and then proceed. The easy way to do this downsampling is to just crop in k-space.
+
+        if crop_to_1024:
+            buff_r = int((abs_fft_im.shape[0] - 1024) // 2)
+            buff_c = int((abs_fft_im.shape[1] - 1024) // 2)
+            abs_fft_im_cropped = abs_fft_im[buff_r:-buff_r, buff_c:-buff_c]
+
+            peakList = self.get_maxima_2D(
+                abs_fft_im_cropped,
+                maxNumPeaks=maxNumPeaks_in,
+                minSpacing=minSpacingPeaks,
+            )
+            peakList["x"] += buff_r
+            peakList["y"] += buff_c
+
+        else:
+            peakList = self.get_maxima_2D(
+                abs_fft_im,
+                maxNumPeaks=maxNumPeaks_in,
+                minSpacing=minSpacingPeaks,
+            )
+
+        # plot the found peaks over the image.. why is it taking so long to find them?
+
+        # x_peak_locations = peakList["x"]
+        # y_peak_locations = peakList["y"]
+        # plt.figure()
+        # plt.title('k space peak finding')
+        # plt.imshow(abs_fft_im, cmap = 'turbo')
+        # plt.scatter(y_peak_locations, x_peak_locations, color = 'red')
+        # plt.axis('off')
+
+        # print('fft1')
         if center_ignore_buffer is not None:
             x_dist_to_center = peakList["x"] - nx / 2
             y_dist_to_center = peakList["y"] - ny / 2

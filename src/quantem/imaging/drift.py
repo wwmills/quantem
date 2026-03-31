@@ -1492,6 +1492,7 @@ class DriftCorrection(AutoSerialize):
             self.affine_cost_list.append(affine_cost)
             return affine_cost
 
+        bound_val = 0.05
         optimization_result = minimize(
             cost_affine,
             x0=np.asarray(dxy_init, dtype=float).copy(),
@@ -1500,6 +1501,7 @@ class DriftCorrection(AutoSerialize):
                 "maxiter": 50,
                 "ftol": 1e-3,
             },
+            bounds=[(-bound_val, bound_val), (-bound_val, bound_val)],
         )
 
         self.generate_validity_mask = gvm_store
