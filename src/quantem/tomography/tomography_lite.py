@@ -8,7 +8,7 @@ from quantem.tomography.dataset_models import DatasetModelType
 from quantem.tomography.logger_tomography import LoggerTomography
 from quantem.tomography.object_models import ObjectINR, ObjectPixelated
 from quantem.tomography.tomography import Tomography, TomographyConventional
-
+import torch
 
 class TomographyLiteINR(Tomography):
     """
@@ -77,6 +77,8 @@ class TomographyLiteINR(Tomography):
         scheduler_factor: float = 0.5,
         new_optimizers: bool = False,
         constraints: dict = {},
+        gt_volume: torch.Tensor | np.ndarray | None = None,
+        gt_defocus: torch.Tensor | np.ndarray | None = None,
     ):
         if self.num_epochs == 0:
             opt_params = {
@@ -118,6 +120,8 @@ class TomographyLiteINR(Tomography):
             optimizer_params=opt_params,
             scheduler_params=scheduler_params,
             constraints=constraints,
+            gt_volume=gt_volume,
+            gt_defocus=gt_defocus,
         )
 
 
