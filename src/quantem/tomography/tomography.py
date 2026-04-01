@@ -58,7 +58,9 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
         val_fraction: float = 0.0,
         # reset_dset: bool = False,
         reset_dset: DatasetModelType | None = None,
-    ):
+        gt_volume: torch.Tensor | np.ndarray | None = None,
+        gt_defocus: torch.Tensor | np.ndarray | None = None,
+        ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
         I.e, auto-detection through the obj model type, while both share the same pose optimization.
@@ -195,7 +197,27 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                             )
 
                         with nvtx_range(profiling_mode, "Backwarding"):
+                            # Add this debug BEFORE backward:
+                            # print(f"batch_consistency_loss.requires_grad: {batch_consistency_loss.requires_grad}")
+                            # print(f"integrated_densities.requires_grad: {integrated_densities.requires_grad}")
+                            # print(f"all_coords.requires_grad: {all_coords.requires_grad}")
                             batch_loss.backward()
+                            # After batch_loss.backward()
+                            # print("Convergence angle param:", self.dset._convergence_angle_params)
+                            # print("Convergence angle grad:", self.dset._convergence_angle_params.grad)
+                            # for name, param in self.dset.named_parameters():
+                            #     if param.grad is not None:
+                            #         print(f"{name}: grad norm = {param.grad.norm():.6f}")
+                            #     else:
+                            #         print(f"{name}: NO GRADIENT")
+                            # print("\n=== Parameter gradient check ===")
+                            # for name, param in self.dset.named_parameters():
+                            #     if param.grad is not None:
+                            #         print(f"{name}: grad={param.grad.norm():.2e}, value={param.data.norm():.2e}")
+                            # # Check what optimizer has:
+                            # print("\n=== Optimizer parameters ===")
+                            # for i, group in enumerate(self.dset.optimizer.param_groups):
+                            #     print(f"Group {i}: {len(group['params'])} parameters")
                         with nvtx_range(profiling_mode, "Clipping Gradients"):
                             # Clip gradients
                             torch.nn.utils.clip_grad_norm_(
@@ -306,6 +328,19 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                                     dataset_model=self.dset,
                                     iter=self.num_epochs,
                                 )
+                                # if hasattr(self.dset, '_z_focus_params'):
+                                #     print("Logging defocus...")
+                                #     self.logger.log_defocus(
+                                #         dataset_volume=self.dset,
+                                #         gt_defocus=gt_defocus,
+                                #     )
+                                if gt_volume is not None:
+                                    print("Logging SSIM...")
+                                    self.logger.log_ssim(
+                                        pred_volume=pred_full,
+                                        gt_volume=gt_volume,
+                                        step=self.num_epochs,
+                                    )
 
                         if self.global_rank == 0:
                             self.logger.log_iter(

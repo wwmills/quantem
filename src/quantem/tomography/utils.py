@@ -13,7 +13,11 @@ from quantem.core.utils.imaging_utils import cross_correlation_shift
 def rot_ZXZ(mags, z1, x, z3, device, mode="bilinear"):
     if not isinstance(x, torch.Tensor) or not isinstance(z1, torch.Tensor):
         z1 = torch.tensor(z1, dtype=torch.float32, device=device)
-        x = torch.tensor(x, dtype=torch.float32, device=device)
+        if isinstance(x, torch.Tensor):
+            x = x.to(device=device, dtype=torch.float32)
+        else:
+            x = torch.tensor(x, dtype=torch.float32, device=device)
+
         z3 = torch.tensor(z3, dtype=torch.float32, device=device)
     curr_mags = mags
 
