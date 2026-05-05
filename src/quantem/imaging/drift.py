@@ -930,6 +930,7 @@ class DriftCorrection(AutoSerialize):
         kernel_size: int = 5,
         # SciPy parameters
         dxy_init: NDArray = np.array((0.0, 0.0)),
+        dxy_max: NDArray = np.array((0.1, 0.1)),
         # Grid Search parameters
         step: float = 0.01,
         num_tests: int = 9,
@@ -977,6 +978,7 @@ class DriftCorrection(AutoSerialize):
                 upsample_factor=upsample_factor,
                 max_image_shift=max_image_shift,
                 dxy_init=dxy_init,
+                dxy_max=dxy_max,
                 generate_validity_mask=generate_validity_mask,
                 mask_edge_dist=mask_edge_dist,
             )
@@ -1407,6 +1409,7 @@ class DriftCorrection(AutoSerialize):
         max_image_shift: float | None = 32,
         min_image_shift: float | None = None,
         dxy_init: NDArray = np.array((0.0, 0.0)),
+        dxy_max: NDArray = np.array((0.1, 0.1)),
         generate_validity_mask: bool | None = None,
         mask_edge_dist: float | None = None,
     ):
@@ -1492,7 +1495,6 @@ class DriftCorrection(AutoSerialize):
             self.affine_cost_list.append(affine_cost)
             return affine_cost
 
-        bound_val = 0.05
         optimization_result = minimize(
             cost_affine,
             x0=np.asarray(dxy_init, dtype=float).copy(),
@@ -1501,7 +1503,7 @@ class DriftCorrection(AutoSerialize):
                 "maxiter": 50,
                 "ftol": 1e-3,
             },
-            bounds=[(-bound_val, bound_val), (-bound_val, bound_val)],
+            bounds=[(-dxy_max[0], dxy_max[0]), (-dxy_max[1], dxy_max[1])],
         )
 
         self.generate_validity_mask = gvm_store
@@ -1906,6 +1908,7 @@ class DriftCorrection(AutoSerialize):
         kde_sigma: float = 0.5,
         weight_thresh=0.1,
         show_image: bool = True,
+        return_mask: bool = False,
         **kwargs,
     ):
         """
@@ -2103,7 +2106,10 @@ class DriftCorrection(AutoSerialize):
         # if show_image:
         #     fig, ax = image_corr.show(**kwargs)
 
-        return image_corr
+        if return_mask:
+            return image_corr, mask
+        else:
+            return image_corr
 
     def calculate_error(
         self,
