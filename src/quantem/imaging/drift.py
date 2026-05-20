@@ -310,7 +310,9 @@ class DriftCorrection(AutoSerialize):
             # Generate initial resampled masks
             self.validity_mask_warped = Dataset3d.from_shape(self.shape)
             for ind in range(self.shape[0]):
-                self.validity_mask_warped.array[ind], _ = self.interpolator[ind].warp_image(
+                self.validity_mask_warped.array[ind], _ = self.validity_mask_interpolator[
+                    ind
+                ].warp_image(
                     self.validity_mask[ind],
                     self.knots[ind],
                 )
@@ -341,7 +343,7 @@ class DriftCorrection(AutoSerialize):
         show_images: bool = False,
         show_knots: bool = True,
         generate_validity_mask: bool | None = None,
-        mask_edge_dist: bool = 8.0,
+        mask_edge_dist: float = 8.0,
         **kwargs,
     ):
         """
@@ -354,6 +356,37 @@ class DriftCorrection(AutoSerialize):
 
         # init
         dxy = np.zeros((self.shape[0], 2))
+
+        # Calculate buffer size for cropping
+        buff_r = (
+            int(
+                int(np.round(self.images[0].shape[0] * (1 + self.pad_fraction) / 2) * 2)
+                - self.images[0].shape[0]
+            )
+            // 2
+        )
+        buff_c = (
+            int(
+                int(np.round(self.images[1].shape[1] * (1 + self.pad_fraction) / 2) * 2)
+                - self.images[0].shape[1]
+            )
+            // 2
+        )
+
+        # Crop, recalculate median, and re-pad each warped image
+        for a0 in range(self.shape[0]):
+            cropped = self.images_warped.array[a0].copy()[buff_r:-buff_r, buff_c:-buff_c]
+            new_median = np.median(cropped)
+            padded = np.pad(
+                cropped,
+                ((buff_r, buff_r), (buff_c, buff_c)),
+                mode="constant",
+                constant_values=new_median,
+            )
+            self.images_warped.array[a0] = padded
+            # Update the interpolator's pad value
+            self.interpolator[a0].set_pad_value(new_median)
+
         if generate_validity_mask is None:
             generate_validity_mask = self.generate_validity_mask
         if self.generate_validity_mask:

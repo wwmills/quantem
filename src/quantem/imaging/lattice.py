@@ -1863,11 +1863,12 @@ class Lattice(AutoSerialize):
             g_vector_1_c = np.array([uv_result_inv[0]["x"], uv_result_inv[0]["y"]])
             g_vector_2_c = np.array([uv_result_inv[1]["x"], uv_result_inv[1]["y"]])
             g_vec1 = np.zeros(2)
-            g_vec1[0] = (g_vector_1_c[0] - (0.5 * H)) / H
-            g_vec1[1] = (g_vector_1_c[1] - (0.5 * W)) / W
+
+            g_vec1[0] = (g_vector_1_c[0][0] - (0.5 * H)) / H
+            g_vec1[1] = (g_vector_1_c[1][0] - (0.5 * W)) / W
             g_vec2 = np.zeros(2)
-            g_vec2[0] = (g_vector_2_c[0] - (0.5 * H)) / H
-            g_vec2[1] = (g_vector_2_c[1] - (0.5 * W)) / W
+            g_vec2[0] = (g_vector_2_c[0][0] - (0.5 * H)) / H
+            g_vec2[1] = (g_vector_2_c[1][0] - (0.5 * W)) / W
             g_matrix = np.array([g_vec1, g_vec2])
             a_matrix = np.linalg.inv(g_matrix)
             a_transpose = a_matrix.T
