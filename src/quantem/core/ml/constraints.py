@@ -5,12 +5,13 @@ from typing import Any, Self
 
 import numpy as np
 import torch
+from numpy.typing import NDArray
 
 
-@dataclass(slots=True)
+@dataclass(slots=False)
 class Constraints(ABC):
     """
-    Needs to be implemented in all object models that inherit from BaseConstraints.
+    Any model that inherits from BaseConstraints will contain a Constraints instance that contains soft and hard constraints.
     """
 
     soft_constraint_keys = []
@@ -34,9 +35,9 @@ class Constraints(ABC):
         soft = "\n".join(f"{key}: {getattr(self, key)}" for key in self.soft_constraint_keys)
 
         # Fix: Move the replace operations outside the f-string or assign to variables
-        hard_indented = hard.replace('\n', '\n    ')
-        soft_indented = soft.replace('\n', '\n    ')
-        
+        hard_indented = hard.replace("\n", "\n    ")
+        soft_indented = soft.replace("\n", "\n    ")
+
         return (
             "Constraints:\n"
             "  Hard constraints:\n"
@@ -60,13 +61,13 @@ class BaseConstraints(ABC):
         self.constraints = self.DEFAULT_CONSTRAINTS.copy()
 
     @property
-    def soft_constraint_losses(self) -> list[float]:
-        return np.array(self._soft_constraint_losses)
+    def soft_constraint_losses(self) -> NDArray[np.float32]:
+        return np.array(self._soft_constraint_losses, dtype=np.float32)
 
     @property
     def constraints(self) -> Constraints:
         """
-        Constraints for the object model.
+        Constraints for the model.
         """
         return self._constraints
 
@@ -87,13 +88,13 @@ class BaseConstraints(ABC):
     @abstractmethod
     def apply_hard_constraints(self, *args, **kwargs) -> torch.Tensor:
         """
-        Apply hard constraints to the object model.
+        Apply hard constraints to the model.
         """
         raise NotImplementedError
 
     @abstractmethod
     def apply_soft_constraints(self, *args, **kwargs) -> torch.Tensor:
         """
-        Apply soft constraints to the object model.
+        Apply soft constraints to the model.
         """
         raise NotImplementedError

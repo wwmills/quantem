@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 
 from quantem.core.ml.logger import LoggerBase
@@ -16,7 +17,7 @@ class LoggerTomography(LoggerBase):
         self,
         log_dir: str,
         run_prefix: str,
-        run_suffix: str = None,
+        run_suffix: str = "",
         log_images_every: int = 10,
     ):
         super().__init__(log_dir, run_prefix, run_suffix, log_images_every)
@@ -35,6 +36,9 @@ class LoggerTomography(LoggerBase):
         learning_rates: dict[str, float],
         num_samples_per_ray: int,
         val_loss: float | None = None,
+        convergence_angle: float | None = None,
+        stig_2: tuple[float, float] | None = None,
+        gt_stig: tuple[float, float] | None = None,
     ):
         self.log_scalar("loss/consistency", consistency_loss, iter)
         self.log_scalar("loss/total", total_loss, iter)
@@ -45,9 +49,25 @@ class LoggerTomography(LoggerBase):
         if val_loss is not None:
             self.log_scalar("loss/val", val_loss, iter)
 
+        if convergence_angle is not None:
+            convergence_mrad = convergence_angle * 1000
+            self.writer.add_scalar("w/convergence_angle_mrad", convergence_mrad, iter)
+            self.writer.add_scalar("w/convergence_angle_rad", convergence_angle, iter)
+        
+        if stig_2 is not None:
+            if gt_stig is not None:
+                self.writer.add_scalar("w/gt_astigmatism_A1x", gt_stig[0], iter)
+                self.writer.add_scalar("w/gt_astigmatism_A1y", gt_stig[1], iter)
+            self.writer.add_scalar("w/astigmatism_A1x", stig_2[0], iter)
+            self.writer.add_scalar("w/astigmatism_A1y", stig_2[1], iter)
+            # Also log magnitude
+            stig_mag = (stig_2[0]**2 + stig_2[1]**2)**0.5
+            self.writer.add_scalar("w/astigmatism_magnitude", stig_mag, iter)
+
+
     def log_iter_images(
         self,
-        pred_volume: torch.Tensor,
+        pred_volume: np.ndarray,
         dataset_model: DatasetModelType,
         iter: int,
         logger_cmap: str = "turbo",
@@ -90,15 +110,18 @@ class LoggerTomography(LoggerBase):
                 error = np.mean((z_focus_vals - gt_z_focus) ** 2)
                 self.log_scalar("z_focus/mse_to_gt", float(error), iter)
 
-
-
-        # print("Logging volume...")
-        self.log_image("volume/sum_z", pred_volume.sum(axis=0), iter, logger_cmap)
-        self.log_image("volume/sum_y", pred_volume.sum(axis=1), iter, logger_cmap)
-        self.log_image("volume/sum_x", pred_volume.sum(axis=2), iter, logger_cmap)
+        for channel in range(pred_volume.shape[0]):
+            self.log_image(
+                f"volume/sum_z_{channel}", pred_volume[channel].sum(axis=0), iter, logger_cmap
+            )
+            self.log_image(
+                f"volume/sum_y_{channel}", pred_volume[channel].sum(axis=1), iter, logger_cmap
+            )
+            self.log_image(
+                f"volume/sum_x_{channel}", pred_volume[channel].sum(axis=2), iter, logger_cmap
+            )
 
         # Plotting z1 and z3 vals
-        print("Plotting z1 and z3 angles...")
         fig, ax = plt.subplots()
         ax.plot(z1_vals, label="Z1")
         ax.plot(z3_vals, label="Z3")
@@ -110,7 +133,6 @@ class LoggerTomography(LoggerBase):
         plt.close(fig)
 
         # Plotting shifts
-        print("Plotting shifts...")
         fig, ax = plt.subplots()
         ax.plot(shifts_vals[:, 0], label="Shifts X")
         ax.plot(shifts_vals[:, 1], label="Shifts Y")
@@ -146,10 +168,8 @@ class LoggerTomography(LoggerBase):
         assert dataset_model.hasattr('_z_focus_params')
         found_defocus =dataset_model._z_focus_params
 
-        mean_ssim = float(np.mean(ssim_vals))
-        self.log_scalar("metrics/ssim", mean_ssim, step)
-
-
+        # mean_ssim = float(np.mean(ssim_vals))
+        # self.log_scalar("metrics/ssim", mean_ssim, step)
 
     def log_ssim(
         self,
