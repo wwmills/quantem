@@ -5,6 +5,12 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, random_split
 
+from quantem.tomography.dataset_models import DatasetModelType
+
+
+def worker_init_fn(worker_id):
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 
 class DDPMixin:
     """
@@ -13,12 +19,7 @@ class DDPMixin:
     -
     """
 
-    def __init__(
-        self,
-    ):
-        self.setup_distributed()
-
-    def setup_distributed(self, device: str | None = None):
+    def setup_distributed(self, device: str | torch.device | None = None):
         """
         Initializes parameters depending if multiple-GPU training, single-GPU training, or CPU training.
         """
@@ -31,7 +32,6 @@ class DDPMixin:
             self.world_size = dist.get_world_size()
             self.global_rank = dist.get_rank()
             self.local_rank = int(os.environ["LOCAL_RANK"])
-
             torch.cuda.set_device(self.local_rank)
             device = torch.device("cuda", self.local_rank)
         else:
@@ -42,10 +42,8 @@ class DDPMixin:
             if torch.cuda.is_available():
                 device = torch.device("cuda:0" if device is None else device)
                 torch.cuda.set_device(device.index)
-                print("Single GPU training")
             else:
                 device = torch.device("cpu")
-                print("CPU training")
 
         if device.type == "cuda":
             torch.backends.cudnn.benchmark = True
@@ -56,16 +54,17 @@ class DDPMixin:
 
     def setup_dataloader(
         self,
-        dataset: Dataset,
+        dataset: Dataset | DatasetModelType,
         batch_size: int,
         num_workers: int = 0,
         val_fraction: float = 0.0,
+        drop_last: bool = True,
     ):
         pin_mem = self.device.type == "cuda"
         persist = num_workers > 0
 
         if val_fraction > 0.0:
-            train_dataset, val_dataset = random_split(dataset, [1 - val_fraction, val_fraction])
+            train_dataset, val_dataset = random_split(dataset, [1 - val_fraction, val_fraction])  # type: ignore[reportArgumentType] --> dataset inherits from torch Dataset so this is fine.
         else:
             train_dataset = dataset
             val_dataset = None
@@ -73,10 +72,11 @@ class DDPMixin:
         if self.world_size > 1:
             shuffle = True
             train_sampler = DistributedSampler(
-                train_dataset,
+                train_dataset,  # type: ignore[reportArgumentType] --> Torch datasets do not have a len method, but still works.
                 num_replicas=self.world_size,
                 rank=self.global_rank,
                 shuffle=shuffle,
+                drop_last=False,
             )
 
             if val_dataset:
@@ -85,6 +85,7 @@ class DDPMixin:
                     num_replicas=self.world_size,
                     rank=self.global_rank,
                     shuffle=False,
+                    drop_last=False,
                 )
             else:
                 val_sampler = None
@@ -96,14 +97,16 @@ class DDPMixin:
             shuffle = True
 
         train_dataloader = DataLoader(
-            train_dataset,
+            train_dataset,  # type: ignore[reportArgumentType] --> Torch datasets do not have a len method, but still works.
             batch_size=batch_size,
             num_workers=num_workers,
             sampler=train_sampler,
             shuffle=shuffle,
             pin_memory=pin_mem,
-            drop_last=True,
+            drop_last=drop_last,
             persistent_workers=persist,
+            multiprocessing_context="spawn",
+            worker_init_fn=worker_init_fn,
         )
 
         if val_dataset:
@@ -116,6 +119,8 @@ class DDPMixin:
                 pin_memory=pin_mem,
                 drop_last=False,
                 persistent_workers=persist,
+                multiprocessing_context="spawn",
+                worker_init_fn=worker_init_fn,
             )
             val_dataloader = val_dataloader
         else:
@@ -123,31 +128,28 @@ class DDPMixin:
 
         if self.global_rank == 0:
             print("Dataloader setup complete:")
-            print(f"  Total train samples: {len(train_dataset)}")
+            print(f"  Total train samples: {len(train_dataset)}")  # pyright: ignore[reportArgumentType] --> Torch datasets do not have a len method, but still works.
             print(f"  Local batch size: {batch_size}")
             print(f"  Global batch size: {batch_size * self.world_size}")
             print(f"  Train batches per GPU per epoch: {len(train_dataloader)}")
+            print(f"  drop_last: {drop_last}")
 
             if val_dataset:
                 print(f"  Total val samples: {len(val_dataset)}")
-                print(f"  Val batches per GPU per epoch: {len(val_dataloader)}")
+                print(f"  Val batches per GPU per epoch: {len(val_dataloader)}")  # pyright: ignore[reportArgumentType] --> Torch datasets do not have a len method, but still works.
 
         return train_dataloader, train_sampler, val_dataloader, val_sampler
 
-    def build_model(
+    def distribute_model(
         self,
         model: nn.Module,
-        pretrained_weights: dict[str, torch.Tensor] | None = None,
     ) -> nn.Module | nn.parallel.DistributedDataParallel:
         """
         Wraps the model with DistributedDataParallel if mulitple GPUs are available.
 
         Returns the model.
         """
-        print("Building Model on device: ", self.device)
         model = model.to(self.device)
-        if pretrained_weights is not None:
-            model.load_state_dict(pretrained_weights.copy())
 
         if self.world_size > 1:
             model = torch.nn.parallel.DistributedDataParallel(
@@ -161,7 +163,7 @@ class DDPMixin:
             )
 
             if self.global_rank == 0:
-                print("Model wrapped with DDP")
+                print("Model wrapped with DDP and compiled")
 
         if self.world_size > 1:
             if self.global_rank == 0:
@@ -177,7 +179,7 @@ class DDPMixin:
         return self._device
 
     @device.setter
-    def device(self, device: torch.device):
+    def device(self, device: torch.device | str):
         if isinstance(device, str):
             device = torch.device(device)
         self._device = device

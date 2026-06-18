@@ -2,11 +2,22 @@ import os
 from typing import Literal, Self
 
 import numpy as np
+import torch
+from numpy.typing import NDArray
 
+from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.ml.inr import HSiren
-from quantem.tomography.dataset_models import DatasetModelType
+from quantem.core.ml.optimizer_mixin import (
+    OptimizerParams,
+    SchedulerParams,
+)
+from quantem.tomography.dataset_models import (
+    DatasetConstraintsType,
+    TomographyINRDataset,
+    TomographyPixDataset,
+)
 from quantem.tomography.logger_tomography import LoggerTomography
-from quantem.tomography.object_models import ObjectINR, ObjectPixelated
+from quantem.tomography.object_models import ObjConstraintsType, ObjectINR, ObjectPixelated
 from quantem.tomography.tomography import Tomography, TomographyConventional
 import torch
 
@@ -18,16 +29,20 @@ class TomographyLiteINR(Tomography):
     @classmethod
     def from_dataset(
         cls,
-        dset: DatasetModelType,
+        tilt_series: Dataset3d | NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
         device: str = "cuda",
         log_dir: os.PathLike | str | None = None,
         log_images_every: int = 10,
         rng: np.random.Generator | int | None = None,
     ) -> Self:
-        dset_model = dset
+        dset_model = TomographyINRDataset.from_data(
+            tilt_stack=tilt_series,
+            tilt_angles=tilt_angles,
+        )
 
         # Define the object model
-        model = HSiren(alpha=1, winner_initialization=True)
+        model = HSiren(alpha=1, winner_initialization=72)
         obj_model = ObjectINR.from_model(
             model=model,
             shape=(
@@ -43,7 +58,7 @@ class TomographyLiteINR(Tomography):
 
         if log_dir is not None:
             logger = LoggerTomography(
-                log_dir=log_dir,
+                log_dir=str(log_dir),
                 run_prefix="tomography_lite_inr",
                 run_suffix="",
                 log_images_every=log_images_every,
@@ -61,7 +76,7 @@ class TomographyLiteINR(Tomography):
 
         return tomography
 
-    def reconstruct(
+    def reconstruct(  # type:ignore[reportIncompatibleMethodOverride] ## easier than overloads
         self,
         num_iter: int = 10,
         reset: bool = False,
@@ -72,44 +87,44 @@ class TomographyLiteINR(Tomography):
         learn_pose: bool = True,
         warmup_routine: bool = True,
         scheduler_type: Literal[
-            "exp", "cyclic", "plateau", "cosine_annealing", "linear", "full_warmup"
+            "exp", "cyclic", "plateau", "cosine_annealing", "linear", "full_warmup", "none"
         ] = "none",
-        scheduler_factor: float = 0.5,
+        scheduler_params: dict = {},
         new_optimizers: bool = False,
-        constraints: dict = {},
+        obj_constraints: ObjConstraintsType | dict | None = None,
+        dset_constraints: DatasetConstraintsType | dict | None = None,
+        show_metrics: bool = False,
         gt_volume: torch.Tensor | np.ndarray | None = None,
         gt_defocus: torch.Tensor | np.ndarray | None = None,
     ):
         if self.num_epochs == 0:
             opt_params = {
-                "object": {
-                    "type": "adam",
-                    "lr": obj_lr,
-                },
+                "object": OptimizerParams.Adam(lr=obj_lr),
             }
 
-            scheduler_params = {
-                "object": {
-                    "type": scheduler_type,
-                    "factor": scheduler_factor,
-                },
+            all_scheduler_params = {
+                "object": SchedulerParams.parse_dict(
+                    {
+                        "name": scheduler_type,
+                        **scheduler_params,
+                    }
+                ),
             }
 
             if learn_pose:
-                opt_params["pose"] = {
-                    "type": "adam",
-                    "lr": pose_lr,
-                }
-                scheduler_params["pose"] = {
-                    "type": scheduler_type,
-                    "factor": scheduler_factor,
-                }
-
+                opt_params["pose"] = OptimizerParams.Adam(lr=pose_lr)
+                all_scheduler_params["pose"] = SchedulerParams.parse_dict(
+                    {
+                        "name": scheduler_type,
+                        **scheduler_params,
+                    }
+                )
         else:
             opt_params = None
-            scheduler_params = None
+            all_scheduler_params = None
+            obj_constraints = None
+            dset_constraints = None
 
-        constraints = constraints
         num_samples_per_ray = int(max(self.dset.tilt_stack.shape))
         return super().reconstruct(
             num_iter=num_iter,
@@ -118,8 +133,10 @@ class TomographyLiteINR(Tomography):
             reset=reset,
             num_samples_per_ray=num_samples_per_ray,
             optimizer_params=opt_params,
-            scheduler_params=scheduler_params,
-            constraints=constraints,
+            scheduler_params=all_scheduler_params,
+            obj_constraints=obj_constraints,
+            dset_constraints=dset_constraints,
+            show_metrics=show_metrics,
             gt_volume=gt_volume,
             gt_defocus=gt_defocus,
         )
@@ -129,17 +146,21 @@ class TomographyLiteConv(TomographyConventional):
     @classmethod
     def from_dataset(
         cls,
-        dset: DatasetModelType,
+        tilt_series: Dataset3d | NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
         device: str = "cuda",
         rng: np.random.Generator | int | None = None,
     ) -> Self:
-        dset_model = dset
+        dset_model = TomographyPixDataset.from_data(
+            tilt_stack=tilt_series,
+            tilt_angles=tilt_angles,
+        )
 
-        obj_model = ObjectPixelated(
+        obj_model = ObjectPixelated.from_uniform(
             shape=(
-                max(dset_model.tilt_stack.shape),
-                max(dset_model.tilt_stack.shape),
-                max(dset_model.tilt_stack.shape),
+                max(tilt_series.shape),
+                max(tilt_series.shape),
+                max(tilt_series.shape),
             ),
             device=device,
             rng=rng,
