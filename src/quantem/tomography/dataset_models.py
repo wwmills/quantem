@@ -179,7 +179,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
             raise RuntimeError("Use TomographyPixDataset.from_* to instantiate this class.")
 
         if not (
-            tilt_stack.shape[0] < tilt_stack.shape[1] or tilt_stack.shape[0] < tilt_stack.shape[2]
+            tilt_stack.shape[0] == tilt_angles.shape[0]
         ):
             raise ValueError(
                 "The number of tilt projections should be in the first dimension of the dataset."
@@ -4936,6 +4936,32 @@ class TomographyThroughFocalINRDataset_0615(TomographyINRDataset):
             token=cls._token,
             ray_pattern=ray_pattern,
         )
+
+    def get_optimization_parameters(self) -> dict[str, list[torch.nn.Parameter]]:
+        params = {}
+        
+        # Pose parameters (shifts, tilt axes, convergence)
+        pose_params = []
+        if self.learn_shift:
+            pose_params.append(self._shifts_params)
+        if self.learn_tilt_axis:
+            pose_params.append(self._z1_params)
+            pose_params.append(self._z3_params)
+        if self.learn_convergence:
+            pose_params.append(self._convergence_angle_params)
+        
+        if pose_params:
+            params["pose"] = pose_params
+        
+        # Astigmatism parameters (separate group)
+        if self.learn_astigmatism:
+            params["astigmatism"] = [self._stig_2_params]
+        
+        # Defocus parameters (separate group)
+        if self.learn_defocus:
+            params["defocus"] = [self._z_focus_params]
+        
+        return params
 
     def _precompute_clever_k_positions(self, num_rays, convergence_angle, wavelength_ang):
         """Compute k-space ray positions once (slow, but only happens once)."""
