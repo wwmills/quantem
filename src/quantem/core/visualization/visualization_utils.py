@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple, Union, cast
 
 import matplotlib as mpl
+import matplotlib.font_manager as fm
 import numpy as np
 from colorspacious import cspace_convert
 from matplotlib import cm, colors, legend, ticker
@@ -56,7 +57,7 @@ def array_to_rgba(
         rgba = cmap_obj(scaled_amplitude)
     else:
         if scaled_angle.shape != scaled_amplitude.shape:
-            raise ValueError()
+            raise ValueError("scaled_angle must have the same shape as scaled_amplitude.")
 
         J = scaled_amplitude * 61.5
         C = np.minimum(chroma_boost * 98 * J / 123, 110)
@@ -64,10 +65,13 @@ def array_to_rgba(
 
         JCh = np.stack((J, C, h), axis=-1)
         with np.errstate(invalid="ignore"):
-            rgb = cspace_convert(JCh, "JCh", "sRGB1").clip(0, 1)
+            rgb = cspace_convert(JCh, "JCh", "sRGB1").clip(0, 1)  # shape (..., 3)
 
-        alpha = np.ones_like(scaled_amplitude)
-        rgba = np.dstack((rgb, alpha))
+        # >>> FIX: ensure alpha has a trailing channel dim, even for 1D <<<
+        alpha = np.ones_like(scaled_amplitude, dtype=rgb.dtype)[..., np.newaxis]  # (..., 1)
+
+        # Use concatenate along the last axis for clarity
+        rgba = np.concatenate((rgb, alpha), axis=-1)  # shape (..., 4)
 
     return rgba
 
@@ -148,6 +152,7 @@ class ScalebarConfig:
     pad_px: float = 0.5
     color: str = "white"
     loc: Union[str, int] = "lower right"
+    font_size: float = 2
 
 
 SCALEBAR_KWARGS = [
@@ -192,6 +197,17 @@ def _resolve_scalebar(cfg: Any, **kwargs) -> Optional[ScalebarConfig]:
         return cfg
     else:
         raise TypeError("scalebar must be None, dict, bool, or ScalebarConfig")
+
+    # if cfg is None or cfg is False:
+    #     return None
+    # elif cfg is True:
+    #     return ScalebarConfig()
+    # elif isinstance(cfg, dict):
+    #     return ScalebarConfig(**cfg)
+    # elif isinstance(cfg, ScalebarConfig):
+    #     return cfg
+    # else:
+    #     raise TypeError("scalebar must be None, dict, bool, or ScalebarConfig")
 
 
 def estimate_scalebar_length(length: float, sampling: float) -> Tuple[float, float]:
@@ -273,6 +289,7 @@ def add_scalebar_to_ax(
     pad_px: float,
     color: str,
     loc: Union[str, int],
+    font_size: float,
 ) -> None:
     """Add a scale bar to a matplotlib axis.
 
@@ -315,6 +332,14 @@ def add_scalebar_to_ax(
         loc_strings = {v: k for k, v in loc_codes.items()}
         loc = loc_strings[loc]
 
+        # >>>
+        # >>> fontprops = fm.FontProperties(size=14, family='monospace')
+        # >>> bar = AnchoredSizeBar(ax.transData, 3, '3 units', 4, pad=0.5,
+        # ...                       sep=5, borderpad=0.5, frameon=False,
+        # ...                       size_vertical=0.5, color='white',
+        # ...                       fontproperties=fontprops)
+
+    fontprops = fm.FontProperties(size=font_size, family="monospace")
     bar = AnchoredSizeBar(
         ax.transData,
         length_px,
@@ -325,6 +350,7 @@ def add_scalebar_to_ax(
         frameon=False,
         label_top=loc[:3] == "low",
         size_vertical=int(width_px),  # Convert to int as required by AnchoredSizeBar
+        fontproperties=fontprops,
     )
     ax.add_artist(bar)
 
@@ -515,3 +541,67 @@ def bilinear_histogram_2d(
     )
 
     return hist  # shape = (Nx, Ny), i.e., array[x, y]
+
+
+def axes_with_inset(
+    axsize=(4, 4),
+    ax_size_embed=None,  # None -> 0.25 of main axes in each dimension (fractional)
+    loc="upper right",  # "upper left"|"upper right"|"lower left"|"lower right" or "ul|ur|ll|lr"
+    borderpad=0,  # keep 0 for perfectly flush
+    inset_facecolor="black",  # only the inset background is black to hide any seam
+    hide_inset_spines=True,  # remove inset spines to avoid edge lines
+):
+    """
+    Create a figure with one main axes and a flush inset axes overlaid on it.
+    - Fractional inset by default (relative to main axes size).
+    - Only the inset axes background is set to black (main axes stays default).
+    """
+    # your file already has: import matplotlib as mpl
+    fig, ax_main = mpl.pyplot.subplots(1, 1, figsize=axsize)
+
+    # lazy import here (some environments need it this way)
+    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+
+    # normalize location string
+    loc_map = {"ul": "upper left", "ur": "upper right", "ll": "lower left", "lr": "lower right"}
+    loc_norm = loc_map.get(str(loc).lower(), loc).lower()
+    if loc_norm not in {"upper left", "upper right", "lower left", "lower right"}:
+        raise ValueError(
+            "loc must be one of: upper left|upper right|lower left|lower right|ul|ur|ll|lr"
+        )
+
+    # resolve inset size: percent strings (fractions) or inches (float > 1)
+    def _size_spec(embed):
+        if embed is None:
+            return "25%", "25%"
+        if isinstance(embed, (int, float)):
+            v = float(embed)
+            return (f"{v * 100:.6g}%", f"{v * 100:.6g}%") if v <= 1.0 else (v, v)
+        if len(embed) != 2:
+            raise ValueError("ax_size_embed must be None, a scalar, or a (w, h) tuple.")
+        w, h = float(embed[0]), float(embed[1])
+        w_spec = f"{w * 100:.6g}%" if w <= 1.0 else w
+        h_spec = f"{h * 100:.6g}%" if h <= 1.0 else h
+        return w_spec, h_spec
+
+    w_spec, h_spec = _size_spec(ax_size_embed)
+
+    # inset, flush to chosen corner of the main axes (no figure background changes)
+    ax_inset = inset_axes(
+        ax_main,
+        width=w_spec,
+        height=h_spec,
+        loc=loc_norm,
+        borderpad=borderpad,  # 0 => perfectly flush
+        bbox_to_anchor=(0, 0, 1, 1),  # anchor in main-axes coords
+        bbox_transform=ax_main.transAxes,
+    )
+    ax_inset.set_zorder(ax_main.get_zorder() + 1)
+    ax_inset.set_facecolor(inset_facecolor)
+    ax_inset.patch.set_alpha(1.0)
+
+    if hide_inset_spines:
+        for spine in ax_inset.spines.values():
+            spine.set_visible(False)
+
+    return fig, [ax_main, ax_inset]

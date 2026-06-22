@@ -146,6 +146,7 @@ def _show_2d_array(
             scalebar_config.pad_px,
             scalebar_config.color,
             scalebar_config.loc,
+            scalebar_config.font_size,
         )
 
     return fig, ax
@@ -259,6 +260,7 @@ def _show_2d_combined(
             scalebar_config.pad_px,
             scalebar_config.color,
             scalebar_config.loc,
+            scalebar_config.font_size,
         )
 
     return fig, ax
