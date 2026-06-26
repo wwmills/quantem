@@ -191,8 +191,18 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
             tilt_angles = torch.from_numpy(tilt_angles)
         if norm_quantile:
             max_val = torch.quantile(tilt_stack, 0.95)
+            if max_val == 0:
+                max_val = torch.max(tilt_stack)
+                if max_val == 0:
+                    print('The maximum value of the tilt series is zero.')
+                    max_val = 1
         else:
             max_val = torch.max(tilt_stack)
+            if max_val == 0:
+                print('The maximum value of the tilt series is zero.')
+                max_val = 1
+
+
 
         # Tilt stack normalization
         tilt_stack = tilt_stack / max_val
@@ -628,7 +638,7 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         remaining = actual_idx % (self.tilt_stack.shape[1] * self.tilt_stack.shape[2])
 
         pixel_i = remaining // self.tilt_stack.shape[1]
-        pixel_j = remaining % self.tilt_stack.shape[1]
+        pixel_j = remaining % self.tilt_stack.shape[2]
 
         return {
             "projection_idx": torch.tensor(projection_idx),
@@ -644,8 +654,7 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         """
         Returns the number of pixels in the tilt stack.
         """
-        N = max(self.tilt_stack.shape)
-        return self.tilt_stack.shape[0] * N * N
+        return self.tilt_stack.shape[0] * self.tilt_stack.shape[1] * self.tilt_stack.shape[2]
 
     def to(self, device: torch.device | str):
         self._z1_params = nn.Parameter(self._z1_angles.to(device))
@@ -4796,12 +4805,17 @@ class TomographyThroughFocalINRDataset_0615(TomographyINRDataset):
         pixel_size_ang: float = 0.2,
         voxel_size_ang: float = 20.0,
         ray_pattern: str = 'clever',
+        lr_defocus: float | None = None,
+        lr_astigmatism: float | None = None,
+        norm_quantile: bool = False,
     ):
-        super().__init__(tilt_stack, tilt_angles, learn_shift, learn_tilt_axis, _token = token)
+        super().__init__(tilt_stack, tilt_angles, learn_shift, learn_tilt_axis, norm_quantile=norm_quantile, _token = token)
         self.num_rays = int(num_rays)
         self.learn_astigmatism = learn_astigmatism
         self.learn_convergence = learn_convergence
         self.learn_defocus = learn_defocus
+        self.lr_defocus = lr_defocus
+        self.lr_astigmatism = lr_astigmatism
 
         self.debug = False
 
@@ -4838,6 +4852,8 @@ class TomographyThroughFocalINRDataset_0615(TomographyINRDataset):
         else:
             # Register as buffer (non-trainable but part of state_dict)
             self.register_buffer('_stig_2_params', self._stig_2.clone())
+        self._probe_pixel_size_ang = pixel_size_ang
+        self._probe_pixel_count = probe_im_shape[0]
 
         if ray_pattern == 'clever':
             # Pre-compute k-positions ONCE
@@ -4849,8 +4865,6 @@ class TomographyThroughFocalINRDataset_0615(TomographyINRDataset):
             # Store as torch tensor (will be moved to device in .to())
             self._clever_k_positions = torch.from_numpy(k_positions_np).float()
 
-        self._probe_pixel_size_ang = pixel_size_ang
-        self._probe_pixel_count = probe_im_shape[0]
 
         if random_method.lower() in ['probe', 'p']:
             import numpy as np
@@ -4915,7 +4929,10 @@ class TomographyThroughFocalINRDataset_0615(TomographyINRDataset):
         pixel_size_ang: float = 0.2,
         random_method: str = 'p',
         ray_pattern: str = 'clever',
+        lr_defocus: float | None = None,
+        lr_astigmatism: float | None = None,
         voxel_size_ang: float = 20.0,
+        norm_quantile: bool = False,
     ):
         return cls(
             tilt_stack=tilt_stack,
@@ -4935,32 +4952,34 @@ class TomographyThroughFocalINRDataset_0615(TomographyINRDataset):
             random_method=random_method,
             token=cls._token,
             ray_pattern=ray_pattern,
+            lr_defocus=lr_defocus,
+            lr_astigmatism=lr_astigmatism,
+            norm_quantile=norm_quantile,
         )
 
     def get_optimization_parameters(self) -> dict[str, list[torch.nn.Parameter]]:
         params = {}
-        
-        # Pose parameters (shifts, tilt axes, convergence)
+
         pose_params = []
         if self.learn_shift:
-            pose_params.append(self._shifts_params)
+            pose_params.append(self.shifts_params)
         if self.learn_tilt_axis:
-            pose_params.append(self._z1_params)
-            pose_params.append(self._z3_params)
+            pose_params.append(self.z1_params)
+            pose_params.append(self.z3_params)
         if self.learn_convergence:
             pose_params.append(self._convergence_angle_params)
-        
         if pose_params:
             params["pose"] = pose_params
-        
-        # Astigmatism parameters (separate group)
-        if self.learn_astigmatism:
-            params["astigmatism"] = [self._stig_2_params]
-        
-        # Defocus parameters (separate group)
+
         if self.learn_defocus:
             params["defocus"] = [self._z_focus_params]
-        
+
+        if self.learn_astigmatism:
+            params["astigmatism"] = [self._stig_2_params]
+
+        if not params:
+            return {self.DEFAULT_OPTIMIZER_KEY: list(self.parameters())}
+
         return params
 
     def _precompute_clever_k_positions(self, num_rays, convergence_angle, wavelength_ang):
@@ -4972,8 +4991,8 @@ class TomographyThroughFocalINRDataset_0615(TomographyINRDataset):
         # Create Probe and define rays (SLOW - but only once!)
         temp_probe = Probe(
             k_max=k_max,
-            pixel_size=0.2,
-            im_shape=(256, 256),
+            pixel_size=self._probe_pixel_size_ang,
+            im_shape=(self._probe_pixel_count, self._probe_pixel_count),
             wavelength=wavelength_ang,
         )
         
@@ -5466,7 +5485,7 @@ class TomographyThroughFocalINRDataset_0615(TomographyINRDataset):
         else:
             predicted_values_all_rays = (ray_densities @ self._ray_weights.view(-1, 1)).squeeze(-1)
         step_size = 2.0 / (num_samples_per_ray - 1)
-        predicted_values = predicted_values_all_rays.sum(dim=1) * step_size
+        predicted_values = predicted_values_all_rays.sum(dim=1) * step_size / num_rays
 
         return predicted_values
 
