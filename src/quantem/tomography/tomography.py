@@ -235,7 +235,13 @@ class Tomography(TomographyOpt, TomographyBase):
                         )
                         probe_weights = None
 
-                    all_densities = self.obj_model.forward(all_coords)
+                    dset_coords_need_grad = all_coords.requires_grad
+                    if dset_coords_need_grad:
+                        inr_coords = all_coords.detach().requires_grad_(True)
+                    else:
+                        inr_coords = all_coords
+
+                    all_densities = self.obj_model.forward(inr_coords)
 
                     if probe_weights is not None:
                         integrated_densities = self.dset.integrate_rays_with_probe_weights(
@@ -255,7 +261,7 @@ class Tomography(TomographyOpt, TomographyBase):
 
                 soft_constraints_loss = self.obj_model.apply_soft_constraints(
                     ctx=ReconstructionContext(
-                        coords=all_coords,
+                        coords=inr_coords,
                         pred=pred,
                         all_densities=all_densities,
                     )
@@ -271,22 +277,39 @@ class Tomography(TomographyOpt, TomographyBase):
 
                 batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
 
+                if dset_coords_need_grad:
+                    (coord_grad,) = torch.autograd.grad(
+                        batch_loss, inr_coords,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )
+                else:
+                    coord_grad = None
+
+
                 batch_loss.backward()
 
-                # if batch_idx == 0 and a0 == 0 and self.global_rank == 0:
-                #     if hasattr(self.dset, '_stig_2_params') and self.dset._stig_2_params.grad is not None:
-                #         print(f"\n=== Stig_2 Gradient Check ===")
-                #         print(f"stig_2 value: {self.dset._stig_2_params.data}")
-                #         print(f"stig_2 grad: {self.dset._stig_2_params.grad}")
-                #         print(f"stig_2 grad norm: {self.dset._stig_2_params.grad.norm().item()}")
-                #     else:
-                #         print(f"\n=== WARNING: No gradient on stig_2_params! ===")
-                
+                if coord_grad is not None:
+                    all_coords.backward(coord_grad)
 
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    dset_params = self.dset.get_optimization_parameters()
+                    for param_list in dset_params.values():
+                        for p in param_list:
+                            if p.grad is not None:
+                                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
                 # Clip gradients
                 torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)
+                dset_opt_params = self.dset.get_optimization_parameters()
+                for param_list in dset_opt_params.values():
+                    torch.nn.utils.clip_grad_norm_(param_list, max_norm=1.0)
                 self.step_optimizers()
+
+                if hasattr(self.dset, '_z_focus_params') and self.dset.learn_defocus:
+                    with torch.no_grad():
+                        self.dset._z_focus_params.clamp_(-2.0, 2.0)
+
                 total_loss += batch_loss.detach()
                 consistency_loss += batch_consistency_loss.detach()
 
