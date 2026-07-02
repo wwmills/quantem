@@ -373,10 +373,18 @@ class DriftCorrection(AutoSerialize):
             // 2
         )
 
-        # Crop, recalculate median, and re-pad each warped image
+        # Recalculate median from well-covered pixels, and re-pad each warped image
         for a0 in range(self.shape[0]):
+            # weights_warped holds the KDE sample density: ~1 where the scan covers
+            # the canvas, ~0 in pad regions, so this excludes pad-contaminated pixels
+            well_covered = self.weights_warped.array[a0] > 0.5
+            if np.any(well_covered):
+                new_median = np.median(self.images_warped.array[a0][well_covered])
+            else:
+                new_median = np.median(
+                    self.images_warped.array[a0][buff_r:-buff_r, buff_c:-buff_c]
+                )
             cropped = self.images_warped.array[a0].copy()[buff_r:-buff_r, buff_c:-buff_c]
-            new_median = np.median(cropped)
             padded = np.pad(
                 cropped,
                 ((buff_r, buff_r), (buff_c, buff_c)),
@@ -384,8 +392,10 @@ class DriftCorrection(AutoSerialize):
                 constant_values=new_median,
             )
             self.images_warped.array[a0] = padded
-            # Update the interpolator's pad value
+            # Update the interpolator's pad value, and persist it on self so that
+            # re-created interpolators (e.g. the torch affine path) also use it
             self.interpolator[a0].set_pad_value(new_median)
+            self.pad_value[a0] = new_median
 
         if generate_validity_mask is None:
             generate_validity_mask = self.generate_validity_mask
@@ -2358,6 +2368,12 @@ class DriftInterpolator:
         )
 
         return image_interp, weight_interp
+
+    def set_pad_value(
+        self,
+        pad_value,
+    ):
+        self.pad_value = pad_value
 
 
 class DriftInterpolatorTorch:
