@@ -68,6 +68,8 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         self._obj_type = obj_type
         self._sampling = None
 
+    # there is some redundancy with shape, shape_2d, and num_slices, but I think it's okay
+    # to just allow things to be set in multiple ways as long as they chain to each other
     @property
     def shape(self) -> tuple[int, int, int]:
         return self.obj.shape
@@ -925,6 +927,21 @@ class ObjectDIP(ObjectConstraints):
     #     else:
     #         raise ValueError(f"Invalid mode: {mode} | must be one of: 'random', 'zeros', 'ones'")
     #     self._model_input = inp
+
+    def _generate_model_input(self, mode: Literal["random", "zeros", "ones"]) -> None:
+        input_shape = (1, *self.shape)
+        # TODO -- support for 3D CNN models, single channel 2D with identical slices
+        if mode == "random":
+            inp = torch.randn(
+                input_shape, device=self.device, dtype=self.dtype, generator=self._rng_torch
+            )
+        elif mode == "zeros":
+            inp = torch.zeros(input_shape, device=self.device, dtype=self.dtype)
+        elif mode == "ones":
+            inp = torch.ones(input_shape, device=self.device, dtype=self.dtype)
+        else:
+            raise ValueError(f"Invalid mode: {mode} | must be one of: 'random', 'zeros', 'ones'")
+        self._model_input = inp
 
     @property
     def pretrain_target(self) -> torch.Tensor:

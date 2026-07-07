@@ -1,5 +1,4 @@
 import os
-import warnings
 from collections.abc import Sequence
 from typing import Any, Optional, Union, cast
 
@@ -151,6 +150,7 @@ def _show_2d_array(
             scalebar_config.pad_px,
             scalebar_config.color,
             scalebar_config.loc,
+            scalebar_config.font_size,
         )
 
     for spine in ax.spines.values():  # fixes asymmetry of bbox for some reason
@@ -267,6 +267,7 @@ def _show_2d_combined(
             scalebar_config.pad_px,
             scalebar_config.color,
             scalebar_config.loc,
+            scalebar_config.font_size,
         )
 
     return fig, ax
@@ -555,10 +556,19 @@ def show_2d(
             for j in range(len(row), ncols):
                 axs[i][j].axis("off")  # type: ignore
 
+        # Safe layout handling
         if kwargs.get("tight_layout", True):
-            with warnings.catch_warnings():  # suppress warning about tight_layout
-                warnings.simplefilter("ignore")
+            only_subplots = all(
+                getattr(ax, "get_subplotspec", lambda: None)() is not None for ax in fig.axes
+            )
+            if only_subplots:
                 fig.tight_layout()
+            elif figax is None:
+                # We created the figure: provide modest spacing without tight_layout warnings.
+                fig.subplots_adjust(
+                    wspace=kwargs.get("wspace", 0.25),
+                    hspace=kwargs.get("hspace", 0.25),
+                )
 
         # Squeeze the axes to the expected shape
         if axs.shape == (1, 1):

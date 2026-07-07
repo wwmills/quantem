@@ -1,11 +1,13 @@
 import math
 from itertools import product
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from tqdm.auto import tqdm
 
 from quantem.core import config
+
+DeviceType = Union[str, "torch.device", int]
 
 if TYPE_CHECKING:
     import cupy as cp  # type: ignore
