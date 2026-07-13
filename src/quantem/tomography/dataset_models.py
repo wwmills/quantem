@@ -523,8 +523,14 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         # target_values = batch["target_value"].to(self.device, non_blocking=True)
         phis = batch["phi"].to(self.device, non_blocking=True)
         projection_indices = batch["projection_idx"].to(self.device, non_blocking=True)
+        # tilt image's own per-axis pixel count -- see create_batch_rays for why this
+        # must be decoupled from the volume-derived N.
+        Nx_img = self.tilt_stack.shape[2]
+        Ny_img = self.tilt_stack.shape[1]
         with torch.no_grad():
-            batch_ray_coords = self.create_batch_rays(pixel_i, pixel_j, N, num_samples_per_ray)
+            batch_ray_coords = self.create_batch_rays(
+                pixel_i, pixel_j, N, num_samples_per_ray, Nx=Nx_img, Ny=Ny_img
+            )
 
         shifts, z1_params, z3_params = self.forward(None)
         batch_shifts = torch.index_select(shifts, 0, projection_indices)
@@ -539,6 +545,8 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             shifts=batch_shifts,
             N=N,
             sampling_rate=1.0,
+            Nx=Nx_img,
+            Ny=Ny_img,
         )
         all_coords = transformed_rays.view(-1, 3)
 
@@ -548,11 +556,18 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
     @staticmethod
     @torch.compile(mode="reduce-overhead")
     def create_batch_rays(
-        pixel_i: torch.Tensor, pixel_j: torch.Tensor, N: int, num_samples_per_ray: int
+        pixel_i: torch.Tensor, pixel_j: torch.Tensor, N: int, num_samples_per_ray: int,
+        Nx: int | None = None, Ny: int | None = None,
     ) -> torch.Tensor:
+        # Lateral pixel-position normalization uses the tilt image's OWN per-axis
+        # pixel count (Nx, Ny), not the volume-derived N -- these only coincided for
+        # square-image/cubic-volume data. Nx/Ny default to N for backwards
+        # compatibility with any caller that hasn't been updated to pass them.
+        Nx = N if Nx is None else Nx
+        Ny = N if Ny is None else Ny
         batch_size = len(pixel_i)
-        x_coords = (pixel_j / (N - 1)) * 2 - 1
-        y_coords = (pixel_i / (N - 1)) * 2 - 1
+        x_coords = (pixel_j / (Nx - 1)) * 2 - 1
+        y_coords = (pixel_i / (Ny - 1)) * 2 - 1
         z_coords = torch.linspace(-1, 1, num_samples_per_ray, device=pixel_i.device)
 
         rays = torch.zeros(batch_size, num_samples_per_ray, 3, device=pixel_i.device)
@@ -572,9 +587,16 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         shifts: torch.Tensor,
         N: int,
         sampling_rate: float,
+        Nx: int | None = None,
+        Ny: int | None = None,
     ) -> torch.Tensor:
-        shift_x_norm = (shifts[:, 0:1] * sampling_rate * 2) / (N - 1)
-        shift_y_norm = (shifts[:, 1:2] * sampling_rate * 2) / (N - 1)
+        # Shift correction is a sub-pixel pose offset in the same lateral units
+        # as x_coords/y_coords (create_batch_rays), so it must normalize by the
+        # tilt image's own per-axis pixel count (Nx, Ny), not the volume-derived N.
+        Nx = N if Nx is None else Nx
+        Ny = N if Ny is None else Ny
+        shift_x_norm = (shifts[:, 0:1] * sampling_rate * 2) / (Nx - 1)
+        shift_y_norm = (shifts[:, 1:2] * sampling_rate * 2) / (Ny - 1)
 
         rays_x = rays[:, :, 0] - shift_x_norm
         rays_y = rays[:, :, 1] - shift_y_norm
@@ -637,7 +659,7 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         projection_idx = actual_idx // (self.tilt_stack.shape[1] * self.tilt_stack.shape[2])
         remaining = actual_idx % (self.tilt_stack.shape[1] * self.tilt_stack.shape[2])
 
-        pixel_i = remaining // self.tilt_stack.shape[1]
+        pixel_i = remaining // self.tilt_stack.shape[2]
         pixel_j = remaining % self.tilt_stack.shape[2]
 
         return {
@@ -5128,10 +5150,12 @@ class TomographyThroughFocalINRDataset_0615(TomographyINRDataset):
             shifts=batch_shifts,
             N=N,
             sampling_rate=1.0,
+            Nx=self.tilt_stack.shape[2],
+            Ny=self.tilt_stack.shape[1],
         )
-        
+
         all_coords = transformed_rays.view(-1, 3)
-        
+
         return all_coords, probe_weights
 
     def _compute_probe_weights_r(
@@ -5251,14 +5275,19 @@ class TomographyThroughFocalINRDataset_0615(TomographyINRDataset):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Create rays with uniform/pattern sampling and return both rays and probe weights.
-        
+
         Returns:
             rays: (batch_size, num_samples_per_ray * num_rays, 3)
             probe_weights: (batch_size, num_samples_per_ray, num_rays) - weights for each ray at each slice
         """
         batch_size = len(pixel_i)
-        x_coords_0 = (pixel_j / (N - 1)) * 2 - 1
-        y_coords_0 = (pixel_i / (N - 1)) * 2 - 1
+        # Lateral pixel-position normalization uses the tilt image's OWN per-axis
+        # pixel count, not the (volume-derived, depth-only-meaningful) N -- these
+        # only coincided for the old square-image/cubic-volume phantom.
+        Nx_img = self.tilt_stack.shape[2]  # pixel_j axis (x / rotation axis)
+        Ny_img = self.tilt_stack.shape[1]  # pixel_i axis (y axis)
+        x_coords_0 = (pixel_j / (Nx_img - 1)) * 2 - 1
+        y_coords_0 = (pixel_i / (Ny_img - 1)) * 2 - 1
 
         if self.debug:
             print(f"DEBUG create_batch_rays: stig_2.requires_grad = {stig_2.requires_grad}")
@@ -5498,9 +5527,19 @@ class TomographyThroughFocalINRDataset_0615(TomographyINRDataset):
         shifts: torch.Tensor,
         N: int,
         sampling_rate: float,
+        Nx: int | None = None,
+        Ny: int | None = None,
     ) -> torch.Tensor:
-        shift_x_norm = (shifts[:, 0:1] * sampling_rate * 2) / (N - 1)
-        shift_y_norm = (shifts[:, 1:2] * sampling_rate * 2) / (N - 1)
+        # Shift correction is a sub-pixel pose offset in the same lateral units
+        # as x_coords_0/y_coords_0 (create_batch_rays), so it must normalize by
+        # the tilt image's own per-axis pixel count (Nx, Ny), not the
+        # volume-derived N -- see create_batch_rays for the full rationale.
+        # Nx/Ny default to N for backwards compatibility with any caller that
+        # hasn't been updated to pass them.
+        Nx = N if Nx is None else Nx
+        Ny = N if Ny is None else Ny
+        shift_x_norm = (shifts[:, 0:1] * sampling_rate * 2) / (Nx - 1)
+        shift_y_norm = (shifts[:, 1:2] * sampling_rate * 2) / (Ny - 1)
 
         shift_x_norm = shift_x_norm.expand(-1, rays.shape[1])
         shift_y_norm = shift_y_norm.expand(-1, rays.shape[1])
