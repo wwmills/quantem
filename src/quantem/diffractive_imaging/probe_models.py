@@ -180,10 +180,27 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
             self.roi_shape = roi_shape
 
     def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
-        """Get the parameters that should be optimized for this model, keyed by group."""
+        """Get the parameters that should be optimized for this model, keyed by group.
+
+        When ``learn_probe_tilt`` is enabled, ``probe_tilt`` gets its own optimizer group
+        (key ``"probe_tilt"``), separate from the main probe parameters (pixel array / CNN
+        weights / aberration coefs). Tilt is a physically distinct, 2-scalar quantity that
+        typically needs a very different learning rate than the rest of the probe, so bundling
+        it into the same group/lr as everything else makes it effectively unlearnable in
+        practice. This is the same per-parameter-group learning rate (PPLR) pattern used by
+        ``ObjectTensorDecomp``/``KPlanes`` elsewhere in this codebase -- pass a nested dict for
+        the ``"probe"`` key, e.g. ``{"probe": {"default": Adam(lr=5e-3), "probe_tilt": Adam(lr=0.3)}}``.
+        """
         params = self.params
         if params is None:
             return {}
+        if self.learn_probe_tilt:
+            rest = [p for p in params if p is not self._probe_tilt]
+            groups: dict[str, list[torch.Tensor]] = {}
+            if rest:
+                groups[self.DEFAULT_OPTIMIZER_KEY] = rest
+            groups["probe_tilt"] = [self._probe_tilt]
+            return groups
         return {self.DEFAULT_OPTIMIZER_KEY: list(params)}
 
     @property
