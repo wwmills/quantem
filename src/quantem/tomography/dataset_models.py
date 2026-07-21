@@ -4886,6 +4886,11 @@ class TomographyThroughFocalINRDataset_0615(TomographyINRDataset):
             )
             # Store as torch tensor (will be moved to device in .to())
             self._clever_k_positions = torch.from_numpy(k_positions_np).float()
+            # _precompute_clever_k_positions never truncates a complete ring, so the
+            # actual count can exceed what was requested -- num_rays must track the
+            # real array length, or every shape reliant on it elsewhere
+            # (create_batch_rays, integrate_rays, ...) mismatches.
+            self.num_rays = self._clever_k_positions.shape[0]
 
 
         if random_method.lower() in ['probe', 'p']:
@@ -5041,16 +5046,39 @@ class TomographyThroughFocalINRDataset_0615(TomographyINRDataset):
         
         # Extract k-positions (numpy)
         k_positions = temp_probe.k  # Shape: (n_rays, 2)
-        
-        # Trim/pad to exact num_rays
+
+        # NEVER truncate a complete ring: ray generation order is a fixed angular
+        # sweep, so slicing k_positions[:num_rays] doesn't uniformly subsample the
+        # outer ring -- it chops off one contiguous arc of it, turning a symmetric
+        # hexagonal illumination cone into an asymmetric one with a bite taken out
+        # of one side. The ring packing (1 center + 6*num_rings*(num_rings+1)/2 per
+        # full hexagonal shell) only lands exactly on the requested num_rays for the
+        # "hexagonal numbers" (1, 7, 19, 37, 61, ...); for anything else we keep the
+        # full ring (using slightly MORE rays than requested) rather than drop any.
+        # Undershoot (fewer positions than requested) is a separate, genuine edge
+        # case caused by aperture-radius clipping in Probe.define_rays, not ring
+        # rounding -- that case still gets padded with dummy on-axis rays, and is
+        # flagged loudly since it also changes the effective ray count.
         actual_num_rays = k_positions.shape[0]
-        if actual_num_rays > num_rays:
-            k_positions = k_positions[:num_rays]
-        elif actual_num_rays < num_rays:
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            if actual_num_rays == num_rays:
+                print(f"  [clever rays] requested={num_rays} -> num_rings={num_rings}, "
+                      f"exact match")
+            elif actual_num_rays > num_rays:
+                print(f"  [clever rays] requested={num_rays} -> num_rings={num_rings} gives "
+                      f"a complete ring of {actual_num_rays} positions -- using all "
+                      f"{actual_num_rays} (kept whole, not truncated, to stay symmetric)")
+            else:
+                print(f"  [clever rays] requested={num_rays} -> num_rings={num_rings} gives "
+                      f"only {actual_num_rays} positions after aperture clipping, padded with "
+                      f"{num_rays - actual_num_rays} dummy on-axis (k=0,0) rays")
+        if actual_num_rays < num_rays:
             padding = np.zeros((num_rays - actual_num_rays, 2))
             k_positions = np.vstack([k_positions, padding])
-        
-        return k_positions  # Return as numpy (will be converted in __init__)
+
+        return k_positions  # Return as numpy (will be converted in __init__); caller
+        # must set num_rays = len(k_positions), NOT the originally requested value,
+        # since that length is now the actual (possibly larger) ray count.
 
 
     # --- Forward Pass w/ Params Method for OptimizerMixin ---
@@ -5087,7 +5115,7 @@ class TomographyThroughFocalINRDataset_0615(TomographyINRDataset):
             z_focus = self.z_focus_params
         else:
             z_focus = self.z_focus_params.detach()  # No gradients
-        
+
 
 
         if self.learn_shift and self.learn_tilt_axis:
