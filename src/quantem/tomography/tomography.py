@@ -97,10 +97,23 @@ class Tomography(TomographyOpt, TomographyBase):
         # Check device consistency
         self.obj_model.to(self.device)
 
-        # Saving batch size, num workers, and val fraction for reloading
+        # Saving batch size, num workers, and val fraction for reloading. Captured
+        # BEFORE overwriting so the dataloader-rebuild check below (which compares
+        # old vs new) can actually detect a change -- previously self.batch_size was
+        # clobbered first, so every call after the first silently kept reusing the
+        # very first dataloader's batch_size/num_workers/val_fraction forever,
+        # regardless of what was passed in.
+        prev_batch_size = getattr(self, "batch_size", None)
+        prev_num_workers = getattr(self, "num_workers", None)
+        prev_val_fraction = getattr(self, "val_fraction", None)
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.val_fraction = val_fraction
+        dataloader_params_changed = (
+            prev_batch_size != batch_size
+            or prev_num_workers != num_workers
+            or prev_val_fraction != val_fraction
+        )
 
         if profiling_mode:
             if self.global_rank == 0:
@@ -134,7 +147,7 @@ class Tomography(TomographyOpt, TomographyBase):
 
             self.dset.constraints = dset_constraints
         # Setting up DDP
-        if not hasattr(self, "dataloader") or reset_dset is not None:
+        if not hasattr(self, "dataloader") or reset_dset is not None or dataloader_params_changed:
             if reset_dset is not None:
                 print("Resetting Dataloader")
                 print("Putting in params from previous dataset.")
@@ -184,6 +197,7 @@ class Tomography(TomographyOpt, TomographyBase):
 
         pbar = tqdm(range(num_iter), disable=not self.verbose)
         for a0 in pbar:
+            epoch_start_time = time.time()
             consistency_loss = torch.tensor(0.0, device=self.device)
             total_loss = torch.tensor(0.0, device=self.device)
             epoch_soft_constraint_loss = torch.tensor(0.0, device=self.device)
@@ -235,13 +249,7 @@ class Tomography(TomographyOpt, TomographyBase):
                         )
                         probe_weights = None
 
-                    dset_coords_need_grad = all_coords.requires_grad
-                    if dset_coords_need_grad:
-                        inr_coords = all_coords.detach().requires_grad_(True)
-                    else:
-                        inr_coords = all_coords
-
-                    all_densities = self.obj_model.forward(inr_coords)
+                    all_densities = self.obj_model.forward(all_coords)
 
                     if probe_weights is not None:
                         integrated_densities = self.dset.integrate_rays_with_probe_weights(
@@ -261,7 +269,7 @@ class Tomography(TomographyOpt, TomographyBase):
 
                 soft_constraints_loss = self.obj_model.apply_soft_constraints(
                     ctx=ReconstructionContext(
-                        coords=inr_coords,
+                        coords=all_coords,
                         pred=pred,
                         all_densities=all_densities,
                     )
@@ -277,33 +285,10 @@ class Tomography(TomographyOpt, TomographyBase):
 
                 batch_loss = batch_consistency_loss.float() + soft_constraints_loss.float()
 
-                if dset_coords_need_grad:
-                    (coord_grad,) = torch.autograd.grad(
-                        batch_loss, inr_coords,
-                        retain_graph=True,
-                        allow_unused=True,
-                    )
-                else:
-                    coord_grad = None
-
-
                 batch_loss.backward()
-
-                if coord_grad is not None:
-                    all_coords.backward(coord_grad)
-
-                if dist.is_initialized() and dist.get_world_size() > 1:
-                    dset_params = self.dset.get_optimization_parameters()
-                    for param_list in dset_params.values():
-                        for p in param_list:
-                            if p.grad is not None:
-                                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
                 # Clip gradients
                 torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)
-                dset_opt_params = self.dset.get_optimization_parameters()
-                for param_list in dset_opt_params.values():
-                    torch.nn.utils.clip_grad_norm_(param_list, max_norm=1.0)
                 self.step_optimizers()
 
                 if hasattr(self.dset, '_z_focus_params') and self.dset.learn_defocus:
@@ -336,6 +321,18 @@ class Tomography(TomographyOpt, TomographyBase):
                 dist.all_reduce(total_loss, dist.ReduceOp.AVG)
                 dist.all_reduce(consistency_loss, dist.ReduceOp.AVG)
                 dist.all_reduce(epoch_soft_constraint_loss, dist.ReduceOp.AVG)
+
+            # Average GPU memory across all ranks every 5 epochs -- this is a
+            # collective op, so every rank must run it (only rank 0 prints it,
+            # further down); gated on epoch number so it's cheap the rest of the time.
+            avg_mem_gb = None
+            if (self.num_epochs + 1) % 5 == 0 and self.device.type == "cuda":
+                avg_mem_gb = torch.tensor(
+                    torch.cuda.memory_allocated(self.device) / 1e9, device=self.device
+                )
+                if self.world_size > 1:
+                    dist.all_reduce(avg_mem_gb, dist.ReduceOp.AVG)
+                avg_mem_gb = avg_mem_gb.item()
 
             total_loss = total_loss.item() / len(self.dataloader)
             consistency_loss = consistency_loss.item() / len(self.dataloader)
@@ -520,11 +517,16 @@ class Tomography(TomographyOpt, TomographyBase):
                     )
 
                 self.logger.flush()
+            epoch_elapsed = time.time() - epoch_start_time
             if not self.verbose:
                 if self.global_rank == 0:
                     print(
-                        f"Reconstruction Epoch {self.num_epochs} | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}"
+                        f"Reconstruction Epoch {self.num_epochs} | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e} | {epoch_elapsed:.2f}s"
                     )
+                    if avg_mem_gb is not None:
+                        print(
+                            f"  [GPU mem] avg allocated across {self.world_size} rank(s): {avg_mem_gb:.2f} GB"
+                        )
         if show_metrics and self.world_size == 1:
             self.plot_losses()
 

@@ -58,7 +58,15 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
                 print("Setting up DDP for obj_model")
 
         self.dset = dset
-        self.dset.to(device)
+        # Use self.device (resolved by setup_distributed just above to cuda:{local_rank}
+        # under torchrun), not the raw `device` param -- our scripts never pass an
+        # explicit device= to Tomography.from_models(), so this defaults to the bare
+        # "cuda" (no index) from the signature. dset.to("cuda") resolves to whatever
+        # the process's *current* default CUDA device happens to be at this exact
+        # point, which is not reliably cuda:{local_rank} for every rank -- surfacing
+        # as a device mismatch between the dataset's ray coordinates and the object
+        # model's (correctly DDP-placed) weights during forward().
+        self.dset.to(self.device)
 
     # --- Properties ---
     @property

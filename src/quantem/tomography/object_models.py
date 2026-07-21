@@ -1,3 +1,4 @@
+import os
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
@@ -498,7 +499,16 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         )
 
         obj_model.setup_distributed(device=device)
-        obj_model.to(device)
+        # Use obj_model.device (resolved by setup_distributed just above), not the
+        # raw `device` param -- under torchrun, setup_distributed ignores/overrides
+        # a "cpu" (or any) default and sets the real per-rank cuda:N device. Passing
+        # the stale literal `device` string here used to be harmless only because
+        # ObjectINR.to()'s world_size>1 branch was a no-op when already DDP-wrapped
+        # (see the bugfix in .to() above); now that .to() actually re-places the
+        # model, calling it with the wrong device would move params back to CPU
+        # while distribute_model's DDP(..., device_ids=[local_rank]) still expects
+        # them on that rank's GPU.
+        obj_model.to(obj_model.device)
         return obj_model
 
     # --- Properties ---
@@ -769,15 +779,30 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
 
     def create_volume(self, return_vol: bool = False):
-        N = max(self._shape)
+        # Generalized to a possibly-anisotropic (Nx, Ny, Nz) shape -- for the
+        # existing cubic case (Nx == Ny == Nz) this is numerically identical
+        # to the old hardcoded-cube behavior.
+        Nx, Ny, Nz = self._shape
         with torch.no_grad():
-            coords_1d = torch.linspace(-1, 1, N)
-            x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
+            x_1d = torch.linspace(-1, 1, Nx)
+            y_1d = torch.linspace(-1, 1, Ny)
+            z_1d = torch.linspace(-1, 1, Nz)
+            x, y, z = torch.meshgrid(x_1d, y_1d, z_1d, indexing="ij")
             inputs = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
-            model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+            # Unwrap DDP too, not just DataParallel -- create_volume calls the raw
+            # model directly (per-rank, on an uneven grid subset, then all_gathers),
+            # which is incompatible with DDP's forward hooks (expects every rank to
+            # call forward in lockstep with a matching batch); calling the DDP
+            # wrapper itself here manifests as a device-mismatch error inside the
+            # model's own layers.
+            model = (
+                self.model.module
+                if isinstance(self.model, (nn.DataParallel, nn.parallel.DistributedDataParallel))
+                else self.model
+            )
 
-            inference_batch_size = 5 * N * N
-            total_samples = N**3
+            inference_batch_size = 5 * Ny * Nz  # ~5 x-slices per batch, same intent as before
+            total_samples = Nx * Ny * Nz
             samples_per_gpu = total_samples // self.world_size
             remainder = total_samples % self.world_size
 
@@ -845,9 +870,9 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                 for rank, size in enumerate(all_sizes):
                     trimmed_outputs.append(gathered_outputs[rank][: size.item(), :])
 
-                pred_full = torch.cat(trimmed_outputs, dim=0).reshape(C, N, N, N).float()
+                pred_full = torch.cat(trimmed_outputs, dim=0).reshape(C, Nx, Ny, Nz).float()
             else:
-                pred_full = outputs.reshape(C, N, N, N).float()
+                pred_full = outputs.reshape(C, Nx, Ny, Nz).float()
 
             if return_vol:
                 return pred_full.detach().cpu()
@@ -857,11 +882,41 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     def to(self, device: str | torch.device):  # pyright: ignore[reportIncompatibleMethodOverride] -> better to do this device change
         if isinstance(device, str):
             device = torch.device(device)
+
+        # Tomography.reconstruct() calls obj_model.to(self.device) unconditionally on
+        # every single call (once per warmup sub-phase, once per Phase-2 chunk, ...).
+        # Without this guard, the world_size>1 branch below tears down and rebuilds the
+        # DistributedDataParallel wrapper (incl. a full parameter broadcast) every time,
+        # even when the device hasn't changed and the model is already correctly
+        # wrapped -- pure wasted work on every reconstruct() call.
+        already_wrapped = isinstance(self._model, torch.nn.parallel.DistributedDataParallel)
+        already_correct = getattr(self, "_device", None) == device and (
+            already_wrapped if self.world_size > 1 else not already_wrapped
+        )
+        if already_correct:
+            return
+
         self._device = device
         if self.world_size == 1:
             self._model = self._model.to(device)
-        elif not isinstance(self._model, torch.nn.parallel.DistributedDataParallel):
-            self.distribute_model(self._model)
+        else:
+            # Bug fix: previously, if self._model was ALREADY DistributedDataParallel
+            # (e.g. after Tomography.from_file() deserializes a checkpoint that was
+            # saved DDP-wrapped), this branch was a no-op -- it never moved the
+            # underlying parameters to `device`, so a resumed model's weights stayed
+            # on CPU (deserialization defaults to CPU) while later code assumed they
+            # were on the correct GPU, surfacing as a device-mismatch error deep in
+            # the model's own layers. Also, the old code discarded distribute_model's
+            # return value, so even the "not yet wrapped" case never re-assigned
+            # self._model. Unwrap (if needed), then always re-move+re-wrap via
+            # distribute_model, which internally does model.to(self.device) before
+            # wrapping.
+            raw_model = (
+                self._model.module
+                if isinstance(self._model, torch.nn.parallel.DistributedDataParallel)
+                else self._model
+            )
+            self._model = self.distribute_model(raw_model)
         self.reconnect_optimizer_to_parameters()
 
 
@@ -908,7 +963,16 @@ class ObjectTensorDecomp(ObjectINR):
         )
 
         obj_model.setup_distributed(device=device)
-        obj_model.to(device)
+        # Use obj_model.device (resolved by setup_distributed just above), not the
+        # raw `device` param -- under torchrun, setup_distributed ignores/overrides
+        # a "cpu" (or any) default and sets the real per-rank cuda:N device. Passing
+        # the stale literal `device` string here used to be harmless only because
+        # ObjectINR.to()'s world_size>1 branch was a no-op when already DDP-wrapped
+        # (see the bugfix in .to() above); now that .to() actually re-places the
+        # model, calling it with the wrong device would move params back to CPU
+        # while distribute_model's DDP(..., device_ids=[local_rank]) still expects
+        # them on that rank's GPU.
+        obj_model.to(obj_model.device)
         return obj_model
 
     # --- Constraints ---
