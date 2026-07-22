@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import scipy.special as sp
 from numpy.typing import NDArray
+from scipy.fft import next_fast_len
 from scipy.ndimage import distance_transform_edt, gaussian_filter
 
 from quantem.core.io.serialize import AutoSerialize
@@ -90,7 +91,13 @@ class SimData(AutoSerialize):
             v = (u @ rotation_matrix).T
         margin_H = int(round(pad_fraction * H))
         margin_W = int(round(pad_fraction * W))
-        obj = cls(H=H + 2 * margin_H, W=W + 2 * margin_W, u=u, v=v, _token=cls._token)
+        # Every add_* method's convolution/blur steps run an FFT over this padded canvas;
+        # snapping its size up to scipy's next efficient FFT length avoids the ~3x slowdown
+        # a size with a large prime factor (e.g. 1228 = 2^2*307) would otherwise cost on
+        # every single one of those calls, for a negligible amount of extra padding.
+        padded_H = next_fast_len(H + 2 * margin_H) if pad_fraction > 0 else H
+        padded_W = next_fast_len(W + 2 * margin_W) if pad_fraction > 0 else W
+        obj = cls(H=padded_H, W=padded_W, u=u, v=v, _token=cls._token)
         obj._pixel_size_nm = pixel_size_nm
         obj._pad_fraction = pad_fraction
         obj._H_display = H
@@ -1022,7 +1029,7 @@ class SimData(AutoSerialize):
         correlation=0.0,
         corr_p_in=25.0,
         corr_p_s=25.0,
-        window_width=20.0,
+        window_width=2.0,
         sigma=1.5,
         amplitude=0.5,
     ):
