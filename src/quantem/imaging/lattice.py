@@ -126,6 +126,158 @@ class Lattice(AutoSerialize):
             else:
                 self._image = Dataset2d(arr)  # type: ignore[call-arg]
 
+    # --- Real-space units ---
+    # Every method in this class does its actual math in raw pixels; everything below is
+    # purely a convenience layer for *specifying* pixel-distance arguments in physical
+    # units instead, one call at a time, without requiring the whole class to be
+    # recalibrated to work in nm/A internally. Conversion only ever goes real-space-unit ->
+    # pixels, never the other way (nothing here reports results back out in nm/A) -- that's
+    # a deliberate scope limit, not an oversight. Currently wired up: atoms_first_uvw's
+    # minSpacing and edge_min_dist_px arguments (via argument_units), the latter of which
+    # measure_b_intensity_near_a/auto_find_b_frac_orientation also inherit by default
+    # through the self.edge_min_dist_px stash -- but if edge_min_dist_px is passed directly
+    # to those two methods instead of relying on that default, it is still raw-pixels-only.
+    _UNIT_ALIASES = {
+        "pixel": "pixels",
+        "pixels": "pixels",
+        "px": "pixels",
+        "nm": "nm",
+        "nanometer": "nm",
+        "nanometers": "nm",
+        "a": "A",
+        "angstrom": "A",
+        "angstroms": "A",
+        "å": "A",
+    }
+    _UNIT_TO_NM = {"nm": 1.0, "A": 0.1}  # 1 angstrom = 0.1 nm
+
+    @classmethod
+    def _normalize_units(cls, units) -> str:
+        key = str(units).strip().lower()
+        normalized = cls._UNIT_ALIASES.get(key)
+        if normalized is None:
+            raise ValueError(
+                f"Unrecognized units {units!r} -- must be one of 'pixels', 'nm', 'A' "
+                f"(or a spelled-out/aliased form of these)."
+            )
+        return normalized
+
+    def set_pixel_units(self, units, pixel_size=None, fov=None):
+        """
+        Calibrate this Lattice's real-space pixel scale, so pixel-distance arguments
+        elsewhere (e.g. atoms_first_uvw's minSpacing) can be given in physical units.
+
+        Parameters
+        ----------
+        units : str
+            'pixels' (the default if this is never called -- distances stay in raw pixels,
+            no calibration needed or used), 'nm', or 'A' (angstrom, abTEM's default unit).
+            Case-insensitive; spelled-out/aliased forms ('angstrom', 'nanometers', 'px', ...)
+            are accepted too.
+        pixel_size : float, optional
+            Physical size of one pixel, in `units`. Required (together with fov, at least
+            one of the two) when units is a real-space unit; unused for 'pixels'.
+        fov : float, optional
+            Physical width of the image's first axis, in `units`. If pixel_size isn't given
+            directly, it's derived as fov / self._image.shape[0] (same convention as
+            SimData.from_HWU's field_size_nm). At least one of pixel_size or fov is required
+            when units is a real-space unit.
+        """
+        units_norm = self._normalize_units(units)
+        if units_norm == "pixels":
+            self._pixel_units = "pixels"
+            self._pixel_size = 1.0
+            return self
+
+        if pixel_size is None and fov is None:
+            raise ValueError(
+                f"units={units_norm!r} is a real-space unit -- pass pixel_size or fov (in "
+                f"{units_norm}) to calibrate it. ('pixels' doesn't need either.)"
+            )
+        if fov is not None and not (np.isfinite(fov) and fov > 0):
+            raise ValueError(f"fov must be a positive, finite number, got {fov!r}.")
+        if pixel_size is None:
+            pixel_size = fov / self._image.shape[0]
+        if not (np.isfinite(pixel_size) and pixel_size > 0):
+            raise ValueError(f"pixel_size must be a positive, finite number, got {pixel_size!r}.")
+
+        self._pixel_units = units_norm
+        self._pixel_size = float(pixel_size)
+        return self
+
+    def _to_pixels(self, value, argument_units=None):
+        """
+        Convert `value` from `argument_units` (or, if not given, whatever units this
+        Lattice was calibrated to via set_pixel_units -- 'pixels' if that was never called)
+        into pixels, for use by any method accepting a real-space distance parameter.
+
+        Only ever converts INTO pixels, matching the class-level scope note above. If
+        argument_units names a real-space unit but this Lattice has no real calibration yet
+        (still 'pixels'), raises rather than silently guessing a scale -- call
+        set_pixel_units first.
+        """
+        class_units = getattr(self, "_pixel_units", "pixels")
+        units_norm = self._normalize_units(
+            argument_units if argument_units is not None else class_units
+        )
+
+        if units_norm == "pixels":
+            return value
+
+        if class_units == "pixels":
+            raise ValueError(
+                f"argument_units={units_norm!r} was requested, but this Lattice has no "
+                f"real-space calibration yet -- call "
+                f"lattice.set_pixel_units({units_norm!r}, pixel_size=... or fov=...) first."
+            )
+
+        pixel_size_in_units = self._pixel_size * (
+            self._UNIT_TO_NM[class_units] / self._UNIT_TO_NM[units_norm]
+        )
+        return value / pixel_size_in_units
+
+    def _spacing_marker_size(self, fig, ax, data_width, frac=0.25, spacing=None, fallback=200.0):
+        """
+        Compute a matplotlib scatter `s` value (marker area in points^2) so the marker's
+        rendered diameter is `frac` times a real lattice spacing, instead of a fixed magic
+        number. `s` is in points^2, which is otherwise blind to how large the image is being
+        displayed (a large image at a fixed `s` renders as a tiny dot; a small image at the
+        same `s` renders as a huge blob) -- this converts using the actual figure size and
+        axes width so the marker tracks the plotted spacing regardless of figsize/dpi.
+
+        Parameters
+        ----------
+        fig, ax : the actual Figure/Axes the scatter will be drawn on.
+        data_width : float
+            The data-coordinate width spanned by `ax` (e.g. image width W, matching
+            ax.set_xlim(0, W) as used throughout this class).
+        frac : float, default 0.25
+            Target marker diameter as a fraction of `spacing`.
+        spacing : float, optional
+            The real lattice spacing (in the same pixel units as `data_width`) to size
+            against. If None, uses self.uv_norm (the average |u|/|v|/|w| lattice-vector
+            magnitude computed during atoms_first_uvw's refit -- a good proxy for the
+            average A-site spacing).
+        fallback : float, default 200.0
+            Returned if spacing/geometry aren't available yet (e.g. called before any
+            lattice has been fit), matching this class's long-standing default marker size.
+        """
+        if spacing is None:
+            spacing = getattr(self, "uv_norm", None)
+        if spacing is None or not np.isfinite(spacing) or spacing <= 0:
+            return fallback
+        if data_width is None or not np.isfinite(data_width) or data_width <= 0:
+            return fallback
+
+        ax_width_frac = ax.get_position().width
+        fig_width_in = fig.get_size_inches()[0]
+        if ax_width_frac <= 0 or fig_width_in <= 0:
+            return fallback
+
+        points_per_data_unit = (fig_width_in * ax_width_frac * 72.0) / data_width
+        diameter_points = (frac * spacing) * points_per_data_unit
+        return float(diameter_points**2)
+
     # --- Functions ---
     def define_lattice(
         self,
@@ -1593,7 +1745,35 @@ class Lattice(AutoSerialize):
                         elif duplicate_atoms_index_found_previous_iterations.size == 1:
                             kept_index = duplicate_atoms_index_found_previous_iterations
                         else:
-                            kept_index = duplicate_group[mask_atoms_found[duplicate_group]][0]
+                            # Fresh collision this iteration: multiple distinct candidates
+                            # were each independently reached as "the neighbor" and ended up
+                            # with the same (a,b) lattice index. All members share that (a,b)
+                            # by construction, so the theoretically-expected real-space
+                            # position is well-defined (origin + a*u + b*v) regardless of
+                            # which path found it -- keep whichever actual candidate sits
+                            # closest to that ideal position, instead of an arbitrary
+                            # array-order pick (the previous behavior let either the correct
+                            # atom or a nearby noise/wrong-population candidate win with no
+                            # preference, which mattered a lot once the search tolerance's
+                            # radius is large enough for real ambiguity to occur often).
+                            eligible = duplicate_group[mask_atoms_found[duplicate_group]]
+                            a_val = unique_ids[2, duplicate_group[0]]
+                            b_val = unique_ids[3, duplicate_group[0]]
+                            expected_x = (
+                                maxima_candidates_x[origin_candidate_index]
+                                + a_val * u[0]
+                                + b_val * v[0]
+                            )
+                            expected_y = (
+                                maxima_candidates_y[origin_candidate_index]
+                                + a_val * u[1]
+                                + b_val * v[1]
+                            )
+                            dist_to_expected = np.hypot(
+                                maxima_candidates_x[eligible] - expected_x,
+                                maxima_candidates_y[eligible] - expected_y,
+                            )
+                            kept_index = eligible[np.argmin(dist_to_expected)]
                         wipe_indicies = duplicate_group[duplicate_group != kept_index]
                         unique_ids[1, wipe_indicies] = (
                             2  # signals to not accept for this maxima anymore
@@ -1787,8 +1967,10 @@ class Lattice(AutoSerialize):
         sigma: float = 0,
         minAbsoluteIntensity: float = 0,
         minRelativeIntensity: float = 0,
-        relativeToPeak: float = 0,
-        minSpacing: float = 0,
+        relativeToPeak: float | str = 0,
+        robust_top_k: int = 5,
+        minSpacing: float | None = None,
+        min_spacing_frac: float = 0.75,
         edgeBoundary: int = 1,
         maxNumPeaks: int = 5000,
         plot_atoms=True,
@@ -1806,11 +1988,117 @@ class Lattice(AutoSerialize):
         num_peaks_use=2,
         center_ignore_buffer=15,
         minSpacingPeaks=5,
+        min_angle_deg=20.0,
+        max_magnitude_ratio=10.0,
+        crop_radius: int | None | str = "auto",
         use_found_peaks_directly=False,
         tolerance_b=None,
+        peak_marker_size=None,
+        atom_marker_size=None,
+        marker_size_frac=0.25,
+        argument_units=None,
         **kwargs,
     ):
         self.check_for_dislocations = check_for_dislocations and check_uv_duplication
+        H, W = self._image.shape  # x=rows, y=cols
+
+        # edge_min_dist_px is a real-space distance argument wired up to accept physical
+        # units -- see set_pixel_units/_to_pixels. argument_units=None (the default) means
+        # "whatever this Lattice was calibrated to" (raw pixels if set_pixel_units was
+        # never called), so this is a no-op for existing callers.
+        # measure_b_intensity_near_a/auto_find_b_frac_orientation's own edge_min_dist_px
+        # parameters are still raw-pixels-only if passed directly -- only the value stashed
+        # here (their fallback default) is unit-converted.
+        if edge_min_dist_px is not None:
+            edge_min_dist_px = self._to_pixels(edge_min_dist_px, argument_units)
+
+        # u, v are found FIRST (from the FFT-based first-order Bragg peaks, independent of
+        # minSpacing/maxima_candidates entirely) specifically so their magnitude is
+        # available to auto-derive minSpacing below -- previously minSpacing defaulted to
+        # 0 (no deduplication at all) since nothing was known about the true lattice
+        # spacing until much later in the function.
+        if u is None or v is None:
+            uv_result_inv = self.auto_peak_finder(
+                num_peaks_search=num_peaks_search,
+                num_peaks_use=num_peaks_use,
+                center_ignore_buffer=center_ignore_buffer,
+                min_angle_deg=min_angle_deg,
+                max_magnitude_ratio=max_magnitude_ratio,
+                minSpacingPeaks=minSpacingPeaks,
+                crop_radius=crop_radius,
+            )
+
+            g_vector_1_c = np.array([uv_result_inv[0]["x"], uv_result_inv[0]["y"]])
+            g_vector_2_c = np.array([uv_result_inv[1]["x"], uv_result_inv[1]["y"]])
+            g_vec1 = np.zeros(2)
+            g_vec1[0] = (g_vector_1_c[0] - (0.5 * H)) / H
+            g_vec1[1] = (g_vector_1_c[1] - (0.5 * W)) / W
+            g_vec2 = np.zeros(2)
+            g_vec2[0] = (g_vector_2_c[0] - (0.5 * H)) / H
+            g_vec2[1] = (g_vector_2_c[1] - (0.5 * W)) / W
+            g_matrix = np.array([g_vec1, g_vec2])
+            a_matrix = np.linalg.inv(g_matrix)
+            a_transpose = a_matrix.T
+            u = np.array([a_transpose[0, 0], a_transpose[0, 1]])
+            v = np.array([a_transpose[1, 0], a_transpose[1, 1]])
+            self.u = u
+            self.v = v
+
+        # positions_frac has to be resolved before minSpacing (below), since minSpacing's
+        # auto-derivation must also respect the shortest distance between DIFFERENT sites
+        # (e.g. A-B), not just the |u|/|v| primitive-cell vectors -- see the multi-site
+        # branch just below for why.
+        if positions_frac is None:
+            positions_frac = np.atleast_2d(np.array((0, 0)))
+        self._positions_frac = np.atleast_2d(np.array(positions_frac, dtype=float))
+        self._num_sites = self._positions_frac.shape[0]
+
+        # minSpacing: None (the new default) auto-derives from the just-found first-order
+        # peaks and site basis. min(|u|, |v|) covers the single-site case (using the
+        # shorter of the two vectors, rather than their average, matters once u and v
+        # aren't the same length -- e.g. a non-hexagonal/rectangular lattice -- since a
+        # fraction of the longer vector could still exceed the true shortest spacing along
+        # the short axis). For multi-site positions_frac (e.g. an A/B sublattice search),
+        # also scan every pair of site-basis points across a 3x3 block of neighboring unit
+        # cells -- a site's nearest neighbor of a DIFFERENT type can sit in an adjacent
+        # cell, e.g. B at (1/3,1/3) is nearest to A at either (0,0) or (1,1), not to another
+        # B -- and fold in the smallest nonzero distance found. This matters a lot in
+        # practice: for a standard 2-site hex material the true A-B spacing is
+        # |u|/sqrt(3) ~= 0.577x |u|, comfortably under the single-site-only 0.75x default,
+        # so without this, get_maxima_2D's minSpacing de-duplication (which runs on the
+        # combined candidate pool before the flood-fill can tell sites apart) would delete
+        # every dimmer B candidate sitting near a brighter A candidate, silently returning
+        # zero B atoms -- confirmed exactly this failure mode on a synthetic WSe2 test
+        # before this multi-site scan was added. min_spacing_frac=0.75 stays comfortably
+        # under the shortest plausible inter-atom distance while still collapsing
+        # noise-driven multi-maxima within a single atom's PSF footprint, which was
+        # verified to otherwise flood the real-space candidate pool with spurious
+        # near-duplicate detections (over half the candidate pool, in one stress test) that
+        # then compete with real atoms during the flood-fill. An explicit numeric
+        # minSpacing (any value, including 0) always overrides this and is unit-converted
+        # as before -- this only changes behavior for callers who never specified
+        # minSpacing at all.
+        if minSpacing is None:
+            prelim_spacing = min(np.linalg.norm(u), np.linalg.norm(v))
+            if self._num_sites > 1:
+                from scipy.spatial import cKDTree
+
+                cell_offsets = np.array([[da, db] for da in (-1, 0, 1) for db in (-1, 0, 1)])
+                shifted_frac = (
+                    self._positions_frac[:, None, :] + cell_offsets[None, :, :]
+                ).reshape(-1, 2)
+                shifted_real = shifted_frac @ np.array([u, v])
+                shifted_real = np.unique(np.round(shifted_real, 6), axis=0)
+                site_tree = cKDTree(shifted_real)
+                site_dists, _ = site_tree.query(shifted_real, k=2)
+                nearest_other = site_dists[:, 1]
+                nearest_other = nearest_other[nearest_other > 1e-6]
+                if nearest_other.size > 0:
+                    prelim_spacing = min(prelim_spacing, nearest_other.min())
+            minSpacing = min_spacing_frac * prelim_spacing
+        else:
+            minSpacing = self._to_pixels(minSpacing, argument_units)
+
         # find all candidates above threshold
         maxima_candidates = self.get_maxima_2D(
             self.image.array,
@@ -1820,12 +2108,11 @@ class Lattice(AutoSerialize):
             minAbsoluteIntensity=minAbsoluteIntensity,
             minRelativeIntensity=minRelativeIntensity,
             relativeToPeak=relativeToPeak,
+            robust_top_k=robust_top_k,
             minSpacing=minSpacing,
             edgeBoundary=edgeBoundary,
             maxNumPeaks=maxNumPeaks,
         )
-
-        H, W = self._image.shape  # x=rows, y=cols
 
         fig, ax = plt.subplots(figsize=(5, 5), dpi=300)
         show_2d(
@@ -1849,37 +2136,6 @@ class Lattice(AutoSerialize):
             origin_y = maxima_candidates[max_intensity_index]["y"]
             origin = np.array([origin_x, origin_y])
 
-        if u is None or v is None:
-            uv_result_inv = self.auto_peak_finder(
-                num_peaks_search=num_peaks_search,
-                num_peaks_use=num_peaks_use,
-                center_ignore_buffer=center_ignore_buffer,
-                minSpacingPeaks=minSpacingPeaks,
-            )
-
-            g_vector_1_c = np.array([uv_result_inv[0]["x"], uv_result_inv[0]["y"]])
-            g_vector_2_c = np.array([uv_result_inv[1]["x"], uv_result_inv[1]["y"]])
-            g_vec1 = np.zeros(2)
-            g_vec1[0] = (g_vector_1_c[0] - (0.5 * H)) / H
-            g_vec1[1] = (g_vector_1_c[1] - (0.5 * W)) / W
-            g_vec2 = np.zeros(2)
-            g_vec2[0] = (g_vector_2_c[0] - (0.5 * H)) / H
-            g_vec2[1] = (g_vector_2_c[1] - (0.5 * W)) / W
-            g_matrix = np.array([g_vec1, g_vec2])
-            a_matrix = np.linalg.inv(g_matrix)
-            a_transpose = a_matrix.T
-            u = np.array([a_transpose[0, 0], a_transpose[0, 1]])
-            v = np.array([a_transpose[1, 0], a_transpose[1, 1]])
-            self.u = u
-            self.v = v
-
-        if positions_frac is None:
-            positions_frac = np.atleast_2d(np.array((0, 0)))  # 1, 1
-        # if (positions_frac[0] == np.array([0,0])).all():
-        # positions_frac[0] = np.atleast_2d(np.array((1,1)))
-
-        self._positions_frac = np.atleast_2d(np.array(positions_frac, dtype=float))
-        self._num_sites = self._positions_frac.shape[0]
         if numbers is None:
             self._numbers = np.arange(1, self._num_sites + 1, dtype=int)
         else:
@@ -1889,9 +2145,12 @@ class Lattice(AutoSerialize):
         # print("num sites",self._num_sites)
 
         if w is None:
-            if np.abs(
-                np.rad2deg(np.arccos(np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v))))
-            ) > np.deg2rad(90):
+            if (
+                np.abs(
+                    np.rad2deg(np.arccos(np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v))))
+                )
+                > 90
+            ):
                 w = np.asarray(u) + np.asarray(v)
                 w_sign = 1
             else:
@@ -1967,6 +2226,9 @@ class Lattice(AutoSerialize):
         # mask of where in real space maxima can occur
         H, W = self._image.shape  # x=rows, y=cols
         edge_thresh = float(edge_min_dist_px) if edge_min_dist_px is not None else 0.0
+        # stashed so measure_b_intensity_near_a can apply the same edge exclusion to B-site
+        # candidates by default, instead of only ever filtering A-sites by it
+        self.edge_min_dist_px = edge_thresh
 
         DT = None
         if input_mask is not None:
@@ -1990,7 +2252,12 @@ class Lattice(AutoSerialize):
         v_norm = np.linalg.norm(v)
         w_norm = np.linalg.norm(w)
         uvw_arr = np.array([np.asarray(u), np.asarray(v), np.asarray(w)])
-        uvw_norm = 0.5 * (u_norm + v_norm + w_norm)
+        # average of THREE magnitudes -- divide by 3, not 2 (was 0.5*(...), which for a
+        # proper hex lattice where u_norm==v_norm==w_norm gives 1.5x the true spacing, not
+        # the average -- verified this alone was enough to substantially depress
+        # atoms_first_uvw's flood-fill yield on a real 2-sublattice image, since it
+        # inflates every tolerance/search radius derived from uv_norm downstream).
+        uvw_norm = (u_norm + v_norm + w_norm) / 3.0
         self.uv_norm = uvw_norm
         self.uv_arr = uvw_arr
         self.tolerance_uv = tolerance_uvw
@@ -2054,13 +2321,18 @@ class Lattice(AutoSerialize):
             xs = maxima_candidates_x
             ys = maxima_candidates_y
             rgb = site_colors(int(self._numbers[0]))
+            peak_s = (
+                peak_marker_size
+                if peak_marker_size is not None
+                else self._spacing_marker_size(fig, ax, W, frac=marker_size_frac, fallback=18.0)
+            )
             ax.scatter(
                 ys,
                 xs,
-                s=18,
-                facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+                s=peak_s,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.1),
                 edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
-                linewidths=0.75,
+                linewidths=1.5,
                 marker="o",
                 zorder=25,
             )
@@ -2221,7 +2493,35 @@ class Lattice(AutoSerialize):
                         elif duplicate_atoms_index_found_previous_iterations.size == 1:
                             kept_index = duplicate_atoms_index_found_previous_iterations
                         else:
-                            kept_index = duplicate_group[mask_atoms_found[duplicate_group]][0]
+                            # Fresh collision this iteration: multiple distinct candidates
+                            # were each independently reached as "the neighbor" and ended up
+                            # with the same (a,b) lattice index. All members share that (a,b)
+                            # by construction, so the theoretically-expected real-space
+                            # position is well-defined (origin + a*u + b*v) regardless of
+                            # which path found it -- keep whichever actual candidate sits
+                            # closest to that ideal position, instead of an arbitrary
+                            # array-order pick (the previous behavior let either the correct
+                            # atom or a nearby noise/wrong-population candidate win with no
+                            # preference, which mattered a lot once the search tolerance's
+                            # radius is large enough for real ambiguity to occur often).
+                            eligible = duplicate_group[mask_atoms_found[duplicate_group]]
+                            a_val = unique_ids[2, duplicate_group[0]]
+                            b_val = unique_ids[3, duplicate_group[0]]
+                            expected_x = (
+                                maxima_candidates_x[origin_candidate_index]
+                                + a_val * u[0]
+                                + b_val * v[0]
+                            )
+                            expected_y = (
+                                maxima_candidates_y[origin_candidate_index]
+                                + a_val * u[1]
+                                + b_val * v[1]
+                            )
+                            dist_to_expected = np.hypot(
+                                maxima_candidates_x[eligible] - expected_x,
+                                maxima_candidates_y[eligible] - expected_y,
+                            )
+                            kept_index = eligible[np.argmin(dist_to_expected)]
                         wipe_indicies = duplicate_group[duplicate_group != kept_index]
                         unique_ids[1, wipe_indicies] = (
                             2  # this signals to not accept for this maxima anymore (and flags this as a dulpicate)
@@ -2296,6 +2596,45 @@ class Lattice(AutoSerialize):
                 )
             ).T
             self.atoms.set_data(arr, 0)
+
+        if refine_lattice:
+            # Refit origin, u, v by least squares over ALL detected A-site positions (using
+            # each atom's integer lattice index, stored in self.atoms's "a"/"b" fields) instead
+            # of trusting the single 2-Bragg-peak FFT estimate from auto_peak_finder above. That
+            # heuristic peak search can be meaningfully off in magnitude and/or angle. A-site
+            # positions are self-correcting (snapped onto real detected peaks during the tiling
+            # loop just completed), but every other-site candidate computed from u/v (e.g.
+            # B-sites in measure_b_intensity_near_a, via get_xy_shifts -> self.uv_arr) is a pure
+            # algebraic offset with no such correction, so any error left in u/v here propagates
+            # uncorrected into every one of those candidates as a uniform bias.
+            a_data = self.atoms.get_data(0)
+            if a_data.shape[0] >= 3:
+                a_idx, b_idx = a_data[:, 2], a_data[:, 3]
+                basis = np.column_stack([np.ones_like(a_idx), a_idx, b_idx])
+                coeffs, *_ = np.linalg.lstsq(basis, a_data[:, :2], rcond=None)
+                origin, u, v = coeffs[0], coeffs[1], coeffs[2]
+                self.origin = origin
+                self.u = u
+                self.v = v
+                if (
+                    np.abs(
+                        np.rad2deg(
+                            np.arccos(np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v)))
+                        )
+                    )
+                    > 90
+                ):
+                    w = u + v
+                    w_sign = 1
+                else:
+                    w = u - v
+                    w_sign = -1
+                u_norm, v_norm, w_norm = np.linalg.norm(u), np.linalg.norm(v), np.linalg.norm(w)
+                # see the matching comment on the pre-refit uvw_norm computation above --
+                # average of three magnitudes, divide by 3 not 2.
+                self.uv_norm = (u_norm + v_norm + w_norm) / 3.0
+                self.uv_arr = np.array([u, v, w])
+                self._lat = np.vstack((origin, u, v))
 
         # second, a loop that uses these A sites to find all other sites
         found_atoms_in_prev_iteration = True
@@ -2397,6 +2736,11 @@ class Lattice(AutoSerialize):
             fig, ax = show_2d(self._image.array, returnfig=True, **kwargs)
             if ax.images:
                 ax.images[-1].set_zorder(0)
+            atom_s = (
+                atom_marker_size
+                if atom_marker_size is not None
+                else self._spacing_marker_size(fig, ax, W, frac=marker_size_frac, fallback=200.0)
+            )
             for a0 in range(self._num_sites):
                 atoms_arr = self.atoms.get_data(a0)
                 xs = atoms_arr[:, 0]
@@ -2407,10 +2751,10 @@ class Lattice(AutoSerialize):
                 ax.scatter(
                     ys,
                     xs,
-                    s=200 * (a0 + 1),
-                    facecolor=(rgb[0], rgb[1], rgb[2], 0.85),
+                    s=atom_s * (a0 + 1),
+                    facecolor=(rgb[0], rgb[1], rgb[2], 0.1),
                     edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
-                    linewidths=0.75,
+                    linewidths=1.5,
                     marker="o",
                     zorder=25,
                 )
@@ -2436,18 +2780,42 @@ class Lattice(AutoSerialize):
         radius=4,
         max_shift_gauss=3,
         dedup_cutoff_px=5,
+        edge_min_dist_px=None,
+        background_sigma_px: float | None = None,
         plot_atoms=True,
         print_message=True,
+        a_marker_size=None,
+        b_marker_size=None,
+        marker_size_frac=0.25,
     ):
         def generate_frac_variants(frac, tol=1e-6):
-            import itertools
-
+            """
+            All fractional representations of the same physical point under every valid
+            choice of "short" primitive basis for a hexagonal A-site lattice -- not just
+            permutations/sign-flips of `frac` (that's only the symmetry group of a
+            RECTANGULAR lattice). A hexagonal lattice has six equally-short vectors
+            {u, v, u-v, u+v, -u, -v, -(u-v), -(u+v)} (u+v is short too once you're
+            standing in a basis that's itself 120 degrees apart rather than 60 -- both
+            show up depending which basis atoms_first_uvw's independent peak-finding
+            happens to land on), and any non-collinear pair of them is an equally valid
+            primitive basis. The B site's true fractional offset looks different in each
+            -- e.g. (1/3,1/3) in one basis is (1/3,2/3) in another -- and permutation/
+            sign-flip alone can't reach between them, so a seed value that's only "wrong"
+            relative to whichever basis got fit would never be corrected. This generates
+            the complete set of alternate-basis representations instead, via an explicit
+            change-of-basis for every valid short-vector pair (verified to connect
+            (1/3,1/3) and (1/3,2/3) to each other, which permutation/sign-flip cannot).
+            """
             frac = np.asarray(frac, dtype=float)
+            short_vecs = [(1, 0), (0, 1), (1, -1), (1, 1), (-1, 0), (0, -1), (-1, 1), (-1, -1)]
             variants = []
-            for perm in set(itertools.permutations(frac)):
-                for signs in itertools.product([1, -1], repeat=2):
-                    v = np.array(perm) * np.array(signs)
-                    variants.append(v)
+            for e1 in short_vecs:
+                for e2 in short_vecs:
+                    m_new = np.array([e1, e2], dtype=float)
+                    det = np.linalg.det(m_new)
+                    if abs(abs(det) - 1.0) > 1e-9:  # must be a unimodular (|det|=1) basis change
+                        continue
+                    variants.append(frac @ np.linalg.inv(m_new))
             unique = []
             for v in variants:
                 if not any(np.allclose(v, u, atol=tol) for u in unique):
@@ -2456,25 +2824,86 @@ class Lattice(AutoSerialize):
 
         candidates = generate_frac_variants(self._positions_frac[1])
 
-        intensities = np.zeros([candidates.shape[0]])
-        frac_ind = 0
-        for frac in candidates:
-            self._positions_frac[1] = frac
-            self.measure_b_intensity_near_a(
-                num_b_per_uc=num_b_per_uc,
-                order=order,
-                interpolate_intensity=interpolate_intensity,
-                avg_inside_radius=avg_inside_radius,
-                max_inside_radius=max_inside_radius,
-                fit_guassian=fit_guassian,
-                radius=radius,
-                max_shift_gauss=max_shift_gauss,
-                dedup_cutoff_px=dedup_cutoff_px,
-                plot_atoms=plot_atoms,
-            )
+        # Scoring during the SEARCH must use a fixed point sample at each candidate's exact
+        # algebraic position (interpolate_intensity=True, no local search/fit of any kind) --
+        # never the caller's own avg_inside_radius/max_inside_radius/fit_guassian settings.
+        # Those all let a candidate's B-site position wander within a local window to whatever
+        # is brightest nearby, and A-sites are the brightest thing in the image: a wrong
+        # candidate that happens to place many B-site guesses within snapping distance of A-site
+        # peaks will trivially win a total-intensity comparison once local snapping is allowed
+        # (measured effect: with fit_guassian=True, this pulls essentially every B site onto the
+        # neighboring A-site instead of picking the right orientation). Using an unmovable point
+        # sample here means a candidate can only score well by actually landing on real B-site
+        # intensity, not by drifting onto a stronger, unrelated peak nearby. The caller's real
+        # settings are still used for the final measurement below, once the orientation this
+        # search picks is already fixed.
+        search_kwargs = dict(
+            num_b_per_uc=num_b_per_uc,
+            order=order,
+            interpolate_intensity=True,
+            avg_inside_radius=False,
+            max_inside_radius=False,
+            fit_guassian=False,
+            dedup_cutoff_px=dedup_cutoff_px,
+            edge_min_dist_px=edge_min_dist_px,
+            plot_atoms=False,
+        )
+        measure_kwargs = dict(
+            num_b_per_uc=num_b_per_uc,
+            order=order,
+            interpolate_intensity=interpolate_intensity,
+            avg_inside_radius=avg_inside_radius,
+            max_inside_radius=max_inside_radius,
+            fit_guassian=fit_guassian,
+            radius=radius,
+            max_shift_gauss=max_shift_gauss,
+            dedup_cutoff_px=dedup_cutoff_px,
+            edge_min_dist_px=edge_min_dist_px,
+            plot_atoms=plot_atoms,
+            a_marker_size=a_marker_size,
+            b_marker_size=b_marker_size,
+            marker_size_frac=marker_size_frac,
+        )
 
-            intensities[frac_ind] = np.sum(self.bsites_assume[:, 0])
-            frac_ind += 1
+        # Raw summed/mean intensity (the previous scoring metric) has a real failure mode:
+        # a candidate offset that happens to sit CLOSER to the much brighter A sublattice
+        # can win purely by picking up A's own Gaussian PSF tail, even when it lands on zero
+        # real atoms -- raw intensity can't distinguish "near something bright" from "is
+        # itself a real atomic peak". Confirmed concretely on a synthetic WSe2 A/B test: the
+        # true B-site candidate (95% of points within 3px of ground truth) scored LOWER raw
+        # intensity than a candidate 1/3 as far from A (0.1% within 3px of ground truth),
+        # because the latter's fixed point sample still sits inside A's tail.
+        #
+        # Fix: score by intensity minus a LOCAL background estimate (a Gaussian-blurred copy
+        # of the image, sampled at the same points) instead of raw intensity. A's tail is
+        # part of that local background at every candidate's sample points, so subtracting
+        # it removes the "closer to A scores higher" bias; a genuine atomic peak still
+        # stands out above its own (much dimmer) local surroundings after subtraction, while
+        # a point merely riding A's tail does not. background_sigma_px must stay comparable
+        # to the atomic PSF width, not the lattice spacing -- tested across 12 random
+        # seeds/geometries, subtracting a background blurred at a scale near one *lattice
+        # spacing* left the background essentially flat within a unit cell (identical
+        # failure mode to no correction at all), whereas a blur scale tied to `radius` (the
+        # existing local-measurement window, which the caller already sizes to their PSF)
+        # correctly separated true from false candidates on every seed tested. Defaults to
+        # half of `radius` when not given explicitly.
+        from scipy.ndimage import gaussian_filter, map_coordinates
+
+        if background_sigma_px is None:
+            background_sigma_px = 0.5 * radius
+        background_image = gaussian_filter(self.image.array, sigma=background_sigma_px)
+
+        intensities = np.zeros([candidates.shape[0]])
+        for frac_ind, frac in enumerate(candidates):
+            self._positions_frac[1] = frac
+            self.measure_b_intensity_near_a(**search_kwargs)
+            b_int = self.bsites_assume[:, 0]
+            b_x = self.bsites_assume[:, 1]
+            b_y = self.bsites_assume[:, 2]
+            local_background = map_coordinates(
+                background_image, [b_x, b_y], order=1, mode="nearest"
+            )
+            intensities[frac_ind] = np.mean(b_int - local_background)
 
         best_index = np.argmax(intensities)
 
@@ -2483,6 +2912,9 @@ class Lattice(AutoSerialize):
                 "Found orientation of b site. Setting position fraction to", candidates[best_index]
             )
         self._positions_frac[1] = candidates[best_index]
+        # recompute bsites_assume for the WINNING candidate -- it was last overwritten by
+        # whichever candidate happened to be tried last in the loop above, not the winner
+        self.measure_b_intensity_near_a(**measure_kwargs)
 
         return self
 
@@ -2497,8 +2929,12 @@ class Lattice(AutoSerialize):
         radius=4,
         max_shift_gauss=3,
         dedup_cutoff_px=5,
+        edge_min_dist_px=None,
         plot_atoms=True,
         title="",
+        a_marker_size=None,
+        b_marker_size=None,
+        marker_size_frac=0.25,
         **kwargs,
     ):
         # going to assume that there is a b site near the a sites.
@@ -2577,13 +3013,24 @@ class Lattice(AutoSerialize):
 
         bsite_data = np.full((n_B, n_A, 3), np.nan, dtype=float)
         H, W = self._image.shape  # x=rows, y=cols
+        # default to whatever edge exclusion atoms_first_uvw applied to A-sites, so B-site
+        # candidates get the same treatment unless a different value is explicitly given here
+        edge_thresh = (
+            float(edge_min_dist_px)
+            if edge_min_dist_px is not None
+            else float(getattr(self, "edge_min_dist_px", 0.0))
+        )
 
         for atom_index in range(a_x.shape[0]):
             for pos_index, pos_vec in enumerate(positions_per_uc):
                 position_x = pos_vec[0] + a_x[atom_index]
                 position_y = pos_vec[1] + a_y[atom_index]
 
-                if not (0 <= np.round(position_x) < H and 0 <= np.round(position_y) < W):
+                rx, ry = np.round(position_x), np.round(position_y)
+                if not (
+                    edge_thresh <= rx <= H - 1 - edge_thresh
+                    and edge_thresh <= ry <= W - 1 - edge_thresh
+                ):
                     continue
                 if interpolate_intensity:
                     intensity = map_coordinates(
@@ -2678,6 +3125,17 @@ class Lattice(AutoSerialize):
             if ax.images:
                 ax.images[-1].set_zorder(0)
 
+            a_s = (
+                a_marker_size
+                if a_marker_size is not None
+                else self._spacing_marker_size(fig, ax, W, frac=marker_size_frac, fallback=200.0)
+            )
+            b_s = (
+                b_marker_size
+                if b_marker_size is not None
+                else self._spacing_marker_size(fig, ax, W, frac=marker_size_frac, fallback=200.0)
+            )
+
             atoms_arr = self.atoms.get_data(0)
             xs = atoms_arr[:, 0]
             ys = atoms_arr[:, 1]
@@ -2685,10 +3143,10 @@ class Lattice(AutoSerialize):
             ax.scatter(
                 ys,
                 xs,
-                s=200,
-                facecolor=(rgb[0], rgb[1], rgb[2], 0.85),
+                s=a_s,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.1),
                 edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
-                linewidths=0.75,
+                linewidths=1.5,
                 marker="o",
                 zorder=25,
             )
@@ -2697,13 +3155,18 @@ class Lattice(AutoSerialize):
             ax.scatter(
                 unique_data[:, 2],
                 unique_data[:, 1],
-                s=200,
-                facecolor=(rgb[0], rgb[1], rgb[2], 0.05),
+                s=b_s,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.1),
                 edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
-                linewidths=0.75,
+                linewidths=1.5,
                 marker="o",
                 zorder=25,
             )
+
+            origin = getattr(self, "origin", None)
+            if origin is not None:
+                ax.scatter(origin[1], origin[0], c="red", marker="x", s=80, zorder=30)
+
             ax.set_title(title)
             ax.set_xlim(0, W)
             ax.set_ylim(H, 0)
@@ -2722,6 +3185,9 @@ class Lattice(AutoSerialize):
         max_shift_gauss=2,
         plot_atoms=True,
         title="",
+        a_marker_size=None,
+        b_marker_size=None,
+        marker_size_frac=0.25,
         **kwargs,
     ):
         from scipy.ndimage import map_coordinates
@@ -2875,14 +3341,25 @@ class Lattice(AutoSerialize):
             if ax.images:
                 ax.images[-1].set_zorder(0)
 
+            a_s = (
+                a_marker_size
+                if a_marker_size is not None
+                else self._spacing_marker_size(fig, ax, W, frac=marker_size_frac, fallback=200.0)
+            )
+            b_s = (
+                b_marker_size
+                if b_marker_size is not None
+                else self._spacing_marker_size(fig, ax, W, frac=marker_size_frac, fallback=300.0)
+            )
+
             rgb = site_colors(int(self._numbers[0]))
             ax.scatter(
                 a_y,
                 a_x,
-                s=200,
-                facecolor=(rgb[0], rgb[1], rgb[2], 0.85),
+                s=a_s,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.1),
                 edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
-                linewidths=0.75,
+                linewidths=1.5,
                 marker="o",
                 zorder=25,
             )
@@ -2891,10 +3368,10 @@ class Lattice(AutoSerialize):
             ax.scatter(
                 b_y,
                 b_x,
-                s=300,
-                facecolor=(rgb[0], rgb[1], rgb[2], 0.01),
+                s=b_s,
+                facecolor=(rgb[0], rgb[1], rgb[2], 0.1),
                 edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
-                linewidths=0.75,
+                linewidths=1.5,
                 marker="o",
                 zorder=25,
             )
@@ -3038,7 +3515,11 @@ class Lattice(AutoSerialize):
         plt.ylabel("Number of neighbors in px range " + str(np.round(neighbor_cutoff_pix)))
 
         num_bins = 100
-        range_bins = [-0.12, 0.1]
+        data_min, data_max = self.delta_assume[:, 0].min(), self.delta_assume[:, 0].max()
+
+        pad = 0.05 * (data_max - data_min)
+        range_bins = [data_min - pad, data_max + pad]
+
         hist_bins = np.linspace(range_bins[0], range_bins[1], num_bins)
         plt.subplot(142)
         plt.hist(self.delta_assume[:, 0], bins=hist_bins)
@@ -3054,7 +3535,31 @@ class Lattice(AutoSerialize):
                 -((x - mean2) ** 2) / (2 * sigma2**2)
             )
 
-        p0 = [100, -0.025, 0.01, 10, -0.07, 0.01]
+        x = np.linspace(range_bins[0], range_bins[1], num_bins)
+        y = delta_histogram
+
+        mode_idx = np.argmax(y)
+        mean1_guess = x[mode_idx]
+        amp1_guess = max(y[mode_idx], 1.0)
+        tail_width = data_max - data_min
+
+        raw_vals = self.delta_assume[:, 0]
+        main_mad = np.median(np.abs(raw_vals - mean1_guess)) * 1.4826
+        main_mad = max(main_mad, 1e-4)
+        tail_vals = raw_vals[raw_vals < mean1_guess - 3 * main_mad]
+
+        if len(tail_vals) >= 3:
+            mean2_guess = np.median(tail_vals)
+            sigma2_guess = max(np.std(tail_vals), tail_width / 40)
+            amp2_guess = max(len(tail_vals) / num_bins * (range_bins[1] - range_bins[0]), 1.0)
+        else:
+            mean2_guess = mean1_guess - 0.3 * tail_width
+            sigma2_guess = tail_width / 20
+            amp2_guess = 1.0
+
+        sigma_guess = max(tail_width / 20, 1e-4)
+
+        p0 = [amp1_guess, mean1_guess, sigma_guess, amp2_guess, mean2_guess, sigma2_guess]
         p0 = np.array(p0)
 
         def double_gaussian_penalized(x, amp1, mean1, sigma1, amp2, mean2, sigma2):
@@ -3069,8 +3574,6 @@ class Lattice(AutoSerialize):
 
             return model + penalty / len(x)
 
-        x = np.linspace(range_bins[0], range_bins[1], num_bins)
-        y = delta_histogram
         from scipy.optimize import curve_fit
 
         try:
@@ -3080,14 +3583,68 @@ class Lattice(AutoSerialize):
 
         amp1, mean1, sigma1, amp2, mean2, sigma2 = popt
 
+        y_max = max(y.max(), double_gaussian(x, *popt).max()) * 1.1
+
+        self.delta_double_gaussian_popt = popt
+
+        def gaussian_intersections(amp1, mean1, sigma1, amp2, mean2, sigma2):
+            """Real x-solutions where the two Gaussian curves have equal height."""
+            s1sq, s2sq = sigma1**2, sigma2**2
+            if np.isclose(s1sq, s2sq):
+                if np.isclose(mean1, mean2):
+                    return np.array([])
+                x = (s1sq * np.log(amp1 / amp2) / (mean1 - mean2) + (mean1 + mean2)) / 2
+                return np.array([x])
+            A = 1 / s2sq - 1 / s1sq
+            B = -2 * (mean2 / s2sq - mean1 / s1sq)
+            C = (mean2**2 / s2sq - mean1**2 / s1sq) - 2 * np.log(amp2 / amp1)
+            disc = B**2 - 4 * A * C
+            if disc < 0:
+                return np.array([])
+            sqrt_disc = np.sqrt(disc)
+            return np.array([(-B + sqrt_disc) / (2 * A), (-B - sqrt_disc) / (2 * A)])
+
+        roots = gaussian_intersections(amp1, mean1, sigma1, amp2, mean2, sigma2)
+        valid_roots = [
+            r
+            for r in roots
+            if mean2 <= r <= mean1 and amp1 * np.exp(-((r - mean1) ** 2) / (2 * sigma1**2)) >= 1.0
+        ]
+
+        if valid_roots:
+            self.delta_gap_threshold = min(valid_roots, key=lambda r: abs(r - (mean1 + mean2) / 2))
+        else:
+            edge1 = mean1 - abs(sigma1) * np.sqrt(2 * np.log(amp1)) if amp1 >= 1.0 else mean1
+            edge2 = mean2 + abs(sigma2) * np.sqrt(2 * np.log(amp2)) if amp2 >= 1.0 else mean2
+            self.delta_gap_threshold = (edge1 + edge2) / 2
+
+        self.delta_defect_peak_threshold = mean2 + 1.2 * abs(sigma2)
+
         plt.subplot(143)
         plt.plot(x, y, "k.", label="Data")
         plt.plot(x, double_gaussian(x, *popt), "r-", label="Total fit")
         plt.plot(x, amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)), "b--")
         plt.plot(x, amp2 * np.exp(-((x - mean2) ** 2) / (2 * sigma2**2)), "g--")
-        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label="Gaussian Means")
+        plt.vlines(np.array([mean1, mean2]), 0.8, y_max, label="Gaussian Means")
+        plt.vlines(
+            self.delta_gap_threshold,
+            0.8,
+            y_max,
+            colors="purple",
+            linestyles="dashed",
+            label="Gap threshold",
+        )
+        plt.vlines(
+            self.delta_defect_peak_threshold,
+            0.8,
+            y_max,
+            colors="orange",
+            linestyles="dashed",
+            label="Defect-peak threshold",
+        )
+
         plt.legend()
-        plt.ylim([0.8, 250])
+        plt.ylim([0.8, y_max])
         plt.xlabel('$I_{site}-median(I_{neighbors})$ "(∆I)"')
         plt.ylabel("Atomic site count")
         plt.title("Gaussian fit of ∆Intensity")
@@ -3097,10 +3654,26 @@ class Lattice(AutoSerialize):
         plt.plot(x, double_gaussian(x, *popt), "r-", label="Total fit")
         plt.plot(x, amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)), "b--")
         plt.plot(x, amp2 * np.exp(-((x - mean2) ** 2) / (2 * sigma2**2)), "g--")
-        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label="Gaussian Means")
+        plt.vlines(np.array([mean1, mean2]), 0.8, y_max, label="Gaussian Means")
+        plt.vlines(
+            self.delta_gap_threshold,
+            0.8,
+            y_max,
+            colors="purple",
+            linestyles="dashed",
+            label="Gap threshold",
+        )
+        plt.vlines(
+            self.delta_defect_peak_threshold,
+            0.8,
+            y_max,
+            colors="orange",
+            linestyles="dashed",
+            label="Defect-peak threshold",
+        )
         plt.legend()
         plt.yscale("log")
-        plt.ylim([0.8, 250])
+        plt.ylim([0.8, y_max])
         plt.xlabel('$I_{site}-median(I_{neighbors})$ "(∆I)"')
         plt.ylabel("Atomic site count [log scale]")
         plt.title("Gaussian fit of ∆Intensity")
@@ -3147,7 +3720,7 @@ class Lattice(AutoSerialize):
             for i in range(positions_b_defect.shape[0]):
                 circle = patches.Circle(
                     (positions_b_defect[i, 1], positions_b_defect[i, 0]),
-                    10,
+                    0.2 * self.uv_norm,
                     fill=False,
                     edgecolor="red",
                     linewidth=2,
@@ -3192,7 +3765,7 @@ class Lattice(AutoSerialize):
             for i in range(positions_b_defect.shape[0]):
                 circle = patches.Circle(
                     (positions_b_defect[i, 1], positions_b_defect[i, 0]),
-                    10,
+                    0.2 * self.uv_norm,
                     fill=False,
                     edgecolor="red",
                     linewidth=2,
@@ -3263,7 +3836,7 @@ class Lattice(AutoSerialize):
     ):
         import ipywidgets as widgets
         import matplotlib.patches as patches
-        from ipywidgets import interactive_output
+        from ipywidgets import HBox, VBox, interactive_output
 
         if init_threshold_low is None:
             init_threshold_low = np.min(self.delta_assume[:, 0]) + 0.01
@@ -3409,11 +3982,14 @@ class Lattice(AutoSerialize):
                     plt.title("Histogram of ∆Intensity")
                     plt.grid("on")
 
-        interactive_output(
+        ui = VBox([HBox([thresh_slider_l, thresh_slider_h])])
+        out_plot = interactive_output(
             circle_defects, {"delta_low": thresh_slider_l, "delta_high": thresh_slider_h}
         )
+        from IPython.display import display
 
-        # display(ui, out_plot)
+        display(ui, out_plot)
+
         return self
 
     def delta_intensities_input(
@@ -3477,8 +4053,12 @@ class Lattice(AutoSerialize):
         plt.xlabel('$I_{site}-median(I_{A neighbors})$ "(∆I)"')
         plt.ylabel("Number of neighbors in px range " + str(np.round(neighbor_cutoff_pix)))
 
+        data_min, data_max = self.delta_assume[:, 0].min(), self.delta_assume[:, 0].max()
+
         num_bins = 100
-        range_bins = [-0.6, 0.1]
+        pad = 0.05 * (data_max - data_min)
+        range_bins = [data_min - pad, data_max + pad]
+
         hist_bins = np.linspace(range_bins[0], range_bins[1], num_bins)
         plt.subplot(142)
         plt.hist(self.delta_input[:, 0], bins=hist_bins)
@@ -3494,7 +4074,7 @@ class Lattice(AutoSerialize):
                 -((x - mean2) ** 2) / (2 * sigma2**2)
             )
 
-        p0 = [30, -0.2, 0.15, 5, -0.5, 0.1]
+        p0 = [100, -0.025, 0.01, 10, -0.07, 0.01]
         p0 = np.array(p0)
 
         def double_gaussian_penalized(x, amp1, mean1, sigma1, amp2, mean2, sigma2):
@@ -3520,14 +4100,16 @@ class Lattice(AutoSerialize):
 
         amp1, mean1, sigma1, amp2, mean2, sigma2 = popt
 
+        y_max = max(y.max(), double_gaussian(x, *popt).max()) * 1.1
+
         plt.subplot(143)
         plt.plot(x, y, "k.", label="Data")
         plt.plot(x, double_gaussian(x, *popt), "r-", label="Total fit")
         plt.plot(x, amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)), "b--")
         plt.plot(x, amp2 * np.exp(-((x - mean2) ** 2) / (2 * sigma2**2)), "g--")
-        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label="Gaussian Means")
+        plt.vlines(np.array([mean1, mean2]), 0.8, y_max, label="Gaussian Means")
         plt.legend()
-        plt.ylim([0.8, 250])
+        plt.ylim([0.8, y_max])
         plt.xlabel('$I_{site}-median(I_{neighbors})$ "(∆I)"')
         plt.ylabel("Atomic site count")
         plt.title("Gaussian fit of ∆Intensity")
@@ -3537,10 +4119,10 @@ class Lattice(AutoSerialize):
         plt.plot(x, double_gaussian(x, *popt), "r-", label="Total fit")
         plt.plot(x, amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)), "b--")
         plt.plot(x, amp2 * np.exp(-((x - mean2) ** 2) / (2 * sigma2**2)), "g--")
-        plt.vlines(np.array([mean1, mean2]), 0.8, 250, label="Gaussian Means")
+        plt.vlines(np.array([mean1, mean2]), 0.8, y_max, label="Gaussian Means")
         plt.legend()
         plt.yscale("log")
-        plt.ylim([0.8, 250])
+        plt.ylim([0.8, y_max])
         plt.xlabel('$I_{site}-median(I_{neighbors})$ "(∆I)"')
         plt.ylabel("Atomic site count [log scale]")
         plt.title("Gaussian fit of ∆Intensity")
@@ -3576,6 +4158,1054 @@ class Lattice(AutoSerialize):
                 linewidth=2,
             )
             ax.add_patch(circle)
+
+        return self
+
+    def _detect_gaussian_modes(
+        self,
+        raw_values,
+        num_bins: int = 100,
+        range_bins=None,
+        max_modes: int = 4,
+        mad_k: float = 3.0,
+        peak_smooth_sigma: float = 1.5,
+        peak_prominence_frac: float = 0.05,
+        agreement_tol_frac: float = 0.15,
+        min_amp_frac: float = 0.02,
+        use_em: bool = True,
+        em_sig_ratio_bounds: tuple = (0.5, 1.3),
+        em_n_grid: int = 9,
+        em_lr_alpha: float = 0.05,
+        plot: bool = False,
+        title: str = "",
+    ):
+        """
+        Detect candidate Gaussian sub-populations in a 1D array of per-site values (e.g.
+        raw intensities or delta-intensities), using up to three independent methods that
+        cross-validate each other, rather than assuming a fixed number of populations
+        (e.g. always exactly "W" and "V"):
+
+        1. "peak" method: histogram the data, smooth it, and find local maxima via
+           scipy.signal.find_peaks (by prominence). Reads modes directly off the shape of
+           the data -- fails if two populations don't produce a visible dip between them.
+        2. "tail/MAD" method: iteratively peel off outlier tails. Starting from all the
+           data, compute its median and a robust sigma (MAD * 1.4826), then treat points
+           beyond mad_k * MAD from the median as a separate population; repeat on the
+           remaining tail up to max_modes times. (Generalizes the single-tail method
+           already used in delta_intensities_assume to more than one tail.) Fails if a
+           population isn't cleanly separated in scale from the rest, even if it has a
+           visibly distinct mean.
+        3. "em" method (use_em=True, the default): a constrained 2-component Gaussian EM
+           fit directly on raw_values (not the histogram). This exists specifically for
+           populations that show up as a SHOULDER on the main distribution rather than a
+           distinct bump -- there is no local maximum for method 1 to find in that case
+           (verified: on real data, the raw histogram counts rose monotonically straight
+           through a real, confirmed-by-EM secondary population -- no dip, no peak), and
+           the population can sit close enough to the core (within a few MAD) that method
+           2 doesn't treat it as an outlier tail either. EM fits by maximum likelihood
+           over ALL the data, so it doesn't need a visible gap.
+
+           Sigma is constrained to within em_sig_ratio_bounds of the majority component's
+           sigma -- this is essential, not optional: UNCONSTRAINED 2-component EM on real
+           data reliably converges instead to a degenerate solution where the second
+           component is much WIDER than the first and nearly co-located with it, simply
+           absorbing a slice of the main population's own tail (higher raw likelihood than
+           the physically real answer, but not a real population -- verified empirically).
+           Constraining sigma2 to a comparable width to sigma1 -- what an actual second
+           physical population should look like -- eliminates that degenerate solution and
+           was verified to converge to the same stable answer regardless of initial guess
+           (across a grid of em_n_grid starting means), whereas the unconstrained version
+           was sensitive to initialization. The result is only added as a candidate if a
+           likelihood-ratio test against a 1-component fit clears em_lr_alpha -- verified
+           on clean single-population synthetic data (6 seeds) to stay far below that
+           threshold (LR stat 0-3.5 vs a chi2(3) critical value of ~16.3), i.e. it does not
+           manufacture false positives on genuinely unimodal data.
+
+        A candidate found by multiple methods (within agreement_tol_frac of the data
+        range) is much more trustworthy than one found by only one -- that agreement is
+        the point of running more than one method, not a formality. Modes found by only
+        one method are still returned, just flagged accordingly.
+
+        Parameters
+        ----------
+        raw_values : array-like
+            The per-site values to analyze (e.g. self.atoms[0]["int_peak"] or a
+            delta-intensity array). NOT a pre-built histogram.
+        num_bins, range_bins : histogram binning (range_bins=None auto-computes from
+            data min/max with 5% padding).
+        max_modes : int, default 4
+            Upper limit on how many populations the peak/MAD methods will report.
+        mad_k : float, default 3.0
+            Tail threshold for the MAD method, in robust-sigma units.
+        peak_smooth_sigma : float, default 1.5
+            Gaussian smoothing (in bins) applied before peak-finding.
+        peak_prominence_frac : float, default 0.05
+            Minimum peak prominence, as a fraction of the smoothed histogram's max, for
+            the peak method to accept a candidate.
+        agreement_tol_frac : float, default 0.15
+            How close two candidates' means must be (as a fraction of the full data
+            range) to be considered the same population by multiple methods.
+        min_amp_frac : float, default 0.02
+            Candidates whose amplitude is below this fraction of the largest candidate's
+            amplitude are dropped before returning -- both methods, especially the
+            iterative MAD-peeling one, can propose a negligible-amplitude leftover-noise
+            "population" that isn't worth ever fitting a component to. This is a basic
+            hygiene filter, not the model-selection judgment of whether a small-but-real
+            population is statistically justified (that happens downstream).
+        use_em : bool, default True
+            Whether to run the constrained-EM method described above.
+        em_sig_ratio_bounds : (float, float), default (0.5, 1.3)
+            The minority component's sigma is clipped to [sig1*lo, sig1*hi] every EM
+            iteration.
+        em_n_grid : int, default 9
+            Number of initial minority-mean guesses tried (spread across the lower half
+            of the data range), keeping whichever converges to the highest likelihood.
+        em_lr_alpha : float, default 0.05
+            Significance threshold for the EM candidate's likelihood-ratio test against a
+            1-component fit; only candidates clearing this are added.
+        plot : bool, default False
+            If True, shows the raw histogram plus every candidate from each method
+            (before matching) and the final matched/pruned modes actually returned, so
+            you can see where methods agreed, disagreed, or where a candidate got pruned.
+        title : str, default ""
+            Plot title, useful when calling this multiple times (e.g. once for direct
+            intensity, once for delta intensity) to tell the figures apart.
+
+        Returns
+        -------
+        list of dict, sorted by mean descending (highest-intensity / least-defective
+        population first): {"mean", "sigma", "amp", "confidence"}, where confidence is
+        "confirmed" (multiple methods agree), "peak_only", "mad_only", or "em_only". amp
+        is in histogram count units (matching np.histogram(raw_values, num_bins,
+        range_bins)), so these are directly usable as curve_fit seeds against that same
+        histogram.
+        """
+        from scipy.ndimage import gaussian_filter1d
+        from scipy.signal import find_peaks
+
+        raw_values = np.asarray(raw_values, dtype=float)
+        if range_bins is None:
+            data_min, data_max = float(raw_values.min()), float(raw_values.max())
+            pad = 0.05 * (data_max - data_min)
+            range_bins = [data_min - pad, data_max + pad]
+        else:
+            range_bins = list(range_bins)
+
+        hist, edges = np.histogram(raw_values, num_bins, range_bins)
+        bin_centers = 0.5 * (edges[:-1] + edges[1:])
+        bin_width = bin_centers[1] - bin_centers[0]
+        data_range = range_bins[1] - range_bins[0]
+        tol = agreement_tol_frac * data_range
+
+        # --- method 1: peak detection on smoothed histogram ---
+        hist_smooth = gaussian_filter1d(hist.astype(float), peak_smooth_sigma)
+        min_prom = max(peak_prominence_frac * hist_smooth.max(), 1e-9)
+        peak_idxs, props = find_peaks(hist_smooth, prominence=min_prom)
+
+        peak_candidates = []
+        for idx in peak_idxs:
+            mean_g = float(bin_centers[idx])
+            amp_g = float(hist[idx])
+            half = amp_g / 2.0
+            lo = idx
+            while lo > 0 and hist[lo] > half:
+                lo -= 1
+            hi = idx
+            while hi < len(hist) - 1 and hist[hi] > half:
+                hi += 1
+            hwhm = max((bin_centers[hi] - bin_centers[lo]) / 2.0, bin_width)
+            sigma_g = hwhm / 1.1774
+            peak_candidates.append({"mean": mean_g, "sigma": float(sigma_g), "amp": amp_g})
+        peak_candidates.sort(key=lambda c: c["amp"], reverse=True)
+        peak_candidates = peak_candidates[:max_modes]
+
+        # --- method 2: iterative tail/MAD peeling ---
+        mad_candidates = []
+        remaining = raw_values.copy()
+        bin_scale = data_range / num_bins
+        for _ in range(max_modes):
+            if len(remaining) < 3:
+                break
+            center = float(np.median(remaining))
+            mad = float(np.median(np.abs(remaining - center))) * 1.4826
+            mad = max(mad, 1e-9)
+            is_tail = np.abs(remaining - center) > mad_k * mad
+            core = remaining[~is_tail]
+            core_amp = len(core) * bin_scale / max(mad * np.sqrt(2 * np.pi), 1e-9)
+            mad_candidates.append({"mean": center, "sigma": mad, "amp": float(core_amp)})
+            if not np.any(is_tail):
+                break
+            tail = remaining[is_tail]
+            if len(tail) < 3:
+                break
+            remaining = tail
+        mad_candidates.sort(key=lambda c: c["amp"], reverse=True)
+        mad_candidates = mad_candidates[:max_modes]
+
+        # --- method 3: constrained 2-component EM directly on raw_values ---
+        em_candidate = None
+        if use_em and len(raw_values) >= 10:
+            from scipy.stats import chi2 as _chi2
+
+            lo_q, hi_q = np.quantile(raw_values, [0.05, 0.5])
+            init_range = np.linspace(lo_q, hi_q, max(em_n_grid, 1))
+            best_em = None
+            for mu2_init in init_range:
+                mu1 = float(np.median(raw_values))
+                mu2 = float(mu2_init)
+                sig1 = float(np.std(raw_values)) * 0.6 + 1e-9
+                sig2 = sig1
+                w1, w2 = 0.97, 0.03
+                prev_ll = -np.inf
+                for _ in range(300):
+                    p1 = (
+                        w1
+                        * np.exp(-0.5 * ((raw_values - mu1) / sig1) ** 2)
+                        / (sig1 * np.sqrt(2 * np.pi))
+                    )
+                    p2 = (
+                        w2
+                        * np.exp(-0.5 * ((raw_values - mu2) / sig2) ** 2)
+                        / (sig2 * np.sqrt(2 * np.pi))
+                    )
+                    total = p1 + p2 + 1e-300
+                    r2 = p2 / total
+                    r1 = 1 - r2
+                    w1, w2 = float(r1.mean()), float(r2.mean())
+                    mu1 = float(np.sum(r1 * raw_values) / np.sum(r1))
+                    mu2 = float(np.sum(r2 * raw_values) / np.sum(r2))
+                    sig1 = float(np.sqrt(np.sum(r1 * (raw_values - mu1) ** 2) / np.sum(r1))) + 1e-9
+                    sig2 = float(np.sqrt(np.sum(r2 * (raw_values - mu2) ** 2) / np.sum(r2))) + 1e-9
+                    lo_r, hi_r = em_sig_ratio_bounds
+                    sig2 = float(np.clip(sig2, sig1 * lo_r, sig1 * hi_r))
+                    ll = float(np.sum(np.log(total)))
+                    if abs(ll - prev_ll) < 1e-9:
+                        break
+                    prev_ll = ll
+                if best_em is None or ll > best_em["loglik"]:
+                    best_em = dict(mu1=mu1, mu2=mu2, sig1=sig1, sig2=sig2, w2=w2, loglik=ll)
+
+            mu0 = float(np.mean(raw_values))
+            sig0 = float(np.std(raw_values)) + 1e-9
+            ll0 = float(
+                np.sum(-0.5 * ((raw_values - mu0) / sig0) ** 2 - np.log(sig0 * np.sqrt(2 * np.pi)))
+            )
+            lr_stat = max(2.0 * (best_em["loglik"] - ll0), 0.0)
+            if _chi2.sf(lr_stat, df=3) < em_lr_alpha:
+                em_amp = (
+                    best_em["w2"]
+                    * len(raw_values)
+                    * bin_width
+                    / max(best_em["sig2"] * np.sqrt(2 * np.pi), 1e-12)
+                )
+                em_candidate = {
+                    "mean": best_em["mu2"],
+                    "sigma": best_em["sig2"],
+                    "amp": float(em_amp),
+                }
+
+        # --- cross-validate: match candidates from all methods by proximity in mean ---
+        # min_amp_frac is a raw-amplitude hygiene filter meant for the MAD method's
+        # occasional negligible-amplitude leftover-noise artifacts, which have no
+        # statistical backing at all -- computed here (from peak/MAD candidates only,
+        # before any matching) so it can also gate whether a low-amplitude MAD candidate
+        # is allowed to "claim" (and thereby suppress) an em_candidate at the same mean.
+        # Without that guard, a real population found robustly by EM could be silently
+        # lost entirely: a MAD candidate too faint to survive pruning on its own would
+        # still match the em_candidate by proximity, marking it "already covered", and
+        # then the MAD candidate itself gets pruned -- verified this happened on real
+        # data (MAD found the same real, ~0.45%-of-sites population as EM, but at an
+        # amplitude below the prune threshold, silently deleting both the "mad_only" AND
+        # the "em_only" entries that would otherwise have each separately survived).
+        pre_amp_candidates = peak_candidates + mad_candidates
+        max_amp_pre = max((c["amp"] for c in pre_amp_candidates), default=0.0)
+        amp_floor = min_amp_frac * max_amp_pre
+
+        matched = []
+        used_mad = set()
+        used_em = False
+        for pc in peak_candidates:
+            best_j, best_d = None, None
+            for j, mc in enumerate(mad_candidates):
+                if j in used_mad:
+                    continue
+                d = abs(pc["mean"] - mc["mean"])
+                if d <= tol and (best_d is None or d < best_d):
+                    best_j, best_d = j, d
+            if best_j is not None:
+                mc = mad_candidates[best_j]
+                used_mad.add(best_j)
+                matched.append(
+                    {
+                        "mean": 0.5 * (pc["mean"] + mc["mean"]),
+                        "sigma": 0.5 * (pc["sigma"] + mc["sigma"]),
+                        # max, not average: a near-zero-amplitude MAD artifact landing near
+                        # an otherwise-solid peak candidate would otherwise dilute the
+                        # merged amp below amp_floor, silently deleting a real,
+                        # independently-valid population just for having been "confirmed"
+                        # by a second method -- the opposite of what agreement should do.
+                        "amp": max(pc["amp"], mc["amp"]),
+                        "confidence": "confirmed",
+                    }
+                )
+            else:
+                matched.append({**pc, "confidence": "peak_only"})
+            if (
+                em_candidate is not None
+                and matched[-1]["amp"] >= amp_floor
+                and abs(em_candidate["mean"] - matched[-1]["mean"]) <= tol
+            ):
+                used_em = True
+        for j, mc in enumerate(mad_candidates):
+            if (
+                j not in used_mad
+                and em_candidate is not None
+                and mc["amp"] >= amp_floor
+                and abs(em_candidate["mean"] - mc["mean"]) <= tol
+            ):
+                used_em = True
+        if em_candidate is not None and not used_em:
+            matched.append({**em_candidate, "confidence": "em_only"})
+        for j, mc in enumerate(mad_candidates):
+            if j not in used_mad:
+                matched.append({**mc, "confidence": "mad_only"})
+
+        # Now apply the amplitude floor to everything except em_only candidates: a real,
+        # small population (e.g. <1% of sites) can have a legitimately tiny histogram
+        # amplitude while still being statistically overwhelming (the EM channel already
+        # required its own likelihood-ratio significance test to pass, a stricter and
+        # more appropriate bar than a relative-amplitude cutoff).
+        matched = [c for c in matched if c["confidence"] == "em_only" or c["amp"] >= amp_floor]
+
+        matched.sort(key=lambda c: c["mean"], reverse=True)
+
+        if plot:
+            fig, ax = plt.subplots(figsize=(8, 5), dpi=120)
+            ax.bar(bin_centers, hist, width=bin_width, color="0.8", edgecolor="0.6", label="data")
+
+            for pc in peak_candidates:
+                ax.axvline(pc["mean"], color="tab:blue", linestyle=":", alpha=0.6)
+            for mc in mad_candidates:
+                ax.axvline(mc["mean"], color="tab:orange", linestyle=":", alpha=0.6)
+            ax.plot([], [], color="tab:blue", linestyle=":", label="peak-method candidate")
+            ax.plot([], [], color="tab:orange", linestyle=":", label="MAD-method candidate")
+
+            x_dense = np.linspace(range_bins[0], range_bins[1], 400)
+            conf_colors = {
+                "confirmed": "tab:green",
+                "peak_only": "tab:blue",
+                "mad_only": "tab:orange",
+            }
+            for m in matched:
+                curve = m["amp"] * np.exp(-((x_dense - m["mean"]) ** 2) / (2 * m["sigma"] ** 2))
+                ax.plot(
+                    x_dense,
+                    curve,
+                    color=conf_colors.get(m["confidence"], "k"),
+                    linewidth=2,
+                    label=f"{m['confidence']}: mean={m['mean']:.3g}",
+                )
+
+            ax.set_xlabel("value")
+            ax.set_ylabel("count")
+            ax.set_title(title or "Gaussian mode detection (peak vs. MAD cross-validation)")
+            ax.legend(fontsize=8)
+            plt.show()
+
+        return matched
+
+    def _fit_gaussian_mixture(
+        self,
+        raw_values,
+        seeds,
+        num_bins: int = 100,
+        range_bins=None,
+        mean_bound_sigmas: float = 3.0,
+        sigma_bound_factor: float = 3.0,
+        amp_bound_factor: float = 4.0,
+        degenerate_tol: float = 1e-3,
+        plot: bool = False,
+        title: str = "",
+    ):
+        """
+        Fit a K-component Gaussian mixture (K = len(seeds)) to a histogram of raw_values,
+        Poisson-weighted (curve_fit with sigma=sqrt(y+1)) since histogram bin counts are
+        Poisson, not homoscedastic-Gaussian -- this also makes the returned log-likelihood
+        meaningful for BIC/likelihood-ratio comparisons in _select_gaussian_mixture_model.
+
+        Unlike the original ported scheme (classify_intensity_direct/delta's fixed bounds
+        relative to the tallest histogram bin), every component's bounds are derived from
+        ITS OWN seed (typically from _detect_gaussian_modes): mean is boxed to within
+        mean_bound_sigmas of the seed sigma, sigma is boxed to a factor of the seed sigma,
+        amp is boxed to a factor of the seed amp. This replaces upper_bound_manual_mult's
+        role of hand-nudging one global assumption with per-component, data-derived boxes.
+
+        Parameters
+        ----------
+        raw_values : array-like
+            The per-site values (not a pre-built histogram).
+        seeds : list of dict
+            Each {"mean", "sigma", "amp", ...} -- e.g. a slice of _detect_gaussian_modes's
+            output. Order is preserved in the returned components/popt.
+        num_bins, range_bins : histogram binning (range_bins=None auto-computes).
+        mean_bound_sigmas : float, default 3.0
+            Half-width of each component's mean bound, in units of its own seed sigma.
+        sigma_bound_factor, amp_bound_factor : float, default 3.0 / 4.0
+            Each component's sigma/amp bound is [seed / factor, seed * factor].
+        degenerate_tol : float, default 1e-3
+            Relative tolerance (fraction of that parameter's bound width) for flagging a
+            fitted parameter as "pinned at its bound" -- see Side Effects.
+        plot, title : as in _detect_gaussian_modes -- shows the histogram, the fitted sum
+            curve, and each individual fitted component.
+
+        Returns
+        -------
+        dict with:
+            components : list of {"mean", "sigma", "amp"}, fitted, same order as seeds.
+            popt : ndarray, flat [amp0, mean0, sigma0, amp1, mean1, sigma1, ...].
+            x, y : the histogram bin centers / counts actually fit.
+            y_fit : the fitted mixture evaluated at x.
+            loglik : Poisson log-likelihood of the fit (for model selection).
+            n_params : 3 * len(seeds).
+            degenerate : list[bool], per component, True if ANY of its 3 fitted params
+                landed on its bound (non-blocking -- a diagnostic flag, not an error;
+                printed when True).
+        """
+        from scipy.optimize import curve_fit
+        from scipy.special import gammaln
+
+        if amp_bound_factor <= 1:
+            raise ValueError(f"amp_bound_factor must be > 1, got {amp_bound_factor!r}.")
+        if sigma_bound_factor <= 1:
+            raise ValueError(f"sigma_bound_factor must be > 1, got {sigma_bound_factor!r}.")
+        if mean_bound_sigmas <= 0:
+            raise ValueError(f"mean_bound_sigmas must be > 0, got {mean_bound_sigmas!r}.")
+
+        raw_values = np.asarray(raw_values, dtype=float)
+        if range_bins is None:
+            data_min, data_max = float(raw_values.min()), float(raw_values.max())
+            pad = 0.05 * (data_max - data_min)
+            range_bins = [data_min - pad, data_max + pad]
+        else:
+            range_bins = list(range_bins)
+
+        hist, edges = np.histogram(raw_values, num_bins, range_bins)
+        x = 0.5 * (edges[:-1] + edges[1:])
+        y = hist.astype(float)
+
+        def gaussian_sum(x, *params):
+            total = np.zeros_like(x, dtype=float)
+            for i in range(0, len(params), 3):
+                amp, mean, sigma = params[i], params[i + 1], params[i + 2]
+                total = total + amp * np.exp(-((x - mean) ** 2) / (2 * sigma**2))
+            return total
+
+        p0, lower, upper = [], [], []
+        for s in seeds:
+            seed_amp = max(float(s["amp"]), 1e-6)
+            seed_sigma = max(float(s["sigma"]), 1e-6)
+            seed_mean = float(s["mean"])
+            p0 += [seed_amp, seed_mean, seed_sigma]
+            lower += [
+                seed_amp / amp_bound_factor,
+                seed_mean - mean_bound_sigmas * seed_sigma,
+                seed_sigma / sigma_bound_factor,
+            ]
+            upper += [
+                seed_amp * amp_bound_factor,
+                seed_mean + mean_bound_sigmas * seed_sigma,
+                seed_sigma * sigma_bound_factor,
+            ]
+
+        sigma_weights = np.sqrt(y + 1.0)
+        popt, _ = curve_fit(
+            gaussian_sum,
+            x,
+            y,
+            p0=p0,
+            bounds=(lower, upper),
+            sigma=sigma_weights,
+            absolute_sigma=True,
+            maxfev=20000,
+        )
+
+        components = []
+        degenerate = []
+        for i in range(0, len(popt), 3):
+            amp, mean, sigma = popt[i], popt[i + 1], popt[i + 2]
+            components.append({"mean": float(mean), "sigma": float(sigma), "amp": float(amp)})
+            flags = []
+            for name, val, lo, hi in zip(
+                ["amp", "mean", "sigma"], [amp, mean, sigma], lower[i : i + 3], upper[i : i + 3]
+            ):
+                width = max(hi - lo, 1e-12)
+                if (
+                    abs(val - lo) < degenerate_tol * width
+                    or abs(val - hi) < degenerate_tol * width
+                ):
+                    flags.append(name)
+            degenerate.append(bool(flags))
+            if flags:
+                print(
+                    f"[_fit_gaussian_mixture] component {i // 3} pinned at bound for: {flags} "
+                    f"(mean={mean:.4g}) -- treat this fit with caution, the box may be too tight."
+                )
+
+        y_fit = gaussian_sum(x, *popt)
+        mu = np.clip(y_fit, 1e-9, None)
+        loglik = float(np.sum(y * np.log(mu) - mu - gammaln(y + 1)))
+        n_params = len(popt)
+
+        if plot:
+            fig, ax = plt.subplots(figsize=(8, 5), dpi=120)
+            bin_width = x[1] - x[0]
+            ax.bar(x, y, width=bin_width, color="0.8", edgecolor="0.6", label="data")
+            x_dense = np.linspace(range_bins[0], range_bins[1], 400)
+            ax.plot(x_dense, gaussian_sum(x_dense, *popt), "k-", linewidth=2, label="fitted sum")
+            for i, c in enumerate(components):
+                curve = c["amp"] * np.exp(-((x_dense - c["mean"]) ** 2) / (2 * c["sigma"] ** 2))
+                ax.plot(
+                    x_dense,
+                    curve,
+                    "--",
+                    linewidth=1.5,
+                    label=f"component {i}: mean={c['mean']:.3g}",
+                )
+            ax.set_xlabel("value")
+            ax.set_ylabel("count")
+            ax.set_title(title or f"{len(seeds)}-component Gaussian mixture fit")
+            ax.legend(fontsize=8)
+            plt.show()
+
+        return {
+            "components": components,
+            "popt": popt,
+            "x": x,
+            "y": y,
+            "y_fit": y_fit,
+            "loglik": loglik,
+            "n_params": n_params,
+            "degenerate": degenerate,
+        }
+
+    def _select_gaussian_mixture_model(
+        self,
+        raw_values,
+        num_bins: int = 100,
+        range_bins=None,
+        max_modes: int = 4,
+        lr_alpha: float = 0.05,
+        mode_kwargs: dict | None = None,
+        fit_kwargs: dict | None = None,
+        verbose: bool = True,
+    ):
+        """
+        Decide how many Gaussian components are statistically justified for raw_values,
+        rather than always fitting exactly 2 ("W" and "V"):
+
+        1. Runs _detect_gaussian_modes to propose up to max_modes candidate seeds
+           (sorted highest-mean first).
+        2. Fits K=1, 2, ..., len(candidates) component mixtures via
+           _fit_gaussian_mixture, adding one candidate at a time in that order.
+        3. Walks K=1->2->3->... and, at each step, tests whether K is justified over
+           K-1 using BOTH:
+             - BIC (accept K if its BIC is lower than K-1's)
+             - a likelihood-ratio test (2*(loglik_K - loglik_{K-1}) ~ chi2(df=3) under
+               the null that K-1 components suffice; accept K if p < lr_alpha)
+           and only advances to K if BOTH agree it's justified. On disagreement, stops
+           and keeps K-1 -- a phantom population is treated as worse than missing a
+           real-but-marginal one. (Caveat: the chi2 approximation for the LR test is
+           technically not exact for mixture models, since an extra component's mean/
+           sigma are unidentifiable under the null -- this is a well-known asymptotic
+           approximation in the mixture-model literature, used here as a practical
+           cross-check on BIC rather than an exact test.)
+
+        Parameters
+        ----------
+        raw_values : array-like
+        num_bins, range_bins, max_modes : passed to _detect_gaussian_modes.
+        lr_alpha : float, default 0.05
+            Significance threshold for the likelihood-ratio test.
+        mode_kwargs : dict, optional
+            Extra kwargs forwarded to _detect_gaussian_modes.
+        fit_kwargs : dict, optional
+            Extra kwargs forwarded to _fit_gaussian_mixture (each K).
+        verbose : bool, default True
+            Print the K-by-K decision trail.
+
+        Returns
+        -------
+        dict with:
+            chosen_k : int, the selected number of components.
+            chosen : the _fit_gaussian_mixture result for chosen_k.
+            candidates : the full _detect_gaussian_modes output.
+            trail : list of per-step dicts {"k", "bic", "loglik", "bic_prefers_k",
+                "lr_pvalue", "lr_prefers_k", "agreed", "accepted"}.
+        """
+        from scipy.stats import chi2
+
+        mode_kwargs = dict(mode_kwargs or {})
+        fit_kwargs = dict(fit_kwargs or {})
+
+        candidates = self._detect_gaussian_modes(
+            raw_values,
+            num_bins=num_bins,
+            range_bins=range_bins,
+            max_modes=max_modes,
+            **mode_kwargs,
+        )
+        if not candidates:
+            raise RuntimeError(
+                "_detect_gaussian_modes found no candidate populations at all -- check "
+                "that raw_values/range_bins/num_bins are sensible."
+            )
+
+        fits = {}
+        trail = []
+        prev_fit = None
+        chosen_k = 1
+        for k in range(1, len(candidates) + 1):
+            seeds = candidates[:k]
+            fit_k = self._fit_gaussian_mixture(
+                raw_values, seeds, num_bins=num_bins, range_bins=range_bins, **fit_kwargs
+            )
+            fits[k] = fit_k
+
+            if prev_fit is None:
+                chosen_k = 1
+                trail.append(
+                    {
+                        "k": 1,
+                        "bic": fit_k["n_params"] * np.log(len(fit_k["x"])) - 2 * fit_k["loglik"],
+                        "loglik": fit_k["loglik"],
+                        "bic_prefers_k": True,
+                        "lr_pvalue": None,
+                        "lr_prefers_k": True,
+                        "agreed": True,
+                        "accepted": True,
+                    }
+                )
+                prev_fit = fit_k
+                continue
+
+            bic_prev = prev_fit["n_params"] * np.log(len(prev_fit["x"])) - 2 * prev_fit["loglik"]
+            bic_k = fit_k["n_params"] * np.log(len(fit_k["x"])) - 2 * fit_k["loglik"]
+            bic_prefers_k = bic_k < bic_prev
+
+            lr_stat = max(2.0 * (fit_k["loglik"] - prev_fit["loglik"]), 0.0)
+            df = fit_k["n_params"] - prev_fit["n_params"]
+            lr_pvalue = float(chi2.sf(lr_stat, df))
+            lr_prefers_k = lr_pvalue < lr_alpha
+
+            agreed = bic_prefers_k == lr_prefers_k
+            accepted = agreed and bic_prefers_k
+
+            trail.append(
+                {
+                    "k": k,
+                    "bic": bic_k,
+                    "loglik": fit_k["loglik"],
+                    "bic_prefers_k": bic_prefers_k,
+                    "lr_pvalue": lr_pvalue,
+                    "lr_prefers_k": lr_prefers_k,
+                    "agreed": agreed,
+                    "accepted": accepted,
+                }
+            )
+
+            if verbose:
+                verdict = (
+                    "ACCEPTED"
+                    if accepted
+                    else (
+                        "DISAGREEMENT -- kept simpler model"
+                        if not agreed
+                        else "rejected (both criteria)"
+                    )
+                )
+                print(
+                    f"[_select_gaussian_mixture_model] K={k - 1}->{k}: BIC {'prefers' if bic_prefers_k else 'rejects'} K "
+                    f"({bic_prev:.1f}->{bic_k:.1f}), LR p={lr_pvalue:.4g} {'prefers' if lr_prefers_k else 'rejects'} K -- {verdict}"
+                )
+
+            if not accepted:
+                break
+            chosen_k = k
+            prev_fit = fit_k
+
+        return {
+            "chosen_k": chosen_k,
+            "chosen": fits[chosen_k],
+            "candidates": candidates,
+            "trail": trail,
+        }
+
+    def classify_intensity_direct(
+        self,
+        site_index: int = 0,
+        num_bins: int = 100,
+        range_bins=None,
+        sigma_multiplier: float = 2.0,
+        sigma_v_mult: float = 2.0,
+        upper_bound_manual_mult: float = 1.0,
+        plot: bool = True,
+    ) -> "Lattice":
+        """
+        Classify sites by fitting a two-component ("double") Gaussian mixture directly to a
+        histogram of raw peak intensities (self.atoms[site_index]["int_peak"]).
+
+        This is a literal port of the user's original notebook-based W/V intensity-histogram
+        classification scheme (bounded curve_fit on a two-Gaussian mixture), kept deliberately
+        unmodified for now so it can be compared side by side against delta_intensities_assume/
+        delta_intensities_input (which classify B-sites by delta-intensity relative to A/B
+        neighbors, using an adaptive-p0 + soft-penalty fit instead of hard bounds) and against
+        classify_intensity_delta below, before deciding which ideas from each to keep.
+
+        Parameters
+        ----------
+        site_index : int, default 0
+            Which self.atoms site index to classify (0 = the "A" sites in this class's
+            convention).
+        num_bins : int, default 100
+            Number of histogram bins.
+        range_bins : (float, float), optional
+            Histogram range. If None, uses the intensity data's own [min, max] with 5% padding
+            (the original notebook hardcoded a dataset-specific range; this is the one
+            adaptation made during the port so the method works on arbitrary intensity scales
+            -- the fit bounds formulas themselves are unchanged).
+        sigma_multiplier : float, default 2.0
+            Multiplier on sigma1 defining the majority-population ("W") capture window.
+        sigma_v_mult : float, default 2.0
+            Additional multiplier (stacked on sigma_multiplier) on sigma2 defining the
+            minority-population ("V") capture window.
+        upper_bound_manual_mult : float, default 1.0
+            Manual nudge factor on mean2's initial guess/bounds, exactly as in the original
+            notebook scheme -- lets you shift where the minority-population guess starts
+            looking if the automatic guess (a fraction of the majority peak location) needs
+            adjusting for a given dataset.
+        plot : bool, default True
+            If True, shows the histogram + fitted double-Gaussian curve and prints counts,
+            matching the original notebook output.
+
+        Returns
+        -------
+        self
+
+        Side Effects
+        ------------
+        self.intensity_direct_popt : ndarray
+            Fitted [amp1, mean1, sigma1, amp2, mean2, sigma2].
+        self.intensity_direct_w_bounds, self.intensity_direct_v_bounds : ndarray
+            The [low, high] capture windows for the majority (W) / minority (V) populations.
+        self.intensity_direct_v_mask : ndarray[bool]
+            Per-site mask, True where the site's intensity falls in the V window.
+        self.intensity_direct_percent_v : float
+            Percent of sites classified as V by the V-window inclusion test. Every other site
+            is counted as W by subtraction (num_W = num_total - num_V), exactly as in the
+            original -- every site is assumed to be either W or V, no third category.
+
+        Notes
+        -----
+        This is the exact bounds design from the original notebook: amp1/mean1 constrained to
+        +/-30%/+/-20% of the histogram peak height/location, amp2 floored at 1% of the peak
+        height, both sigmas boxed to a fixed [1e-4, 0.2] in raw intensity units. None of it has
+        been changed. Candidate follow-up improvements discussed but not yet applied: Poisson-
+        weighted fitting (sigma=sqrt(y+1) in curve_fit), data-driven mean2 seeding (e.g. via
+        scipy.signal.find_peaks on the histogram instead of a fixed fraction of the majority
+        peak), an adaptive single-vs-double-Gaussian model-selection step, sigma bounds scaled
+        to range_bins instead of hardcoded, and a post-fit convergence/degeneracy check
+        (whether popt landed exactly on a bound).
+        """
+        from scipy.optimize import curve_fit
+
+        a_intensity = np.asarray(self.atoms[site_index]["int_peak"], dtype=float)
+
+        if range_bins is None:
+            data_min, data_max = float(a_intensity.min()), float(a_intensity.max())
+            pad = 0.05 * (data_max - data_min)
+            range_bins = [data_min - pad, data_max + pad]
+        else:
+            range_bins = list(range_bins)
+
+        a_histogram, _ = np.histogram(a_intensity, num_bins, range_bins)
+
+        def double_gaussian(x, amp1, mean1, sigma1, amp2, mean2, sigma2):
+            return amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)) + amp2 * np.exp(
+                -((x - mean2) ** 2) / (2 * sigma2**2)
+            )
+
+        x = np.linspace(range_bins[0], range_bins[1], num_bins)
+        y = a_histogram
+
+        peak_x = x[np.argmax(a_histogram)]
+        peak_h = np.max(a_histogram)
+
+        p0 = [peak_h, peak_x, 0.04, 10, peak_x * 0.6 * upper_bound_manual_mult, 0.04]
+        lower = [
+            peak_h * 0.7,
+            peak_x * 0.8,
+            1e-4,
+            peak_h * 0.01,
+            peak_x * 0.1 * upper_bound_manual_mult,
+            1e-4,
+        ]
+        upper = [
+            peak_h * 1.3,
+            peak_x * 1.2,
+            0.2,
+            min(peak_h * 0.2, 11),
+            peak_x * 0.61 * upper_bound_manual_mult,
+            0.2,
+        ]
+
+        popt, _ = curve_fit(double_gaussian, x, y, p0=p0, bounds=(lower, upper), maxfev=10000)
+        amp1, mean1, sigma1, amp2, mean2, sigma2 = popt
+        self.intensity_direct_popt = popt
+
+        w_bounds = mean1 + np.array([-abs(sigma1), abs(sigma1)]) * sigma_multiplier
+        v_bounds = mean2 + np.array([-abs(sigma2), abs(sigma2)]) * sigma_multiplier * sigma_v_mult
+        self.intensity_direct_w_bounds = w_bounds
+        self.intensity_direct_v_bounds = v_bounds
+
+        v_mask = (a_intensity >= v_bounds[0]) & (a_intensity <= v_bounds[1])
+        num_total = a_intensity.shape[0]
+        num_v = int(np.count_nonzero(v_mask))
+        num_w = num_total - num_v
+        self.intensity_direct_v_mask = v_mask
+        self.intensity_direct_percent_v = 100.0 * num_v / num_total if num_total > 0 else np.nan
+
+        if plot:
+            plt.figure(dpi=150)
+            plt.plot(x, y, "k.", label="Data")
+            plt.plot(x, double_gaussian(x, *popt), "r-", label="Fitted total")
+            plt.plot(
+                x, amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)), "b--", label="Gaussian 1"
+            )
+            plt.plot(
+                x, amp2 * np.exp(-((x - mean2) ** 2) / (2 * sigma2**2)), "g--", label="Gaussian 2"
+            )
+            plt.vlines(w_bounds, 0, np.max(y), color="purple", label="W Bounds")
+            plt.vlines(v_bounds, 0, np.max(y), color="orange", label="V Bounds")
+            plt.title("Direct Intensity Fit (arb. scale)")
+            plt.xlabel("Direct Intensity (arb. scale)")
+            plt.ylabel("Number of sites")
+            plt.legend()
+            plt.show()
+            print(f"W sites counted: {num_w}")
+            print(f"V sites counted: {num_v}")
+            print(f"Total counted: {num_total}")
+            print(f"Percent V sites: {self.intensity_direct_percent_v:.2f}%")
+
+        return self
+
+    def _knn_delta_intensity(self, site_index, k=6):
+        """
+        Per-site delta-intensity via a plain k-nearest-neighbor search (scipy cKDTree) on
+        that site's own positions -- each site's intensity minus the median of its k
+        nearest same-site-type neighbors.
+
+        Unlike organize_nearest_neighbors/intensity_neighborhood (which assume an exactly
+        6-neighbor hexagonal lattice via lattice-vector-indexed slots -- self.uv_arr's 3
+        vectors, each +/-), this works for any site_index and any lattice symmetry, since
+        it only ever looks at actual nearest positions rather than a fixed lattice-vector
+        direction. Added specifically to support B-site (site_index=1) delta-intensity
+        classification, which the lattice-vector-slot approach has no equivalent for.
+
+        Parameters
+        ----------
+        site_index : int
+            Which self.atoms site index to compute delta-intensity for.
+        k : int, default 6
+            Number of nearest neighbors to compare each site against. Reduced
+            automatically if fewer than k+1 sites exist at this site_index.
+
+        Returns
+        -------
+        ndarray, per-site delta-intensity (same order as self.atoms[site_index]).
+        """
+        from scipy.spatial import cKDTree
+
+        x = np.asarray(self.atoms[site_index]["x"], dtype=float)
+        y = np.asarray(self.atoms[site_index]["y"], dtype=float)
+        intensity = np.asarray(self.atoms[site_index]["int_peak"], dtype=float)
+        positions = np.column_stack([x, y])
+        n = positions.shape[0]
+        k_use = min(k, n - 1)
+        if k_use < 1:
+            raise ValueError(
+                f"Need at least 2 sites at site_index={site_index} for a KNN "
+                f"delta-intensity computation, got {n}."
+            )
+        tree = cKDTree(positions)
+        _, neighbor_idx = tree.query(positions, k=k_use + 1)  # column 0 is the point itself
+        neighbor_median = np.median(intensity[neighbor_idx[:, 1:]], axis=1)
+        return intensity - neighbor_median
+
+    def classify_intensity_delta(
+        self,
+        site_index: int = 0,
+        neighborhood_units: int = 3,
+        k_neighbors: int = 6,
+        num_bins: int = 100,
+        range_bins=(-0.8, 0.8),
+        sigma_multiplier: float = 2.0,
+        sigma_v_mult: float = 2.0,
+        sigma_delta_mult: float = 1.0,
+        manual_fit_mult_2: float = 1.0,
+        tolerance_uv: float = 1.95,
+        plot: bool = True,
+    ) -> "Lattice":
+        """
+        Classify sites by fitting a two-component Gaussian mixture to a histogram of
+        delta-intensity (each site's intensity minus the median of its neighborhood).
+
+        Literal port of the user's original notebook delta-intensity classification scheme,
+        kept deliberately unmodified for now -- see classify_intensity_direct's docstring for
+        the shared rationale and candidate follow-up improvements. This is DISTINCT from
+        delta_intensities_assume/delta_intensities_input (which classify B-sites by
+        delta-intensity relative to A/B neighbors using an adaptive-p0 + soft-penalty fit).
+
+        Neighbor-finding depends on site_index: for site_index=0 (the default, "A" sites),
+        uses self.organize_nearest_neighbors + self.intensity_neighborhood exactly as the
+        original notebook did (unchanged). For any other site_index (e.g. 1, "B" sites),
+        that lattice-vector-slot machinery has no equivalent at all, so this instead uses
+        self._knn_delta_intensity -- a plain k-nearest-neighbor search that works
+        regardless of lattice symmetry.
+
+        Parameters
+        ----------
+        site_index : int, default 0
+            Which self.atoms site index to classify. 0 ("A" sites) uses the literal
+            historical neighbor-finding method; anything else uses the KNN method.
+        neighborhood_units : int, default 3
+            Only used when site_index=0: passed to organize_nearest_neighbors/
+            intensity_neighborhood to define the neighbor-averaging radius (in lattice
+            units).
+        k_neighbors : int, default 6
+            Only used when site_index != 0: number of nearest neighbors per site for
+            self._knn_delta_intensity.
+        num_bins : int, default 100
+            Number of histogram bins.
+        range_bins : (float, float), default (-0.8, 0.8)
+            Histogram range for the delta-intensity histogram (kept as the literal default
+            from the original notebook -- delta-intensity is naturally centered near 0
+            regardless of dataset, so this is far less dataset-fragile than a hardcoded
+            absolute range would be for raw intensity).
+        sigma_multiplier, sigma_v_mult, sigma_delta_mult : float
+            Multipliers defining the majority (W) / minority (V) capture windows, as in
+            classify_intensity_direct, with an extra sigma_delta_mult stretch on V here
+            (matching the original notebook).
+        manual_fit_mult_2 : float, default 1.0
+            Manual nudge factor on mean2's bounds/initial guess (an offset from zero here,
+            rather than a fraction of the majority peak as in the direct-intensity version).
+        tolerance_uv : float, default 1.95
+            Only used when site_index=0: passed to organize_nearest_neighbors.
+        plot : bool, default True
+
+        Returns
+        -------
+        self
+
+        Side Effects
+        ------------
+        self.intensity_delta_values : ndarray
+            The raw per-site delta-intensity values used for the histogram.
+        self.intensity_delta_popt, self.intensity_delta_w_bounds, self.intensity_delta_v_bounds,
+        self.intensity_delta_v_mask, self.intensity_delta_percent_v :
+            As in classify_intensity_direct, computed on delta-intensity instead of raw
+            intensity. num_W is again num_total - num_V (every site is either W or V).
+        """
+        from scipy.optimize import curve_fit
+
+        if site_index == 0:
+            self.organize_nearest_neighbors(tolerance_uv=tolerance_uv)
+            delta_intensities, _num_neighbors = self.intensity_neighborhood(
+                neighborhood_units=neighborhood_units, return_delta=True
+            )
+            delta_intensities = np.asarray(delta_intensities, dtype=float)
+        else:
+            delta_intensities = self._knn_delta_intensity(site_index, k=k_neighbors)
+        self.intensity_delta_values = delta_intensities
+
+        range_bins = list(range_bins)
+        delta_histogram, _ = np.histogram(delta_intensities, num_bins, range_bins)
+
+        def double_gaussian(x, amp1, mean1, sigma1, amp2, mean2, sigma2):
+            return amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)) + amp2 * np.exp(
+                -((x - mean2) ** 2) / (2 * sigma2**2)
+            )
+
+        x = np.linspace(range_bins[0], range_bins[1], num_bins)
+        y = delta_histogram
+        peak_h = np.max(delta_histogram)
+        peak_x = x[np.argmax(delta_histogram)]
+
+        p0 = [peak_h, 0, 0.04, 10, -0.5 * manual_fit_mult_2, 0.04]
+        lower = [peak_h * 0.7, -peak_x - 0.1, 1e-4, peak_h * 0.01, -0.8 * manual_fit_mult_2, 1e-4]
+        upper = [
+            peak_h * 1.3,
+            peak_x + 0.1,
+            0.2,
+            min(peak_h * 0.2, 30),
+            -0.25 * manual_fit_mult_2,
+            0.5,
+        ]
+
+        popt, _ = curve_fit(double_gaussian, x, y, p0=p0, bounds=(lower, upper), maxfev=10000)
+        amp1, mean1, sigma1, amp2, mean2, sigma2 = popt
+        self.intensity_delta_popt = popt
+
+        w_bounds = mean1 + np.array([-abs(sigma1), abs(sigma1)]) * sigma_multiplier
+        v_bounds = (
+            mean2
+            + np.array([-abs(sigma2), abs(sigma2)])
+            * sigma_multiplier
+            * sigma_v_mult
+            * sigma_delta_mult
+        )
+        self.intensity_delta_w_bounds = w_bounds
+        self.intensity_delta_v_bounds = v_bounds
+
+        v_mask = (delta_intensities >= v_bounds[0]) & (delta_intensities <= v_bounds[1])
+        num_total = delta_intensities.shape[0]
+        num_v = int(np.count_nonzero(v_mask))
+        num_w = num_total - num_v
+        self.intensity_delta_v_mask = v_mask
+        self.intensity_delta_percent_v = 100.0 * num_v / num_total if num_total > 0 else np.nan
+
+        if plot:
+            ymax = peak_h * 1.1
+            plt.figure(figsize=(12, 4), dpi=150)
+            plt.subplot(121)
+            plt.plot(x, y, "k.", label="Data")
+            plt.plot(x, double_gaussian(x, *popt), "r-", label="Total fit")
+            plt.plot(x, amp1 * np.exp(-((x - mean1) ** 2) / (2 * sigma1**2)), "b--")
+            plt.plot(x, amp2 * np.exp(-((x - mean2) ** 2) / (2 * sigma2**2)), "g--")
+            plt.vlines([mean1, mean2], 0, ymax, label="Gaussian Means")
+            plt.vlines(w_bounds, 0, np.max(y), color="purple", label="W Bounds")
+            plt.vlines(v_bounds, 0, np.max(y), color="orange", label="V Bounds")
+            plt.legend()
+            plt.ylim([0, ymax])
+            plt.xlabel(r"$I_{site}-\mathrm{median}(I_{neighbors})$")
+            plt.ylabel("Atomic site count")
+            plt.title("Gaussian fit of ΔIntensity")
+            plt.grid("on")
+            plt.subplot(122)
+            plt.plot(x, y, "k.", label="Data")
+            plt.plot(x, double_gaussian(x, *popt), "r-", label="Total fit")
+            plt.vlines([mean1, mean2], 0.8, ymax * 2, label="Gaussian Means")
+            plt.legend()
+            plt.yscale("log")
+            plt.ylim([0.8, ymax * 2])
+            plt.xlabel(r"$I_{site}-\mathrm{median}(I_{neighbors})$")
+            plt.ylabel("Atomic site count [log scale]")
+            plt.title("Gaussian fit of ΔIntensity [log]")
+            plt.grid("on")
+            plt.show()
+            print(f"[delta] W sites counted: {num_w}")
+            print(f"[delta] V sites counted: {num_v}")
+            print(f"[delta] Total counted: {num_total}")
+            print(f"[delta] Percent V sites: {self.intensity_delta_percent_v:.2f}%")
 
         return self
 
@@ -5106,93 +6736,236 @@ class Lattice(AutoSerialize):
         num_peaks_use=2,
         center_ignore_buffer=15,
         minSpacingPeaks=5,
+        min_angle_deg=20.0,
+        max_magnitude_ratio=10.0,
+        crop_radius: int | None | str = "auto",
     ):
-        diffraction_peaks_list = self.locate_diffraction_spots(
-            num_peaks_search,
-            center_ignore_buffer=center_ignore_buffer,
-            minSpacingPeaks=minSpacingPeaks,
-        )
-        if num_peaks_use == 2:
-            peakA, peakB = self.locate_first_order_peaks(diffraction_peaks_list)
-            diffraction_peaks_list = np.array([peakA, peakB])
-        else:
-            diffraction_peaks_list = np.array(
-                [[diffraction_peaks_list[i]] for i in range(1, (num_peaks_use + 1))]
+        """
+        Parameters
+        ----------
+        crop_radius : int, None, or "auto" (default)
+            Passed to locate_diffraction_spots to limit the k-space search to a centered
+            window -- see that method's docstring for why this matters (the number of raw
+            candidate maxima, mostly noise, scales with the searched k-space area, so
+            cropping is a large speedup for big images). "auto" uses
+            min(image_shape) // 4, which scales with field-of-view/lattice-spacing rather
+            than being a fixed pixel count -- see the module discussion for why a fixed
+            crop isn't safe across datasets with very different unit-cell counts spanning
+            the frame. Pass None to disable cropping entirely (search the full k-space
+            array, as before this parameter existed).
+
+            Only applies to the num_peaks_use == 2 path: if the crop causes
+            locate_first_order_peaks to raise RuntimeError (not enough valid peaks found,
+            the two chosen peaks fail the angle/magnitude sanity checks, or -- see below --
+            a chosen peak sits suspiciously close to the crop boundary), this automatically
+            retries once with the FULL uncropped k-space search before giving up. This
+            catches most bad crops, but is NOT a correctness guarantee: a crop that clips
+            the true Bragg peaks can still occasionally return a self-consistent-looking
+            but wrong pair from weaker candidates well inside the window, without raising
+            -- verified this happens in practice with a borderline-too-small crop_radius.
+            The near-boundary check in _run mitigates the most common version of this (a
+            clipped real peak usually leaves its next-best stand-in near the crop edge),
+            but doesn't eliminate the risk entirely. If results look physically implausible
+            (wrong lattice spacing/orientation), try crop_radius=None before assuming the
+            image itself is the problem. The num_peaks_use != 2 path has no RuntimeError
+            validation to hook into (it didn't before this parameter existed either), so a
+            bad crop there won't self-correct at all.
+        """
+        nx, ny = self._image.shape
+        if crop_radius == "auto":
+            crop_radius = max(min(nx, ny) // 4, 1)
+
+        def _run(radius):
+            diffraction_peaks_list = self.locate_diffraction_spots(
+                num_peaks_search,
+                center_ignore_buffer=center_ignore_buffer,
+                minSpacingPeaks=minSpacingPeaks,
+                crop_radius=radius,
             )
-        return diffraction_peaks_list
+            if num_peaks_use == 2:
+                peakA, peakB = self.locate_first_order_peaks(
+                    diffraction_peaks_list,
+                    min_angle_deg=min_angle_deg,
+                    max_magnitude_ratio=max_magnitude_ratio,
+                )
+                if radius is not None:
+                    # A crop can silently return a self-consistent but WRONG pair instead
+                    # of raising: if the true (stronger) Bragg peaks sit just outside
+                    # crop_radius, locate_first_order_peaks's angle/magnitude checks (based
+                    # only on the returned peaks' own radii, not on anything outside the
+                    # crop) can still pass for the best AVAILABLE candidates inside the
+                    # window -- verified this happens in practice. A real peak pair well
+                    # inside a correctly-sized crop shouldn't sit right at the window's
+                    # edge, so treat that as suspicious and force the uncropped fallback.
+                    cx, cy = nx / 2, ny / 2
+                    for p in (peakA, peakB):
+                        r = float(np.hypot(p["x"][0] - cx, p["y"][0] - cy))
+                        if r > 0.85 * radius:
+                            raise RuntimeError(
+                                f"Chosen peak at radius {r:.1f}px sits within 15% of "
+                                f"crop_radius={radius}px -- likely clipped, the true peak "
+                                f"may lie just outside the crop."
+                            )
+                return np.array([peakA, peakB])
+            else:
+                return np.array(
+                    [[diffraction_peaks_list[i]] for i in range(1, (num_peaks_use + 1))]
+                )
+
+        if crop_radius is None or num_peaks_use != 2:
+            return _run(crop_radius)
+
+        try:
+            return _run(crop_radius)
+        except RuntimeError as e:
+            print(
+                f"[auto_peak_finder] cropped k-space search (crop_radius={crop_radius}) "
+                f"failed ({e}); retrying with the full uncropped k-space array."
+            )
+            return _run(None)
 
     def locate_first_order_peaks(
         self,
         peakCoordinates: np.dtype([("x", float), ("y", float), ("intensity", float)]),
+        min_angle_deg: float = 20.0,
+        max_magnitude_ratio: float = 10.0,
     ):
         """
-        Locate three low-order linearly independent peaks in k-space.
+        Locate two first-order, linearly independent Bragg peaks in k-space.
+
+        The previous version picked peakA as simply the candidate closest to the k-space
+        center (regardless of how confidently it was actually detected) and peakB as the
+        closest remaining candidate whose cross product with peakA exceeded an ADAPTIVE
+        threshold scaled by the weakest candidate pair present in that specific image (5x,
+        falling back to 2x) -- neither criterion considers peak intensity, and the adaptive
+        threshold can accept a nearly-collinear pair if the whole candidate population
+        happens to be angularly clustered (e.g. under heavy anisotropic contamination or
+        drift). A nearly-collinear pair makes the real-space basis matrix inversion in
+        auto_peak_finder numerically unstable: verified empirically, a pair only a few
+        degrees off parallel inverted into real-space lattice vectors 15-19x too long,
+        silently producing a basis that atoms_first_uvw's flood-fill tiling then can't grow
+        from at all (it looks for neighbors at the wrong distance entirely), and no amount
+        of downstream refinement (e.g. refitting u/v from whatever A-sites got tiled) can
+        recover from that -- there's nothing real to refit from.
+
+        This version instead: (1) treats peakA as the MOST INTENSE candidate (not merely
+        the closest to center), since a confidently-detected peak is a more trustworthy
+        anchor than an arbitrary nearby one that might be noise; (2) picks peakB as the
+        most intense REMAINING candidate whose angle to peakA exceeds a FIXED minimum
+        (min_angle_deg), not an adaptive one, so a near-collinear pair can never be
+        accepted regardless of what the rest of the candidate population looks like; (3)
+        validates that the resulting real-space u, v magnitudes are dimensionally
+        consistent with the chosen peaks' own k-space radii before returning, raising a
+        RuntimeError instead of silently returning a basis that's wrong by an order of
+        magnitude. RuntimeError specifically (not e.g. ValueError) so that an OUTER,
+        caller-side retry loop can catch it and escalate to the next set of peak-finding
+        settings (e.g. a notebook-level run_lattice_vacancy_analysis_auto wrapper that
+        retries with different parameters on RuntimeError -- that wrapper lives in the
+        analysis notebook, not in this library, so it won't show up in a search of this
+        repo). Deliberately NOT caught anywhere inside this class (auto_peak_finder's
+        crop_radius fallback re-raises rather than swallowing a second RuntimeError, and
+        atoms_first_uvw/atoms_first don't catch it either) -- propagating it all the way out
+        is the point, so whatever retry logic the caller has can see it.
 
         Parameters
         ----------
-        peakCoordinates: (number of peaks) np.ndarrary, np.dtype([("x", float), ("y", float), ("intensity", float)])
-            An array of input peaks. This array should contain at least 2 linearly independent Bragg vectors.
+        peakCoordinates: (number of peaks) np.ndarray, np.dtype([("x", float), ("y", float), ("intensity", float)])
+            Candidate peaks, as returned by locate_diffraction_spots. Index 0 is always the
+            synthetic zero/DC peak that function inserts, excluded here unconditionally.
+        min_angle_deg: float, default=20.0
+            Minimum angle (degrees) required between peakA and peakB. Below this, the 2x2
+            basis-matrix inversion used to convert k-space peaks to real-space lattice
+            vectors becomes too ill-conditioned to trust.
+        max_magnitude_ratio: float, default=10.0
+            The chosen peaks' k-space radii imply an expected real-space lattice spacing of
+            roughly image_size / radius; if the actual matrix-inverted u or v magnitude is
+            off from that estimate by more than this factor (in either direction), something
+            is still wrong even though the angle check passed, and a RuntimeError is raised.
 
         Returns
         -------
-        peakA: np.dtype([("x", float), ("y", float), ("intensity", float)])
-            The first peak (closest to central peak).
-        peakB: np.dtype([("x", float), ("y", float), ("intensity", float)])
-            The first peak (second closest to central peak).
+        peakA, peakB: np.dtype([("x", float), ("y", float), ("intensity", float)])
+            The two chosen peaks.
         """
         nx, ny = self._image.shape
-        midX = nx // 2
-        midY = ny // 2
-        peakCoordinatesRespCenter = np.zeros(
-            len(peakCoordinates),
-            dtype=np.dtype([("x", float), ("y", float), ("intensity", float)]),
+        midX, midY = nx // 2, ny // 2
+
+        # peakCoordinates[0] is always the synthetic DC/zero peak locate_diffraction_spots
+        # inserts -- exclude it directly instead of re-deriving "is this close to center".
+        real_peaks = peakCoordinates[1:]
+        if len(real_peaks) < 2:
+            raise RuntimeError(
+                f"Need at least 2 non-DC candidate peaks to find a lattice basis, got "
+                f"{len(real_peaks)}. Increase num_peaks_search."
+            )
+
+        rel_x = real_peaks["x"] - midX
+        rel_y = real_peaks["y"] - midY
+        radius = np.sqrt(rel_x**2 + rel_y**2)
+        vecs = np.column_stack([rel_x, rel_y])
+
+        # get_maxima_2D already returns peaks sorted by intensity descending, but don't
+        # rely on that implicitly carrying through locate_diffraction_spots -- resort here
+        # so this method is correct on its own regardless of upstream ordering.
+        order = np.argsort(real_peaks["intensity"])[::-1]
+        real_peaks = real_peaks[order]
+        vecs = vecs[order]
+        radius = radius[order]
+
+        peakA_idx = 0  # most intense non-DC candidate
+        vecA = vecs[peakA_idx]
+        normA = np.linalg.norm(vecA)
+
+        min_sin_angle = np.sin(np.deg2rad(min_angle_deg))
+        peakB_idx = None
+        for cand_idx in range(1, len(real_peaks)):
+            vecB = vecs[cand_idx]
+            normB = np.linalg.norm(vecB)
+            if normA < 1e-9 or normB < 1e-9:
+                continue
+            sin_angle = abs(np.cross(vecA, vecB)) / (normA * normB)
+            if sin_angle > min_sin_angle:
+                peakB_idx = cand_idx
+                break
+
+        if peakB_idx is None:
+            raise RuntimeError(
+                f"No candidate peak found with angle > {min_angle_deg} deg from the "
+                f"strongest peak, among {len(real_peaks)} candidates -- the detected peaks "
+                f"may all be nearly collinear. Increase num_peaks_search or lower "
+                f"min_angle_deg."
+            )
+
+        peakA = real_peaks[peakA_idx : peakA_idx + 1].copy()
+        peakB = real_peaks[peakB_idx : peakB_idx + 1].copy()
+
+        # Sanity-check the resulting real-space basis before returning, using the same
+        # k-space-peak -> real-space-vector conversion auto_peak_finder itself does. A
+        # peak at k-space radius r implies a real-space periodicity on the order of
+        # image_size / r; if the matrix inversion blows that up or shrinks it by more than
+        # max_magnitude_ratio, the angle check above wasn't enough to catch a bad pair.
+        g1 = np.array([vecA[0] / nx, vecA[1] / ny])
+        g2 = np.array([vecs[peakB_idx][0] / nx, vecs[peakB_idx][1] / ny])
+        g_matrix = np.array([g1, g2])
+        a_matrix = np.linalg.inv(g_matrix)
+        u_check, v_check = a_matrix.T[0], a_matrix.T[1]
+        expected_scale = 0.5 * (
+            nx / max(radius[peakA_idx], 1.0) + ny / max(radius[peakB_idx], 1.0)
         )
-        peakCoordinatesRespCenter["x"] = peakCoordinates["x"] - midX
-        peakCoordinatesRespCenter["y"] = peakCoordinates["y"] - midY
-        peakRadialDistCenter = (
-            peakCoordinatesRespCenter["x"] ** 2 + peakCoordinatesRespCenter["y"] ** 2
-        )
+        for name, vec in [("u", u_check), ("v", v_check)]:
+            vnorm = np.linalg.norm(vec)
+            if (
+                vnorm > max_magnitude_ratio * expected_scale
+                or vnorm < expected_scale / max_magnitude_ratio
+            ):
+                raise RuntimeError(
+                    f"Real-space {name} from the chosen peak pair has magnitude "
+                    f"{vnorm:.1f}px, far from the ~{expected_scale:.1f}px expected from "
+                    f"these peaks' k-space radii -- the chosen basis is likely still wrong "
+                    f"despite passing the angle check. Increase num_peaks_search or "
+                    f"min_angle_deg."
+                )
 
-        smallestRadiiIndices = np.argsort(peakRadialDistCenter)
-        peakCoordinatesRespCenter = peakCoordinatesRespCenter[smallestRadiiIndices]
-
-        # The closest peak should be the zero order peak - not interested in that.
-        if peakRadialDistCenter[0] < 5:
-            peakAInd = 1
-            peakBInd = None
-        else:
-            peakAInd = 0
-            peakBInd = None
-
-        crossAWithRest = np.zeros(
-            [len(peakCoordinates) - 2]
-        )  # this 2 comes from the A peak and the central peak that are excluded from consideration for the B and C peaks
-        peakA_xy = self.get_xy(peakCoordinatesRespCenter[peakAInd])
-        for peakIndex in np.arange(2, len(peakCoordinates)):
-            currentPeak = self.get_xy(peakCoordinatesRespCenter[peakIndex])
-            crossAWithRest[peakIndex - 2] = np.cross(peakA_xy, currentPeak)
-        threshold = 5 * (np.min(np.abs(crossAWithRest)) + 0.1)
-
-        thresholdCondition = np.abs(crossAWithRest) > threshold
-        if np.any(thresholdCondition):
-            peakBInd = (
-                np.argmax(thresholdCondition) + 2
-            )  # returning the 2 that was subtracted above
-        else:
-            print("Lowering threshold B")
-            threshold = 2 * (np.min(np.abs(crossAWithRest)) + 0.1)
-            thresholdCondition = np.abs(crossAWithRest) > threshold
-            peakBInd = np.argmax(thresholdCondition) + 2
-
-        peakA = np.zeros(1, dtype=np.dtype([("x", float), ("y", float), ("intensity", float)]))
-        peakB = np.zeros(1, dtype=np.dtype([("x", float), ("y", float), ("intensity", float)]))
-
-        peakA["x"] = peakCoordinates["x"][smallestRadiiIndices[peakAInd]]
-        peakA["y"] = peakCoordinates["y"][smallestRadiiIndices[peakAInd]]
-        peakA["intensity"] = peakCoordinates["intensity"][smallestRadiiIndices[peakAInd]]
-        peakB["x"] = peakCoordinates["x"][smallestRadiiIndices[peakBInd]]
-        peakB["y"] = peakCoordinates["y"][smallestRadiiIndices[peakBInd]]
-        peakB["intensity"] = peakCoordinates["intensity"][smallestRadiiIndices[peakBInd]]
         return peakA, peakB
 
     def locate_diffraction_spots(
@@ -5200,6 +6973,7 @@ class Lattice(AutoSerialize):
         maxNumPeaks_in: int,
         minSpacingPeaks: int = 0,
         center_ignore_buffer: int | None = None,
+        crop_radius: int | None = None,
     ):
         """
         Calls the maxima finder.
@@ -5208,17 +6982,45 @@ class Lattice(AutoSerialize):
         ----------
         maxNumPeaks_in: int
             The number of peaks to return. Noisier data should use a smaller value. For 2D crystals, more than 3 peaks should be sought.
+        crop_radius: int, optional
+            If given, crops the (already FFT-shifted) k-space magnitude image to a
+            centered (2*crop_radius) x (2*crop_radius) window before searching for maxima,
+            instead of searching the full array. This does NOT change the FFT itself
+            (still computed on the full real-space image, so k-space sampling/resolution
+            is unaffected) -- it only shrinks the region get_maxima_2D has to search,
+            which matters because the number of raw candidate maxima (mostly noise, not
+            real Bragg peaks) scales with the searched area. Returned peak coordinates are
+            remapped back into full-image k-space coordinates, so callers never need to
+            know cropping happened. If a real Bragg peak lies outside crop_radius, it will
+            not be found -- see auto_peak_finder for the automatic uncropped-retry
+            fallback that guards against this.
+
         Returns
         -------
         peakList: (maxNumPeaks_in) np.ndarray, np.dtype([("x", float), ("y", float), ("intensity", float)])
             An array of peak coordinates with a custom datatype.
         """
         nx, ny = self._image.shape
+        fft_mag = np.abs(np.fft.fftshift(np.fft.fft2(self._image.array)))
+
+        if crop_radius is not None:
+            cx, cy = nx // 2, ny // 2
+            r = int(crop_radius)
+            x0, x1 = max(0, cx - r), min(nx, cx + r)
+            y0, y1 = max(0, cy - r), min(ny, cy + r)
+            fft_mag = fft_mag[x0:x1, y0:y1]
+        else:
+            x0 = y0 = 0
+
         peakList = self.get_maxima_2D(
-            np.abs(np.fft.fftshift(np.fft.fft2(self._image.array))),
+            fft_mag,
             maxNumPeaks=maxNumPeaks_in,
             minSpacing=minSpacingPeaks,
         )
+        if crop_radius is not None:
+            peakList["x"] += x0
+            peakList["y"] += y0
+
         if center_ignore_buffer is not None:
             x_dist_to_center = peakList["x"] - nx / 2
             y_dist_to_center = peakList["y"] - ny / 2
@@ -5280,10 +7082,11 @@ class Lattice(AutoSerialize):
         sigma: float = 0,
         minAbsoluteIntensity: float = 0,
         minRelativeIntensity: float = 0,
-        relativeToPeak: float = 0,
+        relativeToPeak: float | str = 0,
         minSpacing: float = 0,
         edgeBoundary: int = 1,
         maxNumPeaks: int = 1,
+        robust_top_k: int = 5,
         _ar_FT: np.ndarray | None = None,
     ):
         """
@@ -5305,8 +7108,8 @@ class Lattice(AutoSerialize):
         maxNumPeaks: int
             The maximum number of maxima to return
         minAbsoluteIntensity, minRelativeIntensity, relativeToPeak,
-            minSpacing, edgeBoundary, maxNumPeaks: filtering applied
-            after maximum detection and before subpixel refinement.
+            minSpacing, edgeBoundary, maxNumPeaks, robust_top_k: filtering
+            applied after maximum detection and before subpixel refinement.
             Parameter descriptions in filter_2D_maxima.
         _ar_FT: (nx, ny) np.ndarray, complex
             If 'multicorr' is used and this is not None, uses this argument
@@ -5368,6 +7171,7 @@ class Lattice(AutoSerialize):
             minSpacing=minSpacing,
             edgeBoundary=edgeBoundary,
             maxNumPeaks=maxNumPeaks,
+            robust_top_k=robust_top_k,
         )
 
         if subpixel == "pixel":
@@ -5418,14 +7222,23 @@ class Lattice(AutoSerialize):
         minSpacing=0,
         edgeBoundary=1,
         maxNumPeaks=1,
+        robust_top_k=5,
     ):
         """
         Args:
             maxima : a numpy structured array with fields 'x', 'y', 'intensity'
             minAbsoluteIntensity : delete counts with intensity below this value
             minRelativeIntensity : delete counts with intensity below this value times
-                the intensity of the i'th peak, where i is given by `relativeToPeak`
-            relativeToPeak : see above
+                a reference intensity -- see `relativeToPeak`
+            relativeToPeak : int or "robust". If an int i, the reference intensity is the
+                i'th-brightest peak's raw intensity (legacy behavior) -- fragile, since a
+                single hot pixel or noise spike landing at exactly rank i (rank 0, the
+                brightest peak, by default) skews every other peak's threshold. If
+                "robust", the reference is instead the median intensity of the
+                `robust_top_k` brightest peaks, which tracks the same true peak-intensity
+                scale but is not swayed by any single outlier peak.
+            robust_top_k : only used when relativeToPeak == "robust" -- number of
+                brightest peaks to take the median of.
             minSpacing : if two peaks are within this euclidean distance from one
                 another, delete the less intense of the two
             edgeBoundary : delete peaks within this distance of the image edge
@@ -5440,24 +7253,50 @@ class Lattice(AutoSerialize):
             deletemask = maxima["intensity"] < minAbsoluteIntensity
             maxima = maxima[~deletemask]
 
-        # Remove maxima which are too dim, compared to the n-th brightest
-        if (minRelativeIntensity > 0) & (len(maxima) > relativeToPeak):
-            assert isinstance(relativeToPeak, (int, np.integer))
-            deletemask = (
-                maxima["intensity"] / maxima["intensity"][relativeToPeak] < minRelativeIntensity
-            )
-            maxima = maxima[~deletemask]
+        # Remove maxima which are too dim, compared to a reference peak intensity
+        if minRelativeIntensity > 0 and len(maxima) > 0:
+            if isinstance(relativeToPeak, str):
+                if relativeToPeak != "robust":
+                    raise ValueError(
+                        f"relativeToPeak string values must be 'robust', got {relativeToPeak!r}."
+                    )
+                reference_intensity = np.median(maxima["intensity"][: max(1, robust_top_k)])
+            elif len(maxima) > relativeToPeak:
+                assert isinstance(relativeToPeak, (int, np.integer))
+                reference_intensity = maxima["intensity"][relativeToPeak]
+            else:
+                reference_intensity = None
+            if reference_intensity is not None:
+                deletemask = maxima["intensity"] / reference_intensity < minRelativeIntensity
+                maxima = maxima[~deletemask]
 
-        # Remove maxima which are too close
-        if minSpacing > 0:
+        # Remove maxima which are too close. `maxima` is sorted by intensity descending
+        # (by get_maxima_2D, and preserved by the boolean masks above), so array index
+        # order IS intensity rank order -- among any pair within minSpacing, the
+        # lower-index (higher-intensity) one survives and suppresses the other. This used
+        # to be a plain O(N^2) nested Python loop over every raw local maximum (i.e. every
+        # noise bump in a large/noisy image, not just real peaks) BEFORE any intensity
+        # threshold or maxNumPeaks truncation narrowed the candidate pool -- for a large
+        # FFT (e.g. k-space Bragg-peak search on a several-thousand-pixel image), that's
+        # tens of thousands of raw candidates and the loop could effectively never finish.
+        # A cKDTree turns the same "for each surviving point, suppress not-yet-deleted
+        # later points within minSpacing" sweep into O(N log N), with identical results.
+        if minSpacing > 0 and len(maxima) > 1:
+            from scipy.spatial import cKDTree
+
+            positions = np.column_stack([maxima["x"], maxima["y"]])
+            tree = cKDTree(positions)
+            pairs = tree.query_pairs(minSpacing, output_type="ndarray")  # (i, j), i < j
+            # Only the first column needs to be in ascending order (ties among pairs
+            # sharing the same i can be processed in any order -- they're independent
+            # marks). A plain Python sorted() on millions of (i, j) tuples was itself the
+            # bottleneck on a dense candidate set (e.g. ~7M pairs from a real, noisy
+            # image); argsort on one column is a vectorized C-level op instead.
+            pairs = pairs[np.argsort(pairs[:, 0])] if len(pairs) else pairs
             deletemask = np.zeros(len(maxima), dtype=bool)
-            for i in range(len(maxima)):
-                if deletemask[i] == False:  # noqa: E712
-                    tooClose = (
-                        (maxima["x"] - maxima["x"][i]) ** 2 + (maxima["y"] - maxima["y"][i]) ** 2
-                    ) < minSpacing**2
-                    tooClose[: i + 1] = False
-                    deletemask[tooClose] = True
+            for i, j in pairs.tolist():
+                if not deletemask[i]:
+                    deletemask[j] = True
             maxima = maxima[~deletemask]
 
         # Remove maxima in excess of maxNumPeaks

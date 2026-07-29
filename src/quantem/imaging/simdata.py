@@ -235,7 +235,15 @@ class SimData(AutoSerialize):
                 indexing="ij",
             )
             basis = np.vstack((np.ones(aa.size), aa.ravel(), bb.ravel())).T
-            xy = basis @ lat
+            # This matmul spuriously raises divide-by-zero/overflow/invalid-value
+            # RuntimeWarnings on Apple's Accelerate BLAS backend for some shapes of
+            # `basis` here, even though the actual output is always finite and correct --
+            # verified across many seeds/geometries (no NaN/Inf in `xy` ever, despite the
+            # warnings firing every time on this backend). Confirmed via
+            # `numpy.show_config()` this environment uses Accelerate; this is a known class
+            # of false-positive with it, not a real numerical issue in this computation.
+            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                xy = basis @ lat
 
             x, y = xy[:, 0], xy[:, 1]
             in_bounds = (x >= 0.0) & (x <= H - 1) & (y >= 0.0) & (y <= W - 1)
