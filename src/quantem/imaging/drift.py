@@ -2121,6 +2121,11 @@ class DriftCorrection(AutoSerialize):
 
         if output_original_shape:
             image_corr_fft = fourier_cropping(image_corr_fft, self.shape[-2:]) / upsample_factor**2
+            if mask_output:
+                mask = (
+                    np.real(np.fft.ifft2(fourier_cropping(np.fft.fft2(mask), self.shape[-2:])))
+                    / upsample_factor**2
+                )
 
         # TODO - adjust origin / sampling if output sampling is different from input
         # i.e. if output_original_shape is False, and upsample_factor > 1
