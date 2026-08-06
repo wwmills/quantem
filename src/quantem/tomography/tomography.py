@@ -289,6 +289,16 @@ class Tomography(TomographyOpt, TomographyBase):
 
                 # Clip gradients
                 torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)
+
+                # Defocus previously had NO gradient clipping at all (only the object's
+                # weights were clipped above) -- a stray large per-batch gradient on
+                # z_focus_params had no ceiling before reaching Adam. Added as a pure
+                # safety net against single-step blowups; does not by itself prevent
+                # the slower, many-epoch object-absorbs-wrong-defocus divergence (see
+                # the "defocus" cosine-decay scheduler / weight_decay fix for that).
+                if hasattr(self.dset, '_z_focus_params') and self.dset.learn_defocus:
+                    torch.nn.utils.clip_grad_norm_(self.dset._z_focus_params, max_norm=1.0)
+
                 self.step_optimizers()
 
                 if hasattr(self.dset, '_z_focus_params') and self.dset.learn_defocus:
@@ -801,7 +811,15 @@ class Tomography(TomographyOpt, TomographyBase):
         path: str | Path,
         mode: Literal["w", "o"] = "w",
         store: Literal["auto", "zip", "dir"] = "auto",
-        skip: str | type | Sequence[str | type] = ["dataloader"],
+        # "val_dataloader" must be skipped alongside "dataloader": it is built
+        # with persistent_workers=True (core/ml/ddp.py:125), so once validation
+        # has run it holds a live _MultiProcessingDataLoaderIter, which raises
+        #   NotImplementedError: ('{} cannot be pickled',
+        #                         '_MultiProcessingDataLoaderIter')
+        # from torch's DataLoader.__getstate__. Skipping only "dataloader" made
+        # save() fail for ANY run with val_fraction > 0; it appeared to work only
+        # because val_fraction defaults to 0.0, which leaves val_dataloader None.
+        skip: str | type | Sequence[str | type] = ["dataloader", "val_dataloader"],
         compression_level: int | None = 4,
     ) -> None:
         super(Tomography, self).save(

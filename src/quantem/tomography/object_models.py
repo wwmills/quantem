@@ -890,8 +890,21 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         # even when the device hasn't changed and the model is already correctly
         # wrapped -- pure wasted work on every reconstruct() call.
         already_wrapped = isinstance(self._model, torch.nn.parallel.DistributedDataParallel)
-        already_correct = getattr(self, "_device", None) == device and (
-            already_wrapped if self.world_size > 1 else not already_wrapped
+        # Checking the cached self._device attribute alone is not enough: after
+        # Tomography.from_file() deserializes a checkpoint, torch.load(...,
+        # map_location="cpu") forces the actual parameter tensors onto CPU
+        # regardless of what self._device says (that plain Python attribute
+        # round-trips through pickling unchanged, so it still reads the
+        # pre-save device). Without also checking real parameter placement,
+        # this guard wrongly short-circuits and skips the .to(device) call
+        # below, leaving weights stranded on CPU while inputs are on GPU --
+        # confirmed via a reproducible "Expected all tensors to be on the same
+        # device" crash on the very next reconstruct() call after a reload.
+        actual_device = next(self._model.parameters()).device
+        already_correct = (
+            getattr(self, "_device", None) == device
+            and actual_device == device
+            and (already_wrapped if self.world_size > 1 else not already_wrapped)
         )
         if already_correct:
             return
@@ -981,7 +994,11 @@ class ObjectTensorDecomp(ObjectINR):
         soft_loss = torch.tensor(
             0.0, device=ctx.pred.device if ctx.pred is not None else self.device
         )
-        if self.constraints.tv_vol > 0:
+        # Gate on EITHER coefficient. Previously this tested only tv_vol, so a
+        # run with tv_plane > 0 and tv_vol == 0 -- the natural setting, since
+        # volume TV penalizes density gradients and fights sharp atomic peaks --
+        # silently applied no plane regularization whatsoever.
+        if self.constraints.tv_vol > 0 or self.constraints.tv_plane > 0:
             assert ctx.coords is not None, "Coordinates must be provided for TV loss"
             assert ctx.pred is not None, "Prediction must be provided for TV loss"
             soft_loss += self.get_tv_loss(ctx)
@@ -1007,18 +1024,31 @@ class ObjectTensorDecomp(ObjectINR):
         assert ctx.coords is not None, "Coordinates must be provided for TV loss"
         assert ctx.pred is not None, "Prediction must be provided for TV loss"
         tv_loss = torch.tensor(0.0, device=ctx.pred.device)
-        tv_loss += self._get_plane_tv_loss()
-        tv_loss += self.get_volume_tv_loss(ctx.coords)
+        # Each term is skipped when its own coefficient is zero. Beyond being
+        # correct, this matters for cost: get_volume_tv_loss runs three extra
+        # forward passes per call (one per axis, plus the base), so evaluating
+        # it at tv_vol == 0 would roughly quadruple the object-model cost to
+        # multiply the result by zero.
+        if self.constraints.tv_plane > 0:
+            tv_loss += self._get_plane_tv_loss()
+        if self.constraints.tv_vol > 0:
+            tv_loss += self.get_volume_tv_loss(ctx.coords)
         return tv_loss
 
     def _get_plane_tv_loss(self) -> torch.Tensor:
         """
         Gets the total-variation across the planes.
         """
-        is_tilted = self.model.tilted
+        # Read `tilted` and `T` from the UNWRAPPED module. DistributedDataParallel
+        # does not proxy attribute access, so `self.model.tilted` raised
+        # AttributeError at world_size>1 -- i.e. any multi-GPU run with
+        # tv_plane > 0 crashed on its first backward. Harmless at world_size==1
+        # because distribute_model does not wrap there (core/ml/ddp.py:158),
+        # which is why single-GPU runs never hit it.
+        model = _unwrap(self.model)
+        is_tilted = model.tilted
         per_level = []
 
-        model = _unwrap(self.model)
         for p in model.grids:
             # p: (3*T, C, H, W) for TILTED, (3, C, H, W) for KPlanes
             dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
@@ -1026,7 +1056,7 @@ class ObjectTensorDecomp(ObjectINR):
             per_plane = dh + dw  # (3*T,) or (3,)
 
             if is_tilted:
-                T = self.model.T
+                T = model.T
                 per_rotation = per_plane.view(T, 3).sum(dim=1)  # sum 3 planes per rotation
                 level_tv = per_rotation.mean()  # avg across rotations
             else:
