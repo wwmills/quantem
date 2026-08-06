@@ -111,15 +111,39 @@ class LoggerTomography(LoggerBase):
                 self.log_scalar("z_focus/mse_to_gt", float(error), iter)
 
         for channel in range(pred_volume.shape[0]):
-            self.log_image(
-                f"volume/sum_z_{channel}", pred_volume[channel].sum(axis=0), iter, logger_cmap
-            )
-            self.log_image(
-                f"volume/sum_y_{channel}", pred_volume[channel].sum(axis=1), iter, logger_cmap
-            )
-            self.log_image(
-                f"volume/sum_x_{channel}", pred_volume[channel].sum(axis=2), iter, logger_cmap
-            )
+            vol = pred_volume[channel]
+            self.log_image(f"volume/sum_z_{channel}", vol.sum(axis=0), iter, logger_cmap)
+            self.log_image(f"volume/sum_y_{channel}", vol.sum(axis=1), iter, logger_cmap)
+            self.log_image(f"volume/sum_x_{channel}", vol.sum(axis=2), iter, logger_cmap)
+
+            # Central slices, in addition to the sum projections above. A sum
+            # integrates through the whole volume, which averages successive
+            # atomic planes together and washes out the lattice -- exactly the
+            # feature you want to watch at atomic resolution. A single central
+            # plane keeps it.
+            #
+            # slab_mean is logged alongside the single slice because one voxel
+            # plane can be noisy; averaging a few adjacent planes is far more
+            # legible while still being thin enough not to blur the lattice.
+            # SLAB_HALF=2 -> 5 planes.
+            SLAB_HALF = 2
+            for axis in range(3):
+                n = vol.shape[axis]
+                mid = n // 2
+                lo, hi = max(0, mid - SLAB_HALF), min(n, mid + SLAB_HALF + 1)
+                name = "zyx"[axis]
+                self.log_image(
+                    f"volume/slice_{name}_{channel}",
+                    np.take(vol, mid, axis=axis),
+                    iter,
+                    logger_cmap,
+                )
+                self.log_image(
+                    f"volume/slab_{name}_{channel}",
+                    np.take(vol, range(lo, hi), axis=axis).mean(axis=axis),
+                    iter,
+                    logger_cmap,
+                )
 
         # Plotting z1 and z3 vals
         fig, ax = plt.subplots()
