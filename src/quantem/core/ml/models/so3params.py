@@ -173,12 +173,29 @@ class SO3ParamR9SVD(nn.Module):
 
     @staticmethod
     def r9_to_rotmat(M: torch.Tensor) -> torch.Tensor:
-        """R9 (..., 3, 3) -> nearest SO(3) matrix via SVD+."""
-        U, _, Vh = torch.linalg.svd(M)
-        d = torch.det(U @ Vh)
-        diag = torch.ones(*M.shape[:-2], 3, device=M.device, dtype=M.dtype)
-        diag[..., 2] = d
-        return U @ (diag.unsqueeze(-1) * Vh)
+        """R9 (..., 3, 3) -> nearest SO(3) matrix via SVD+.
+
+        Forced to full precision with autocast disabled. Tomography.reconstruct
+        wraps the entire object forward in torch.autocast(dtype=torch.bfloat16)
+        (tomography.py:225), which makes the ``U @ Vh`` matmul below return
+        bfloat16 -- and torch.det's CUDA LU factorization has no bfloat16
+        kernel, so this raised
+
+            NotImplementedError: "lu_factor_cublas" not implemented for 'BFloat16'
+
+        on every GPU forward pass of any KPlanesTILTED/CPTilted model built with
+        so3_param_type="r9svd" (the default). The SVD-based projection is both
+        numerically delicate and completely negligible in cost -- it runs on T
+        (typically 4) 3x3 matrices per forward -- so there is nothing to gain
+        from letting autocast touch it.
+        """
+        with torch.autocast(device_type=M.device.type, enabled=False):
+            M = M.float()
+            U, _, Vh = torch.linalg.svd(M)
+            d = torch.det(U @ Vh)
+            diag = torch.ones(*M.shape[:-2], 3, device=M.device, dtype=M.dtype)
+            diag[..., 2] = d
+            return U @ (diag.unsqueeze(-1) * Vh)
 
     def as_matrix(self) -> torch.Tensor:
         return self.r9_to_rotmat(self.M)
