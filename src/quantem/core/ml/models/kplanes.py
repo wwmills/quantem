@@ -18,6 +18,25 @@ K-planes utility functions
 """
 
 
+def softplus_shifted(x: torch.Tensor) -> torch.Tensor:
+    """Default density activation: ``softplus(x - 1)``.
+
+    A module-level named function rather than the ``lambda`` this used to be,
+    because ``density_activation`` is stored as an instance attribute and
+    therefore has to survive pickling. ``Tomography.save`` ->
+    ``serialize._serialize_value`` -> ``torch.save`` pickles the object model by
+    reference, and a lambda has no importable qualname, so saving ANY KPlanes /
+    KPlanesTILTED / CPTilted model built with the default activation died with
+
+        _pickle.PicklingError: Can't pickle <function KPlanesTILTED.<lambda>>:
+        attribute lookup KPlanesTILTED.<lambda> on
+        quantem.core.ml.models.kplanes failed
+
+    Numerically identical to the lambda it replaced.
+    """
+    return F.softplus(x - 1)
+
+
 def grid_sample_wrapper(
     grid: torch.Tensor, coords: torch.Tensor, align_corners: bool = True
 ) -> torch.Tensor:
@@ -178,9 +197,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
         resolution: Sequence[int] = (200, 200, 200),
         multiscale_res_multipliers: Optional[Sequence[int]] = None,
         concat_features: bool = True,
-        density_activation: Callable = lambda x: F.softplus(
-            x - 1
-        ),  # Keep playing around with this and trunc_exp
+        density_activation: Callable = softplus_shifted,  # Keep playing around with this and trunc_exp
         # Hybrid MLP parameters
         use_hybrid_mlp: bool = False,
         hybrid_hidden_dim: int = 64,
@@ -308,10 +325,25 @@ def interpolate_ms_features_tilted(
     pts: torch.Tensor,  # (B, 3)
     ms_grids: nn.ParameterList,  # each grid: (3*T, C, H, W)
     rotation_matrices: torch.Tensor,  # (T, 3, 3)
+    interp_mode: str = "bilinear",
+    coupling_form: str = "prod",
 ) -> torch.Tensor:
     """
     Fully-vectorized multi-scale, multi-rotation K-Planes feature interpolation.
     Returns features of shape (B, C * T * num_scales).
+
+    interp_mode="bicubic" exists to suppress feature-plane grid imprint. Bilinear
+    grid_sample is C0 but not C1, so the derivative discontinuities at cell
+    boundaries stamp the plane pitch onto the reconstructed volume. Measured on
+    the au_disc_12nm 135-projection recon: 8.1x anisotropic power excess at the
+    coarse-plane pitch (85 cells over 341 voxels -> 4.01 voxel pitch, d=1.65 A),
+    concentrated at the discrete angles of the learned rotated frames, against
+    1.6x (i.e. isotropic, no structure) for an HSiren reconstruction of the same
+    data. Bicubic is C1 and removes the discontinuity at its source. It is
+    slower, and it can overshoot the input range -- harmless here since the
+    3-plane product feeds a softplus.
+
+    Default stays "bilinear" so existing runs and checkpoints are unchanged.
     """
     T = rotation_matrices.shape[0]
     B = pts.shape[0]
@@ -341,12 +373,23 @@ def interpolate_ms_features_tilted(
             plane_coef,
             coord_tensor,
             align_corners=True,
-            mode="bilinear",
+            mode=interp_mode,
             padding_mode="border",
         )  # (3T, C, B, 1)
 
-        # (3T, C, B) -> (T, 3, C, B) -> Hadamard across the "3" dim -> (T, C, B)
-        sampled = sampled.squeeze(-1).view(T, 3, C, B).prod(dim=1)
+        # (3T, C, B) -> (T, 3, C, B) -> couple across the "3" dim -> (T, C, B)
+        # coupling_form="prod" is the Hadamard product (default, original
+        # behaviour). "sum" is the additive coupling used by the collaborator's
+        # config; it pairs with a small grid init (init_range ~ 0.0-0.02),
+        # whereas a product needs the paper's 0.1-0.5 or the triple product
+        # underflows and starves the grid gradients.
+        sampled = sampled.squeeze(-1).view(T, 3, C, B)
+        if coupling_form == "prod":
+            sampled = sampled.prod(dim=1)
+        elif coupling_form == "sum":
+            sampled = sampled.sum(dim=1)
+        else:
+            raise ValueError(f"coupling_form must be prod/sum, got {coupling_form}")
 
         # (T, C, B) -> (B, T, C) -> (B, T*C) to concatenate rotations along feature dim
         per_scale_features.append(sampled.permute(2, 0, 1).reshape(B, T * C))
@@ -396,7 +439,7 @@ class KPlanesTILTED(KPlanes):
         M_features: int = 32,
         resolution: Sequence[int] = (200, 200, 200),
         multiscale_res_multipliers: Optional[Sequence[float]] = None,
-        density_activation: Callable = lambda x: F.softplus(x - 1),
+        density_activation: Callable = softplus_shifted,
         # TILTED parameters
         T: int = 4,
         tau_init: str = "random",
@@ -405,6 +448,9 @@ class KPlanesTILTED(KPlanes):
         hybrid_hidden_dim: int = 64,
         hybrid_num_layers: int = 2,
         so3_param_type: str = "r9svd",
+        interp_mode: str = "bilinear",
+        coupling_form: str = "prod",
+        init_range: Sequence[float] = (0.1, 0.5),
     ):
         self._td_type = "tilted"
         if input_coords_dims != 3:
@@ -435,13 +481,20 @@ class KPlanesTILTED(KPlanes):
         )
 
         self.T = T
+        if interp_mode not in ("bilinear", "bicubic", "nearest"):
+            raise ValueError(f"interp_mode must be bilinear/bicubic/nearest, got {interp_mode}")
+        self.interp_mode = interp_mode
+        if coupling_form not in ("prod", "sum"):
+            raise ValueError(f"coupling_form must be prod/sum, got {coupling_form}")
+        self.coupling_form = coupling_form
+        self.init_range = tuple(init_range)
 
         # ---- Rebuild grids: (3*T, M_features, H, W) per scale ----
         self.grids = nn.ParameterList()
         for res_mult in multiscale_res_multipliers:
             scaled_res = [int(r * res_mult) for r in resolution]
             plane = nn.Parameter(torch.empty(3 * T, M_features, scaled_res[1], scaled_res[0]))
-            nn.init.uniform_(plane, 0.1, 0.5)
+            nn.init.uniform_(plane, float(init_range[0]), float(init_range[1]))
             self.grids.append(plane)
 
         # ---- Rebuild sigma_net with the correct feature_dim ----
@@ -496,6 +549,10 @@ class KPlanesTILTED(KPlanes):
             pts=pts,
             ms_grids=self.grids,
             rotation_matrices=R,
+            # getattr, not self.interp_mode: checkpoints pickled before this
+            # option existed have no such attribute and must still load.
+            interp_mode=getattr(self, "interp_mode", "bilinear"),
+            coupling_form=getattr(self, "coupling_form", "prod"),
         )
         density_before_activation = self.sigma_net(features)
         return self.density_activation(density_before_activation)
@@ -663,7 +720,7 @@ class CPTilted(PPLR, TensorDecompositionModel):
         multiscale_res_multipliers: Optional[Sequence[int]] = None,
         T: int = 4,
         tau_init: str = "random",
-        density_activation: Callable = lambda x: F.softplus(x - 1),
+        density_activation: Callable = softplus_shifted,
         so3_param_type: str = "r9svd",
     ):
         super().__init__()
