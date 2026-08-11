@@ -1,4 +1,5 @@
 import os
+import time
 from pathlib import Path
 from typing import Literal, Self, Sequence
 
@@ -33,7 +34,6 @@ from quantem.tomography.tomography_base import TomographyBase
 from quantem.tomography.tomography_context import ReconstructionContext
 from quantem.tomography.tomography_opt import TomographyOpt
 
-import time
 
 class Tomography(TomographyOpt, TomographyBase):
     """
@@ -88,7 +88,7 @@ class Tomography(TomographyOpt, TomographyBase):
         gt_volume: torch.Tensor | np.ndarray | None = None,
         gt_defocus: torch.Tensor | np.ndarray | None = None,
         gt_stig: torch.Tensor | np.ndarray | None = None,
-        ):
+    ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
         I.e, auto-detection through the obj model type, while both share the same pose optimization.
@@ -194,7 +194,6 @@ class Tomography(TomographyOpt, TomographyBase):
 
         loss_func = get_loss_module(name=loss_type, dtype=self.obj_model.dtype, **loss_func_kwargs)
 
-
         pbar = tqdm(range(num_iter), disable=not self.verbose)
         for a0 in pbar:
             epoch_start_time = time.time()
@@ -238,14 +237,15 @@ class Tomography(TomographyOpt, TomographyBase):
                     # )
                     # In tomography.py reconstruction loop:
                     # all_coords = self.dset.get_coords(
-                    if hasattr(self.dset, 'ray_pattern'):
+                    if hasattr(self.dset, "ray_pattern"):
                         all_coords, probe_weights = self.dset.get_coords(
-                            batch, N, curr_num_samples_per_ray,
-                            ray_pattern = self.dset.ray_pattern
+                            batch, N, curr_num_samples_per_ray, ray_pattern=self.dset.ray_pattern
                         )
                     else:
                         all_coords = self.dset.get_coords(
-                            batch, N, curr_num_samples_per_ray,
+                            batch,
+                            N,
+                            curr_num_samples_per_ray,
                         )
                         probe_weights = None
 
@@ -264,6 +264,11 @@ class Tomography(TomographyOpt, TomographyBase):
                             curr_num_samples_per_ray,
                             len(batch["target_value"]),
                         )
+                    # Only TomographyFocalINRDataset carries a learnable dropoff, so
+                    # this is guarded rather than assumed -- the same duck-typing as
+                    # the ray_pattern branch above. No-op when none is attached.
+                    if hasattr(self.dset, "apply_dropoff"):
+                        integrated_densities = self.dset.apply_dropoff(integrated_densities)
 
                 pred = integrated_densities.float()
 
@@ -280,6 +285,11 @@ class Tomography(TomographyOpt, TomographyBase):
                 batch_consistency_loss = loss_func(pred, target)
 
                 soft_constraints_loss += self.dset.apply_soft_constraints()
+                # Zero unless a dropoff AND an anchor are configured. Required
+                # when a dropoff is active: object/curve scale is an exact
+                # degeneracy that no data term or regulariser can break.
+                if hasattr(self.dset, "apply_dropoff_anchor"):
+                    soft_constraints_loss += self.dset.apply_dropoff_anchor(all_densities)
 
                 epoch_soft_constraint_loss += soft_constraints_loss.detach()
 
@@ -296,12 +306,12 @@ class Tomography(TomographyOpt, TomographyBase):
                 # safety net against single-step blowups; does not by itself prevent
                 # the slower, many-epoch object-absorbs-wrong-defocus divergence (see
                 # the "defocus" cosine-decay scheduler / weight_decay fix for that).
-                if hasattr(self.dset, '_z_focus_params') and self.dset.learn_defocus:
+                if hasattr(self.dset, "_z_focus_params") and self.dset.learn_defocus:
                     torch.nn.utils.clip_grad_norm_(self.dset._z_focus_params, max_norm=1.0)
 
                 self.step_optimizers()
 
-                if hasattr(self.dset, '_z_focus_params') and self.dset.learn_defocus:
+                if hasattr(self.dset, "_z_focus_params") and self.dset.learn_defocus:
                     with torch.no_grad():
                         self.dset._z_focus_params.clamp_(-2.0, 2.0)
 
@@ -351,7 +361,6 @@ class Tomography(TomographyOpt, TomographyBase):
             self.step_schedulers(loss=total_loss)
             # TODO: Maybe reorganize the losses so that the order makes sense lol.
 
-
             avg_val_loss = None
             if self.val_dataloader is not None:
                 print("Validating...")
@@ -367,19 +376,23 @@ class Tomography(TomographyOpt, TomographyBase):
                             enabled=True,
                         ):
                             # Handle probe weights in validation too
-                            if hasattr(self.dset, 'ray_pattern'):
+                            if hasattr(self.dset, "ray_pattern"):
                                 all_coords, probe_weights = self.dset.get_coords(
-                                    batch, N, curr_num_samples_per_ray,
-                                    ray_pattern=self.dset.ray_pattern
+                                    batch,
+                                    N,
+                                    curr_num_samples_per_ray,
+                                    ray_pattern=self.dset.ray_pattern,
                                 )
                             else:
                                 all_coords = self.dset.get_coords(
-                                    batch, N, curr_num_samples_per_ray,
+                                    batch,
+                                    N,
+                                    curr_num_samples_per_ray,
                                 )
                                 probe_weights = None
 
                             all_densities = self.obj_model.forward(all_coords)
-                            
+
                             # Use probe weights if available
                             if probe_weights is not None:
                                 integrated_densities = self.dset.integrate_rays_with_probe_weights(
@@ -394,6 +407,10 @@ class Tomography(TomographyOpt, TomographyBase):
                                     curr_num_samples_per_ray,
                                     len(batch["target_value"]),
                                 )
+                            if hasattr(self.dset, "apply_dropoff"):
+                                integrated_densities = self.dset.apply_dropoff(
+                                    integrated_densities
+                                )
 
                             target = (
                                 batch["target_value"].to(self.device, non_blocking=True).float()
@@ -406,47 +423,6 @@ class Tomography(TomographyOpt, TomographyBase):
                             val_loss += batch_val_loss.detach()
 
                     avg_val_loss = val_loss.item() / len(self.val_dataloader)
-
-
-
-
-
-
-            # avg_val_loss = None
-            # if self.val_dataloader is not None:
-            #     print("Validating...")
-            #     self.obj_model.model.eval()
-            #     self.dset.eval()
-            #     with torch.no_grad():
-            #         val_loss = torch.tensor(0.0, device=self.device)
-
-            #         for batch in self.val_dataloader:
-            #             with torch.autocast(
-            #                 device_type=self.device.type,
-            #                 dtype=torch.bfloat16,
-            #                 enabled=True,
-            #             ):
-            #                 all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
-
-            #                 all_densities = self.obj_model.forward(all_coords)
-
-            #                 integrated_densities = self.dset.integrate_rays(
-            #                     all_densities,
-            #                     curr_num_samples_per_ray,
-            #                     len(batch["target_value"]),
-            #                 )
-
-            #                 target = (
-            #                     batch["target_value"].to(self.device, non_blocking=True).float()
-            #                 )
-
-            #                 batch_val_loss = torch.nn.functional.mse_loss(
-            #                     integrated_densities, target
-            #                 )
-
-            #                 val_loss += batch_val_loss.detach()
-
-            #         avg_val_loss = val_loss.item() / len(self.val_dataloader)
 
             metrics = torch.tensor(
                 [total_loss, consistency_loss, epoch_soft_constraint_loss], device=self.device
@@ -469,19 +445,18 @@ class Tomography(TomographyOpt, TomographyBase):
                 self._val_losses.append(avg_val_loss)
 
             if self.logger is not None:
-
                 convergence_angle = None
                 stig_2 = None
-                
-                if hasattr(self.dset, '_convergence_angle_params'):
+
+                if hasattr(self.dset, "_convergence_angle_params"):
                     convergence_angle = self.dset._convergence_angle_params[0]
-                
-                if hasattr(self.dset, '_stig_2_params'):
+
+                if hasattr(self.dset, "_stig_2_params"):
                     stig_2_tensor = self.dset._stig_2_params  # Scaled values
                     # Scale back to physical units for logging
-                    scale = self.dset.STIG_SCALE if hasattr(self.dset, 'STIG_SCALE') else 1.0
+                    scale = self.dset.STIG_SCALE if hasattr(self.dset, "STIG_SCALE") else 1.0
                     stig_2 = (stig_2_tensor[0].item() * scale, stig_2_tensor[1].item() * scale)
-                    
+
                 if (
                     self.logger.log_images_every > 0
                     and self.num_epochs % self.logger.log_images_every == 0
@@ -493,11 +468,11 @@ class Tomography(TomographyOpt, TomographyBase):
                             pred_volume=pred_full,
                             dataset_model=self.dset,
                             iter=self.num_epochs,
-                            gt_z_focus = gt_defocus
+                            gt_z_focus=gt_defocus,
                         )
                     pbar.set_description(
                         f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e} | Images Logged"
-                                )
+                    )
                     # if hasattr(self.dset, '_z_focus_params'):
                     #     print("Logging defocus...")
                     #     self.logger.log_defocus(
@@ -553,7 +528,7 @@ class Tomography(TomographyOpt, TomographyBase):
         """
         Generate forward projections using the ray-based model (like reconstruct but single pass).
         Uses the dataloader infrastructure for proper batching and DDP.
-        
+
         Parameters:
         -----------
         phantom_vol : ndarray or tensor
@@ -568,7 +543,7 @@ class Tomography(TomographyOpt, TomographyBase):
             Number of samples along each ray
         save_path : str, optional
             Path to save the generated tilt series (rank 0 only)
-            
+
         Returns:
         --------
         tilt_series : ndarray or None
@@ -576,24 +551,26 @@ class Tomography(TomographyOpt, TomographyBase):
         """
         import torch.nn.functional as F
         from tqdm import tqdm
-        
+
         # Convert to torch if needed
         if isinstance(phantom_vol, np.ndarray):
             phantom_vol = torch.from_numpy(phantom_vol).float()
         if isinstance(true_focus, np.ndarray):
             true_focus = torch.from_numpy(true_focus).float()
-        
+
         phantom_vol = phantom_vol.to(self.device)
         true_focus = true_focus.to(self.device)
-        
+
         N = phantom_vol.shape[0]
         ny, nx = phantom_vol.shape[1], phantom_vol.shape[2]
         n_tilts = len(self.dset.tilt_angles)
-        
+
         if self.global_rank == 0:
-            print(f"Generating forward projections with {self.dset.num_rays} rays, {num_samples_per_ray} samples/ray")
+            print(
+                f"Generating forward projections with {self.dset.num_rays} rays, {num_samples_per_ray} samples/ray"
+            )
             print(f"Using {self.world_size} GPUs, batch size {batch_size}")
-        
+
         # Sample phantom using grid_sample (efficient trilinear interpolation)
         def sample_phantom(coords):
             """Sample phantom at given coordinates."""
@@ -601,17 +578,13 @@ class Tomography(TomographyOpt, TomographyBase):
             grid = coords.view(1, n_points, 1, 1, 3)
             phantom_5d = phantom_vol.unsqueeze(0).unsqueeze(0)
             sampled = F.grid_sample(
-                phantom_5d, 
-                grid, 
-                mode='bilinear',
-                padding_mode='border',
-                align_corners=True
+                phantom_5d, grid, mode="bilinear", padding_mode="border", align_corners=True
             )
             return sampled.view(n_points)
-        
+
         # Override focus in dataset with ground truth
         self.dset._z_focus_params = torch.nn.Parameter(true_focus)
-        
+
         # Set up dataloader if not already done
         if not hasattr(self, "dataloader"):
             self.dataloader, self.sampler, _, _ = self.setup_dataloader(
@@ -619,25 +592,25 @@ class Tomography(TomographyOpt, TomographyBase):
                 batch_size,
                 num_workers=num_workers,
                 val_fraction=0.0,
-                drop_last = False,
+                drop_last=False,
             )
-        
-        pixel_coverage = torch.zeros((n_tilts, ny, nx), dtype=torch.int32, device=self.device)
 
+        pixel_coverage = torch.zeros((n_tilts, ny, nx), dtype=torch.int32, device=self.device)
 
         # Initialize storage for projections
         # Each GPU will accumulate its batches into full projections
         projections = torch.zeros((n_tilts, ny, nx), device=self.device)
-        
+
         if self.global_rank == 0:
             print("Processing batches...")
-        
+
         # Single forward pass through all data (like one epoch of reconstruct)
         self.dset.eval()  # Not training, just forward pass
-        
+
         with torch.no_grad():  # No gradients needed
-            pbar = tqdm(self.dataloader, disable=(self.global_rank != 0), desc="Forward projection")
-            
+            pbar = tqdm(
+                self.dataloader, disable=(self.global_rank != 0), desc="Forward projection"
+            )
 
             batch_count = 0
             pixel_count = 0
@@ -651,13 +624,12 @@ class Tomography(TomographyOpt, TomographyBase):
                 ):
                     # Get ray coordinates and probe weights
                     all_coords, probe_weights = self.dset.get_coords(
-                        batch, N, num_samples_per_ray,
-                        ray_pattern=self.dset.ray_pattern
+                        batch, N, num_samples_per_ray, ray_pattern=self.dset.ray_pattern
                     )
-                    
+
                     # Sample phantom at ray coordinates
                     all_densities = sample_phantom(all_coords)
-                    
+
                     # Integrate rays
                     if probe_weights is not None:
                         integrated_densities = self.dset.integrate_rays_with_probe_weights(
@@ -672,21 +644,24 @@ class Tomography(TomographyOpt, TomographyBase):
                             num_samples_per_ray,
                             len(batch["target_value"]),
                         )
-                    
+                    if hasattr(self.dset, "apply_dropoff"):
+                        integrated_densities = self.dset.apply_dropoff(integrated_densities)
+
                     # Place predictions back into full projections
                     # batch contains pixel_i, pixel_j, projection_idx
                     pixel_i = batch["pixel_i"].to(self.device, non_blocking=True)
                     pixel_j = batch["pixel_j"].to(self.device, non_blocking=True)
                     proj_idx = batch["projection_idx"].to(self.device, non_blocking=True)
-                    
+
                     # Scatter predictions to correct positions
                     for k in range(len(integrated_densities)):
-                        projections[proj_idx[k], pixel_i[k], pixel_j[k]] = integrated_densities[k].float()
+                        projections[proj_idx[k], pixel_i[k], pixel_j[k]] = integrated_densities[
+                            k
+                        ].float()
                         pixel_coverage[proj_idx[k], pixel_i[k], pixel_j[k]] += 1  # Track coverage
 
         if self.global_rank == 0:
             print(f"Rank 0 processed {pixel_count} pixels in {batch_count} batches")
-    
 
         # Gather all projections to rank 0
         if self.world_size > 1:
@@ -695,45 +670,51 @@ class Tomography(TomographyOpt, TomographyBase):
             dist.all_reduce(pixel_coverage, op=dist.ReduceOp.SUM)
             dist.all_reduce(projections, op=dist.ReduceOp.SUM)
             dist.barrier()
-            
+
             # All-reduce to combine partial results from all GPUs
             dist.all_reduce(projections, op=dist.ReduceOp.SUM)
-            
+
             # Barrier to ensure completion
             dist.barrier()
-        
+
         # Convert to numpy and save on rank 0
         if self.global_rank == 0:
-
             dead_pixels = (pixel_coverage == 0).sum().item()
             duplicate_pixels = (pixel_coverage > 1).sum().item()
             total_pixels = n_tilts * ny * nx
-            
-            print(f"\nPixel Coverage Diagnostics:")
+
+            print("\nPixel Coverage Diagnostics:")
             print(f"  Total pixels: {total_pixels}")
-            print(f"  Dead pixels (coverage=0): {dead_pixels} ({100*dead_pixels/total_pixels:.2f}%)")
-            print(f"  Duplicate pixels (coverage>1): {duplicate_pixels} ({100*duplicate_pixels/total_pixels:.2f}%)")
-            print(f"  Coverage min/max/mean: {pixel_coverage.min().item()}/{pixel_coverage.max().item()}/{pixel_coverage.float().mean().item():.2f}")
-            
+            print(
+                f"  Dead pixels (coverage=0): {dead_pixels} ({100 * dead_pixels / total_pixels:.2f}%)"
+            )
+            print(
+                f"  Duplicate pixels (coverage>1): {duplicate_pixels} ({100 * duplicate_pixels / total_pixels:.2f}%)"
+            )
+            print(
+                f"  Coverage min/max/mean: {pixel_coverage.min().item()}/{pixel_coverage.max().item()}/{pixel_coverage.float().mean().item():.2f}"
+            )
+
             # Fix dead pixels by averaging neighbors (simple inpainting)
             if dead_pixels > 0:
                 print("Fixing dead pixels with neighbor interpolation...")
                 projections_np = projections.cpu().numpy()
-                
+
                 for t in range(n_tilts):
                     dead_mask = (pixel_coverage[t] == 0).cpu().numpy()
                     if dead_mask.any():
                         # Simple average of 4-neighbors
-                        from scipy.ndimage import binary_dilation, convolve
+                        from scipy.ndimage import convolve
+
                         kernel = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]]) / 4
-                        
+
                         for _ in range(3):  # Iterate to fill isolated pixels
-                            neighbor_avg = convolve(projections_np[t], kernel, mode='constant')
+                            neighbor_avg = convolve(projections_np[t], kernel, mode="constant")
                             projections_np[t][dead_mask] = neighbor_avg[dead_mask]
                             dead_mask = (projections_np[t] == 0) & dead_mask  # Update mask
             else:
                 projections_np = projections.cpu().numpy()
-            
+
             # projections_np = projections.cpu().numpy()
             # Handle duplicate pixels (average them)
             if duplicate_pixels > 0:
@@ -742,8 +723,6 @@ class Tomography(TomographyOpt, TomographyBase):
                 coverage_np[coverage_np == 0] = 1  # Avoid division by zero
                 projections_np = projections_np / coverage_np
 
-
-
             if save_path is not None:
                 np.save(save_path, projections_np)
                 print(f"Saved forward projections to {save_path}")
@@ -751,9 +730,6 @@ class Tomography(TomographyOpt, TomographyBase):
             return projections_np
         else:
             return None
-
-
-
 
     # --- Helper Functions ---
 
