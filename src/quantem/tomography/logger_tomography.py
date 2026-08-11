@@ -172,25 +172,6 @@ class LoggerTomography(LoggerBase):
         vmax = vol.max()
         return (vol - vmin) / (vmax - vmin + 1e-8)
 
-    def log_defocus(
-        self,
-        dataset_model: DatasetModelType,
-        gt_defocus,
-    ):
-        """
-        Accepts GT as torch.Tensor or numpy array.
-        """
-
-        if gt_defocus is not None:
-            with torch.no_grad():
-                if isinstance(gt_defocus, torch.Tensor):
-                    gt = gt_defocus.detach().cpu().numpy()
-                else:
-                    gt = gt_defocus
-
-        assert dataset_model.hasattr("_z_focus_params")
-        found_defocus = dataset_model._z_focus_params
-
         # mean_ssim = float(np.mean(ssim_vals))
         # self.log_scalar("metrics/ssim", mean_ssim, step)
 
