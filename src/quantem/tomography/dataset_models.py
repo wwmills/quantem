@@ -3416,8 +3416,29 @@ class TomographyFocalINRDataset(TomographyINRDataset):
         self._z3_params = nn.Parameter(self._z3_angles.to(device))
         self._shifts_params = nn.Parameter(self._shifts.to(device))
 
-        if self._clever_k_positions is not None:
-            self._clever_k_positions = self._clever_k_positions.to(device)
+        # _convergence_angle_params was never moved here. It went unnoticed because
+        # no ray pattern used it device-sensitively -- "clever" reads
+        # _clever_k_positions instead, and the angle patterns take their device
+        # from pixel_i. "clever_probe" derives its ray device from this tensor, so
+        # leaving it on CPU produced a cuda/cpu mismatch in create_batch_rays.
+        if self.learn_convergence:
+            self._convergence_angle_params = nn.Parameter(
+                self._convergence_angle_params.to(device)
+            )
+        else:
+            self.register_buffer(
+                "_convergence_angle_params", self._convergence_angle_params.to(device)
+            )
+
+        for _name in (
+            "_clever_k_positions",
+            "_sunflower_positions",
+            "_hexagonal_positions",
+            "_fibonacci_positions",
+        ):
+            _t = getattr(self, _name, None)
+            if _t is not None:
+                setattr(self, _name, _t.to(device))
 
         if self.learn_defocus:
             self._z_focus_params = nn.Parameter(self._z_focus_params.to(device))
