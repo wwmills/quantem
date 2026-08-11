@@ -39,8 +39,36 @@ class DDPMixin:
             self.global_rank = 0
             self.local_rank = 0
 
-            if torch.cuda.is_available():
-                device = torch.device("cuda:0" if device is None else device)
+            # This branch used to be
+            #     device = torch.device("cuda:0" if device is None else device)
+            #     torch.cuda.set_device(device.index)
+            # which had three problems, all reproducible on a single-GPU node:
+            #
+            #  1. device="cuda" -- the DEFAULT on Tomography.from_models,
+            #     TomographyBase and TomographyLite -- has index None, so
+            #     set_device(None) raised ValueError. The documented default
+            #     could not be used.
+            #  2. device="cpu" was ignored whenever a GPU was visible, then hit
+            #     the same ValueError. Asking for CPU on a GPU node was
+            #     impossible, which is why CPU smoke tests had to be run under
+            #     an salloc.
+            #  3. device=None hardcoded cuda:0, ignoring CUDA_VISIBLE_DEVICES
+            #     pinning and any set_device the caller had already done.
+            #
+            # An explicit indexed device still resolves to exactly itself, so
+            # every existing GPU call site is unchanged.
+            requested = torch.device(device) if device is not None else None
+
+            if requested is not None and requested.type != "cuda":
+                # Honour cpu (or anything else asked for) rather than overriding it.
+                device = requested
+            elif torch.cuda.is_available():
+                if requested is not None and requested.index is not None:
+                    device = requested
+                else:
+                    # current_device() respects CUDA_VISIBLE_DEVICES and any
+                    # earlier set_device; a literal 0 respects neither.
+                    device = torch.device("cuda", torch.cuda.current_device())
                 torch.cuda.set_device(device.index)
             else:
                 device = torch.device("cpu")
