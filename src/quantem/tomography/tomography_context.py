@@ -1,8 +1,9 @@
 from dataclasses import dataclass
 from typing import Optional
-from quantem.core.ml.constraints import BaseContext
 
 import torch
+
+from quantem.core.ml.constraints import BaseContext
 
 
 @dataclass

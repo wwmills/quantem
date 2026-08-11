@@ -1049,18 +1049,63 @@ class ObjectTensorDecomp(ObjectINR):
         is_tilted = model.tilted
         per_level = []
 
-        for p in model.grids:
-            # p: (3*T, C, H, W) for TILTED, (3, C, H, W) for KPlanes
-            dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
-            dw = (p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
-            per_plane = dh + dw  # (3*T,) or (3,)
+        # QUANTEM_TV_PLANE_NORM -- per-scale weighting, added 2026-08-08.
+        #
+        #   "mean"    (default) historical behaviour, every prior run reproduces
+        #   "percell" equalise the gradient reaching one PLANE CELL across scales
+        #
+        # Why "percell" exists: the .mean(dim=(1,2,3)) below normalises each
+        # scale by its own C*H*W, so with multiscale [0.25,0.5,1.0] a cell of the
+        # 341-cell plane receives (341/85)^2 = 16x LESS gradient than a cell of
+        # the 85-cell plane. The scale that carries the Nyquist-rate content --
+        # and that README section 13.1 measures as the noisiest -- is the one the
+        # penalty barely touches. Weighting each level by its area relative to
+        # the FINEST level makes the per-cell gradient equal while leaving the
+        # finest level's magnitude unchanged, so the section 8 tv_plane
+        # calibration (5.666e-7 ~ 10 % of the data loss) stays approximately
+        # valid instead of needing a ~1e6 rescale as a bare .sum() would.
+        _norm = os.environ.get("QUANTEM_TV_PLANE_NORM", "mean")
+        if _norm not in ("mean", "percell"):
+            raise ValueError(f"QUANTEM_TV_PLANE_NORM must be mean/percell, got {_norm}")
+        _area_max = max(int(g.shape[2]) * int(g.shape[3]) for g in model.grids)
 
-            if is_tilted:
-                T = model.T
-                per_rotation = per_plane.view(T, 3).sum(dim=1)  # sum 3 planes per rotation
-                level_tv = per_rotation.mean()  # avg across rotations
+        # With an anisotropic resolution the three planes of a scale differ in
+        # shape and cannot share a tensor, so kplanes.py stores them as three
+        # separate parameters per scale rather than one packed (3*T, C, H, W).
+        # getattr: checkpoints pickled before that fix have no such attribute
+        # and were necessarily packed.
+        _packed = getattr(model, "planes_packed", True)
+        _grids = list(model.grids)
+        _stride = 1 if _packed else 3
+
+        for s in range(0, len(_grids), _stride):
+            entries = _grids[s : s + _stride]
+            # packed:   one p of (3*T, C, H, W) for TILTED, (3, C, H, W) for KPlanes
+            # unpacked: three p of (T, C, H, W)     "     , (1, C, H, W)     "
+            per_entry = []
+            for p in entries:
+                dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
+                dw = (p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
+                per_entry.append(dh + dw)
+
+            if _packed:
+                per_plane = per_entry[0]  # (3*T,) or (3,)
+                if is_tilted:
+                    # sum the 3 planes of each rotation, then average rotations
+                    level_tv = per_plane.view(model.T, 3).sum(dim=1).mean()
+                else:
+                    level_tv = per_plane.sum()
             else:
-                level_tv = per_plane.sum()
+                # per_entry[p] is (T,) or (1,) -- summing across the list is the
+                # same "sum 3 planes per rotation" reduction as the view above.
+                per_rotation = torch.stack(per_entry, dim=0).sum(dim=0)
+                level_tv = per_rotation.mean() if is_tilted else per_rotation.sum()
+
+            if _norm == "percell":
+                # The three planes of an anisotropic scale have different areas;
+                # weight the scale by its largest, which is the packed value.
+                _area = max(int(p.shape[2]) * int(p.shape[3]) for p in entries)
+                level_tv = level_tv * (_area / float(_area_max))
 
             per_level.append(level_tv)
 

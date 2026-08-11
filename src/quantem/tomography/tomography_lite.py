@@ -19,7 +19,7 @@ from quantem.tomography.dataset_models import (
 from quantem.tomography.logger_tomography import LoggerTomography
 from quantem.tomography.object_models import ObjConstraintsType, ObjectINR, ObjectPixelated
 from quantem.tomography.tomography import Tomography, TomographyConventional
-import torch
+
 
 class TomographyLiteINR(Tomography):
     """

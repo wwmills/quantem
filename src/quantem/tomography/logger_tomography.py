@@ -1,12 +1,12 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from skimage.metrics import structural_similarity as ssim
 
 from quantem.core.ml.logger import LoggerBase
 from quantem.tomography.dataset_models import DatasetModelType
 from quantem.tomography.object_models import ObjectModelType
-import numpy as np
-from skimage.metrics import structural_similarity as ssim
+
 
 class LoggerTomography(LoggerBase):
     """
@@ -53,7 +53,7 @@ class LoggerTomography(LoggerBase):
             convergence_mrad = convergence_angle * 1000
             self.writer.add_scalar("w/convergence_angle_mrad", convergence_mrad, iter)
             self.writer.add_scalar("w/convergence_angle_rad", convergence_angle, iter)
-        
+
         if stig_2 is not None:
             if gt_stig is not None:
                 self.writer.add_scalar("w/gt_astigmatism_A1x", gt_stig[0], iter)
@@ -61,9 +61,8 @@ class LoggerTomography(LoggerBase):
             self.writer.add_scalar("w/astigmatism_A1x", stig_2[0], iter)
             self.writer.add_scalar("w/astigmatism_A1y", stig_2[1], iter)
             # Also log magnitude
-            stig_mag = (stig_2[0]**2 + stig_2[1]**2)**0.5
+            stig_mag = (stig_2[0] ** 2 + stig_2[1] ** 2) ** 0.5
             self.writer.add_scalar("w/astigmatism_magnitude", stig_mag, iter)
-
 
     def log_iter_images(
         self,
@@ -175,7 +174,7 @@ class LoggerTomography(LoggerBase):
 
     def log_defocus(
         self,
-        dataset_model:DatasetModelType,
+        dataset_model: DatasetModelType,
         gt_defocus,
     ):
         """
@@ -189,8 +188,8 @@ class LoggerTomography(LoggerBase):
                 else:
                     gt = gt_defocus
 
-        assert dataset_model.hasattr('_z_focus_params')
-        found_defocus =dataset_model._z_focus_params
+        assert dataset_model.hasattr("_z_focus_params")
+        found_defocus = dataset_model._z_focus_params
 
         # mean_ssim = float(np.mean(ssim_vals))
         # self.log_scalar("metrics/ssim", mean_ssim, step)
@@ -215,13 +214,10 @@ class LoggerTomography(LoggerBase):
 
         assert pred.shape == gt.shape
 
-        gt_t = gt.transpose(2,0,1)
+        gt_t = gt.transpose(2, 0, 1)
         pred_t = pred.transpose(0, 2, 1)
 
-        ssim_vals = [
-            ssim(gt_t[i], pred_t[i], data_range=1.0)
-            for i in range(pred_t.shape[0])
-        ]
+        ssim_vals = [ssim(gt_t[i], pred_t[i], data_range=1.0) for i in range(pred_t.shape[0])]
 
         mean_ssim = float(np.mean(ssim_vals))
         self.log_scalar("metrics/ssim", mean_ssim, step)
