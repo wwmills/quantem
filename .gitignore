@@ -179,6 +179,10 @@ cython_debug/
 # jupyter notebooks
 *.ipynb
 ipynb-playground/
+# ...except the ones under examples/, which are the point of that directory -- a Colab link can
+# only open a notebook that is actually in the repo.  Commit them **without outputs**: an executed
+# notebook carrying saved ipympl widget state runs to ~10 MB and is unreviewable in a diff.
+!examples/**/*.ipynb
 
 # zip files
 *.zip
