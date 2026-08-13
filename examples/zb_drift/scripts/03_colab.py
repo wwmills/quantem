@@ -63,14 +63,19 @@ if IN_COLAB:
     _run(sys.executable, "-m", "pip", "install", "-q", CLONE, "ncempy", "ipympl")
 
 # zbkit is not part of the quantem package -- it ships beside it in examples/ and is imported from
-# the clone rather than installed.
-ZBKIT_DIR = CLONE / "examples" / "zb_drift"
-if (ZBKIT_DIR / "zbkit").exists():
-    sys.path.insert(0, str(ZBKIT_DIR))
-elif (Path.cwd() / "zbkit").exists():        # running from the project folder, not Colab
-    sys.path.insert(0, str(Path.cwd()))
+# the clone rather than installed.  Three places it can legitimately be, in order: the Colab clone;
+# the working directory (this notebook opened from examples/zb_drift, or from the project folder);
+# and beside this file, which is the case when the percent-format source is run as a script from
+# somewhere else entirely.
+_here = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+CANDIDATES = [CLONE / "examples" / "zb_drift", Path.cwd(), _here, _here.parent]
+for _d in CANDIDATES:
+    if (_d / "zbkit").exists():
+        sys.path.insert(0, str(_d))
+        break
 else:
-    raise RuntimeError(f"zbkit not found -- looked in {ZBKIT_DIR} and {Path.cwd()}")
+    raise RuntimeError("zbkit not found -- looked in:\n  "
+                       + "\n  ".join(str(d) for d in CANDIDATES))
 print("zbkit path:", sys.path[0])
 
 # %% [markdown]
