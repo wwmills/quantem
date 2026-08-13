@@ -47,12 +47,14 @@ dependencies = [
   "torchmetrics>=1.7.3",
   "torchsummary>=1.5.1",
   "optuna>=4.5.0",
-  # imported unconditionally by quantem/imaging/drift.py, which quantem/__init__.py imports,
-  # so `import quantem` raises ModuleNotFoundError without it.  It was only ever present as an
-  # ad-hoc install in the dev venv -- absent from both this list and uv.lock -- so any fresh
-  # `pip install` of the package was broken.  Verified against 0.8.3; the floor is untested.
-  "kornia",
 ]
+
+[project.optional-dependencies]
+# kornia is used only by the torch backends: bilinear_kde_torch's gaussian blur and
+# _optimize_affine_pytorch's distance transform.  Both import it lazily, so the numpy
+# paths -- which is everything the drift/bond workflow uses -- run without it.
+# Install with `pip install -e ".[torch-backends]"` if you need those.
+torch-backends = ["kornia"]
 
 [tool.hatch.build.targets.sdist]
 # hatchling always includes:

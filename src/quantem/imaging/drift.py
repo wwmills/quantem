@@ -1,7 +1,6 @@
 import warnings
 from collections.abc import Sequence
 
-import kornia as K
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -1096,6 +1095,10 @@ class DriftCorrection(AutoSerialize):
         For parameter descriptions, see align_affine.
         """
         device = get_device()
+
+        # kornia is a torch-path-only dependency; see bilinear_kde_torch. Imported
+        # here so it cannot break `import quantem` for the numpy backends.
+        import kornia as K
 
         # Generate the torch interpolator for all images
         interpolator_torch = []

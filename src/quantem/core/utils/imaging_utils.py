@@ -3,7 +3,6 @@
 import math
 from typing import Optional, Tuple
 
-import kornia as K
 import numpy as np
 import torch
 from numpy.typing import NDArray
@@ -555,6 +554,12 @@ def bilinear_kde_torch(
     # pix_output = pix_output.reshape(output_shape)
     pix_count = torch.reshape(pix_count, output_shape)
     pix_output = torch.reshape(pix_output, output_shape)
+
+    # Imported here rather than at module scope: kornia is only needed by the torch
+    # paths, and a top-level import made `import quantem` fail outright for anyone
+    # who did not have it -- which was everyone doing a fresh `pip install`, since
+    # it was absent from the dependency list.
+    import kornia as K
 
     kernel_size = 5
 
