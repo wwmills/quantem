@@ -47,6 +47,11 @@ dependencies = [
   "torchmetrics>=1.7.3",
   "torchsummary>=1.5.1",
   "optuna>=4.5.0",
+  # imported unconditionally by quantem/imaging/drift.py, which quantem/__init__.py imports,
+  # so `import quantem` raises ModuleNotFoundError without it.  It was only ever present as an
+  # ad-hoc install in the dev venv -- absent from both this list and uv.lock -- so any fresh
+  # `pip install` of the package was broken.  Verified against 0.8.3; the floor is untested.
+  "kornia",
 ]
 
 [tool.hatch.build.targets.sdist]
