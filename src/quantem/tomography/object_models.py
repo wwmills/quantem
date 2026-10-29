@@ -1,4 +1,3 @@
-import os
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
@@ -499,16 +498,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         )
 
         obj_model.setup_distributed(device=device)
-        # Use obj_model.device (resolved by setup_distributed just above), not the
-        # raw `device` param -- under torchrun, setup_distributed ignores/overrides
-        # a "cpu" (or any) default and sets the real per-rank cuda:N device. Passing
-        # the stale literal `device` string here used to be harmless only because
-        # ObjectINR.to()'s world_size>1 branch was a no-op when already DDP-wrapped
-        # (see the bugfix in .to() above); now that .to() actually re-places the
-        # model, calling it with the wrong device would move params back to CPU
-        # while distribute_model's DDP(..., device_ids=[local_rank]) still expects
-        # them on that rank's GPU.
-        obj_model.to(obj_model.device)
+        obj_model.to(obj_model.device)  # device resolved by setup_distributed
         return obj_model
 
     # --- Properties ---
@@ -779,29 +769,20 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
 
     def create_volume(self, return_vol: bool = False):
-        # Generalized to a possibly-anisotropic (Nx, Ny, Nz) shape -- for the
-        # existing cubic case (Nx == Ny == Nz) this is numerically identical
-        # to the old hardcoded-cube behavior.
-        Nx, Ny, Nz = self._shape
+        Nx, Ny, Nz = self._shape  # per-axis grid; identical to the old cube when Nx == Ny == Nz
         with torch.no_grad():
-            x_1d = torch.linspace(-1, 1, Nx)
-            y_1d = torch.linspace(-1, 1, Ny)
-            z_1d = torch.linspace(-1, 1, Nz)
-            x, y, z = torch.meshgrid(x_1d, y_1d, z_1d, indexing="ij")
+            x, y, z = torch.meshgrid(
+                torch.linspace(-1, 1, Nx), torch.linspace(-1, 1, Ny), torch.linspace(-1, 1, Nz),
+                indexing="ij",
+            )
             inputs = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
-            # Unwrap DDP too, not just DataParallel -- create_volume calls the raw
-            # model directly (per-rank, on an uneven grid subset, then all_gathers),
-            # which is incompatible with DDP's forward hooks (expects every rank to
-            # call forward in lockstep with a matching batch); calling the DDP
-            # wrapper itself here manifests as a device-mismatch error inside the
-            # model's own layers.
             model = (
                 self.model.module
                 if isinstance(self.model, (nn.DataParallel, nn.parallel.DistributedDataParallel))
                 else self.model
             )
 
-            inference_batch_size = 5 * Ny * Nz  # ~5 x-slices per batch, same intent as before
+            inference_batch_size = 5 * Ny * Nz
             total_samples = Nx * Ny * Nz
             samples_per_gpu = total_samples // self.world_size
             remainder = total_samples % self.world_size
@@ -882,53 +863,20 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     def to(self, device: str | torch.device):  # pyright: ignore[reportIncompatibleMethodOverride] -> better to do this device change
         if isinstance(device, str):
             device = torch.device(device)
-
-        # Tomography.reconstruct() calls obj_model.to(self.device) unconditionally on
-        # every single call (once per warmup sub-phase, once per Phase-2 chunk, ...).
-        # Without this guard, the world_size>1 branch below tears down and rebuilds the
-        # DistributedDataParallel wrapper (incl. a full parameter broadcast) every time,
-        # even when the device hasn't changed and the model is already correctly
-        # wrapped -- pure wasted work on every reconstruct() call.
         already_wrapped = isinstance(self._model, torch.nn.parallel.DistributedDataParallel)
-        # Checking the cached self._device attribute alone is not enough: after
-        # Tomography.from_file() deserializes a checkpoint, torch.load(...,
-        # map_location="cpu") forces the actual parameter tensors onto CPU
-        # regardless of what self._device says (that plain Python attribute
-        # round-trips through pickling unchanged, so it still reads the
-        # pre-save device). Without also checking real parameter placement,
-        # this guard wrongly short-circuits and skips the .to(device) call
-        # below, leaving weights stranded on CPU while inputs are on GPU --
-        # confirmed via a reproducible "Expected all tensors to be on the same
-        # device" crash on the very next reconstruct() call after a reload.
         actual_device = next(self._model.parameters()).device
-        already_correct = (
+        if (
             getattr(self, "_device", None) == device
             and actual_device == device
             and (already_wrapped if self.world_size > 1 else not already_wrapped)
-        )
-        if already_correct:
+        ):
             return
-
         self._device = device
         if self.world_size == 1:
             self._model = self._model.to(device)
         else:
-            # Bug fix: previously, if self._model was ALREADY DistributedDataParallel
-            # (e.g. after Tomography.from_file() deserializes a checkpoint that was
-            # saved DDP-wrapped), this branch was a no-op -- it never moved the
-            # underlying parameters to `device`, so a resumed model's weights stayed
-            # on CPU (deserialization defaults to CPU) while later code assumed they
-            # were on the correct GPU, surfacing as a device-mismatch error deep in
-            # the model's own layers. Also, the old code discarded distribute_model's
-            # return value, so even the "not yet wrapped" case never re-assigned
-            # self._model. Unwrap (if needed), then always re-move+re-wrap via
-            # distribute_model, which internally does model.to(self.device) before
-            # wrapping.
-            raw_model = (
-                self._model.module
-                if isinstance(self._model, torch.nn.parallel.DistributedDataParallel)
-                else self._model
-            )
+            # re-wrap and keep the result; the old branch skipped already-wrapped models
+            raw_model = self._model.module if already_wrapped else self._model
             self._model = self.distribute_model(raw_model)
         self.reconnect_optimizer_to_parameters()
 
@@ -976,16 +924,7 @@ class ObjectTensorDecomp(ObjectINR):
         )
 
         obj_model.setup_distributed(device=device)
-        # Use obj_model.device (resolved by setup_distributed just above), not the
-        # raw `device` param -- under torchrun, setup_distributed ignores/overrides
-        # a "cpu" (or any) default and sets the real per-rank cuda:N device. Passing
-        # the stale literal `device` string here used to be harmless only because
-        # ObjectINR.to()'s world_size>1 branch was a no-op when already DDP-wrapped
-        # (see the bugfix in .to() above); now that .to() actually re-places the
-        # model, calling it with the wrong device would move params back to CPU
-        # while distribute_model's DDP(..., device_ids=[local_rank]) still expects
-        # them on that rank's GPU.
-        obj_model.to(obj_model.device)
+        obj_model.to(obj_model.device)  # device resolved by setup_distributed
         return obj_model
 
     # --- Constraints ---
@@ -994,11 +933,7 @@ class ObjectTensorDecomp(ObjectINR):
         soft_loss = torch.tensor(
             0.0, device=ctx.pred.device if ctx.pred is not None else self.device
         )
-        # Gate on EITHER coefficient. Previously this tested only tv_vol, so a
-        # run with tv_plane > 0 and tv_vol == 0 -- the natural setting, since
-        # volume TV penalizes density gradients and fights sharp atomic peaks --
-        # silently applied no plane regularization whatsoever.
-        if self.constraints.tv_vol > 0 or self.constraints.tv_plane > 0:
+        if self.constraints.tv_vol > 0 or self.constraints.tv_plane > 0:  # as in cedriclim1 6496aa6
             assert ctx.coords is not None, "Coordinates must be provided for TV loss"
             assert ctx.pred is not None, "Prediction must be provided for TV loss"
             soft_loss += self.get_tv_loss(ctx)
@@ -1024,11 +959,6 @@ class ObjectTensorDecomp(ObjectINR):
         assert ctx.coords is not None, "Coordinates must be provided for TV loss"
         assert ctx.pred is not None, "Prediction must be provided for TV loss"
         tv_loss = torch.tensor(0.0, device=ctx.pred.device)
-        # Each term is skipped when its own coefficient is zero. Beyond being
-        # correct, this matters for cost: get_volume_tv_loss runs three extra
-        # forward passes per call (one per axis, plus the base), so evaluating
-        # it at tv_vol == 0 would roughly quadruple the object-model cost to
-        # multiply the result by zero.
         if self.constraints.tv_plane > 0:
             tv_loss += self._get_plane_tv_loss()
         if self.constraints.tv_vol > 0:
@@ -1039,73 +969,22 @@ class ObjectTensorDecomp(ObjectINR):
         """
         Gets the total-variation across the planes.
         """
-        # Read `tilted` and `T` from the UNWRAPPED module. DistributedDataParallel
-        # does not proxy attribute access, so `self.model.tilted` raised
-        # AttributeError at world_size>1 -- i.e. any multi-GPU run with
-        # tv_plane > 0 crashed on its first backward. Harmless at world_size==1
-        # because distribute_model does not wrap there (core/ml/ddp.py:158),
-        # which is why single-GPU runs never hit it.
-        model = _unwrap(self.model)
+        model = _unwrap(self.model)  # DDP does not proxy .tilted / .T
         is_tilted = model.tilted
         per_level = []
 
-        # QUANTEM_TV_PLANE_NORM -- per-scale weighting, added 2026-08-08.
-        #
-        #   "mean"    (default) historical behaviour, every prior run reproduces
-        #   "percell" equalise the gradient reaching one PLANE CELL across scales
-        #
-        # Why "percell" exists: the .mean(dim=(1,2,3)) below normalises each
-        # scale by its own C*H*W, so with multiscale [0.25,0.5,1.0] a cell of the
-        # 341-cell plane receives (341/85)^2 = 16x LESS gradient than a cell of
-        # the 85-cell plane. The scale that carries the Nyquist-rate content --
-        # and that README section 13.1 measures as the noisiest -- is the one the
-        # penalty barely touches. Weighting each level by its area relative to
-        # the FINEST level makes the per-cell gradient equal while leaving the
-        # finest level's magnitude unchanged, so the section 8 tv_plane
-        # calibration (5.666e-7 ~ 10 % of the data loss) stays approximately
-        # valid instead of needing a ~1e6 rescale as a bare .sum() would.
-        _norm = os.environ.get("QUANTEM_TV_PLANE_NORM", "mean")
-        if _norm not in ("mean", "percell"):
-            raise ValueError(f"QUANTEM_TV_PLANE_NORM must be mean/percell, got {_norm}")
-        _area_max = max(int(g.shape[2]) * int(g.shape[3]) for g in model.grids)
+        for p in model.grids:
+            # p: (3*T, C, H, W) for TILTED, (3, C, H, W) for KPlanes
+            dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
+            dw = (p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
+            per_plane = dh + dw  # (3*T,) or (3,)
 
-        # With an anisotropic resolution the three planes of a scale differ in
-        # shape and cannot share a tensor, so kplanes.py stores them as three
-        # separate parameters per scale rather than one packed (3*T, C, H, W).
-        # getattr: checkpoints pickled before that fix have no such attribute
-        # and were necessarily packed.
-        _packed = getattr(model, "planes_packed", True)
-        _grids = list(model.grids)
-        _stride = 1 if _packed else 3
-
-        for s in range(0, len(_grids), _stride):
-            entries = _grids[s : s + _stride]
-            # packed:   one p of (3*T, C, H, W) for TILTED, (3, C, H, W) for KPlanes
-            # unpacked: three p of (T, C, H, W)     "     , (1, C, H, W)     "
-            per_entry = []
-            for p in entries:
-                dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
-                dw = (p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
-                per_entry.append(dh + dw)
-
-            if _packed:
-                per_plane = per_entry[0]  # (3*T,) or (3,)
-                if is_tilted:
-                    # sum the 3 planes of each rotation, then average rotations
-                    level_tv = per_plane.view(model.T, 3).sum(dim=1).mean()
-                else:
-                    level_tv = per_plane.sum()
+            if is_tilted:
+                T = model.T
+                per_rotation = per_plane.view(T, 3).sum(dim=1)  # sum 3 planes per rotation
+                level_tv = per_rotation.mean()  # avg across rotations
             else:
-                # per_entry[p] is (T,) or (1,) -- summing across the list is the
-                # same "sum 3 planes per rotation" reduction as the view above.
-                per_rotation = torch.stack(per_entry, dim=0).sum(dim=0)
-                level_tv = per_rotation.mean() if is_tilted else per_rotation.sum()
-
-            if _norm == "percell":
-                # The three planes of an anisotropic scale have different areas;
-                # weight the scale by its largest, which is the packed value.
-                _area = max(int(p.shape[2]) * int(p.shape[3]) for p in entries)
-                level_tv = level_tv * (_area / float(_area_max))
+                level_tv = per_plane.sum()
 
             per_level.append(level_tv)
 
